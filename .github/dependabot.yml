@@ -1,0 +1,38 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/invoker"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/json"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/nats"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/jetstream"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/redis"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/telemetry"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/prometheus"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
