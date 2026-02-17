@@ -3,6 +3,8 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/isaquesb/go-event-bus.svg)](https://pkg.go.dev/github.com/isaquesb/go-event-bus)
 [![Go Report Card](https://goreportcard.com/badge/github.com/isaquesb/go-event-bus)](https://goreportcard.com/report/github.com/isaquesb/go-event-bus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![codecov](https://codecov.io/gh/isaquesb/go-event-bus/branch/main/graph/badge.svg)](https://codecov.io/gh/isaquesb/go-event-bus)
+[![CI](https://github.com/isaquesb/go-event-bus/actions/workflows/ci.yml/badge.svg)](https://github.com/isaquesb/go-event-bus/actions/workflows/ci.yml)
 
 A modular, in-process and distributed **event bus abstraction for Go**, designed for
 high-throughput systems with strong requirements around **observability, resilience,
