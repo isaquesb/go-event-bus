@@ -16,6 +16,14 @@ import (
 
 var tracer = otel.Tracer("go-event-bus")
 
+// natsConn is an internal interface over *nats.Conn to allow testing.
+type natsConn interface {
+	Subscribe(subj string, cb nats.MsgHandler) (*nats.Subscription, error)
+	Publish(subj string, data []byte) error
+	Request(subj string, data []byte, timeout time.Duration) (*nats.Msg, error)
+	Close()
+}
+
 type BusOptions struct {
 	// Timeout default para EmitSync se ctx não tiver deadline
 	RequestTimeout time.Duration
@@ -44,19 +52,21 @@ func NewNatsBus(
 
 // Bus implements a NATS-backed event bus.
 type Bus struct {
-	nc      *nats.Conn
+	nc      natsConn
 	reg     event.Registry
 	timeout time.Duration
 	invoker event.Invoker
 	onErr   func(ctx context.Context, evt event.Event, err error, handler string)
 }
 
-func (b *Bus) Emit(ctx context.Context, e event.Event) error {
+func (b *Bus) Emit(ctx context.Context, e event.Event, opts ...event.EmitOption) error {
+	cfg := event.ApplyEmitOptions(e, opts...)
+
 	ctx, span := tracer.Start(ctx, "eventbus.emit",
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(
 			attribute.String("messaging.system", "nats"),
-			attribute.String("messaging.destination", e.Name()),
+			attribute.String("messaging.destination", cfg.Subject),
 			attribute.String("event.name", e.Name()),
 		),
 	)
@@ -72,9 +82,10 @@ func (b *Bus) Emit(ctx context.Context, e event.Event) error {
 	slog.DebugContext(ctx,
 		"nats publish",
 		"event", e.Name(),
+		"subject", cfg.Subject,
 	)
 
-	err = b.nc.Publish(e.Name(), data)
+	err = b.nc.Publish(cfg.Subject, data)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -227,8 +238,12 @@ func (b *Bus) SubscribeSync(
 // RegisterSubscribers registers multiple subscribers at once.
 func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber) error {
 	for _, s := range subs {
+		opts := []event.SubscribeOption{event.WithHandlerName(s.Name())}
+		if p, ok := s.(event.SubscribeOptionsProvider); ok {
+			opts = append(opts, p.SubscribeOptions()...)
+		}
 		for evtName, handler := range s.Events() {
-			if err := b.Subscribe(ctx, evtName, handler, event.WithHandlerName(s.Name())); err != nil {
+			if err := b.Subscribe(ctx, evtName, handler, opts...); err != nil {
 				return err
 			}
 		}

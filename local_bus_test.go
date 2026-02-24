@@ -361,3 +361,132 @@ type testSubscriber struct {
 
 func (s *testSubscriber) Name() string                      { return s.name }
 func (s *testSubscriber) Events() map[string]event.HandleFn { return s.events }
+
+// testSubscriberWithOpts also implements SubscribeOptionsProvider
+type testSubscriberWithOpts struct {
+	testSubscriber
+	opts []event.SubscribeOption
+}
+
+func (s *testSubscriberWithOpts) SubscribeOptions() []event.SubscribeOption { return s.opts }
+
+// errSubscribeLocalBus wraps LocalBus so Subscribe always fails after n successes
+type errAfterLocalBus struct {
+	*event.LocalBus
+	count    int
+	failAt   int
+	failWith error
+}
+
+func TestLocalBus_RegisterSubscribers_MultipleSubscribers(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{Invoker: &passthroughInvoker{}})
+
+	var mu sync.Mutex
+	received := map[string]int{}
+
+	err := bus.RegisterSubscribers(ctx,
+		&testSubscriber{
+			name: "subscriber-a",
+			events: map[string]event.HandleFn{
+				"order.placed": func(_ context.Context, _ event.Event) error {
+					mu.Lock()
+					received["order.placed"]++
+					mu.Unlock()
+					return nil
+				},
+			},
+		},
+		&testSubscriber{
+			name: "subscriber-b",
+			events: map[string]event.HandleFn{
+				"order.shipped": func(_ context.Context, _ event.Event) error {
+					mu.Lock()
+					received["order.shipped"]++
+					mu.Unlock()
+					return nil
+				},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("RegisterSubscribers failed: %v", err)
+	}
+
+	bus.EmitSync(ctx, &testEvent{name: "order.placed"})
+	bus.EmitSync(ctx, &testEvent{name: "order.shipped"})
+
+	if received["order.placed"] != 1 {
+		t.Errorf("expected order.placed count 1, got %d", received["order.placed"])
+	}
+	if received["order.shipped"] != 1 {
+		t.Errorf("expected order.shipped count 1, got %d", received["order.shipped"])
+	}
+}
+
+func TestLocalBus_RegisterSubscribers_HandlerNameFromSubscriberName(t *testing.T) {
+	ctx := context.Background()
+
+	var capturedHandler string
+	bus := event.NewLocalBus(event.LocalBusOptions{
+		Invoker: &passthroughInvoker{},
+		OnErr: func(_ context.Context, _ event.Event, _ error, handler string) {
+			capturedHandler = handler
+		},
+	})
+
+	err := bus.RegisterSubscribers(ctx, &testSubscriber{
+		name: "my-service",
+		events: map[string]event.HandleFn{
+			"user.created": func(_ context.Context, _ event.Event) error {
+				return errors.New("boom")
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RegisterSubscribers failed: %v", err)
+	}
+
+	bus.EmitSync(ctx, &testEvent{name: "user.created"})
+
+	if capturedHandler != "my-service" {
+		t.Errorf("expected handler name 'my-service', got '%s'", capturedHandler)
+	}
+}
+
+func TestLocalBus_RegisterSubscribers_WithSubscribeOptionsProvider(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{Invoker: &passthroughInvoker{}})
+
+	var called bool
+	err := bus.RegisterSubscribers(ctx, &testSubscriberWithOpts{
+		testSubscriber: testSubscriber{
+			name: "svc",
+			events: map[string]event.HandleFn{
+				"item.updated": func(_ context.Context, _ event.Event) error {
+					called = true
+					return nil
+				},
+			},
+		},
+		// HandlerName from WithHandlerName inside SubscribeOptions should override
+		opts: []event.SubscribeOption{event.WithHandlerName("override-name")},
+	})
+	if err != nil {
+		t.Fatalf("RegisterSubscribers failed: %v", err)
+	}
+
+	bus.EmitSync(ctx, &testEvent{name: "item.updated"})
+	if !called {
+		t.Error("expected handler to be called")
+	}
+}
+
+func TestLocalBus_RegisterSubscribers_NoSubscribers(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{Invoker: &passthroughInvoker{}})
+
+	if err := bus.RegisterSubscribers(ctx); err != nil {
+		t.Errorf("expected nil error for empty subscribers, got %v", err)
+	}
+}

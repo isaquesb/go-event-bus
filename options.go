@@ -2,6 +2,32 @@ package event
 
 import "time"
 
+// EmitOptions holds configuration for Emit
+type EmitOptions struct {
+	// Subject overrides the default publish subject (defaults to evt.Name())
+	Subject string
+}
+
+// EmitOption configures Emit behavior
+type EmitOption func(*EmitOptions)
+
+// WithSubject overrides the subject used when publishing the event.
+// Defaults to evt.Name() if not set.
+func WithSubject(subject string) EmitOption {
+	return func(o *EmitOptions) {
+		o.Subject = subject
+	}
+}
+
+// ApplyEmitOptions applies all emit options and returns the result
+func ApplyEmitOptions(evt Event, opts ...EmitOption) EmitOptions {
+	o := EmitOptions{Subject: evt.Name()}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 // SubscribeOptions holds configuration for Subscribe
 type SubscribeOptions struct {
 	// HandlerName identifies the handler for metrics and logging

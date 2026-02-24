@@ -66,8 +66,12 @@ func (b *LocalBus) Subscribe(
 // RegisterSubscribers registers multiple subscribers at once.
 func (b *LocalBus) RegisterSubscribers(ctx context.Context, subs ...Subscriber) error {
 	for _, s := range subs {
+		opts := []SubscribeOption{WithHandlerName(s.Name())}
+		if p, ok := s.(SubscribeOptionsProvider); ok {
+			opts = append(opts, p.SubscribeOptions()...)
+		}
 		for evtName, handler := range s.Events() {
-			if err := b.Subscribe(ctx, evtName, handler, WithHandlerName(s.Name())); err != nil {
+			if err := b.Subscribe(ctx, evtName, handler, opts...); err != nil {
 				return err
 			}
 		}
@@ -83,11 +87,12 @@ func (b *LocalBus) Close() error {
 
 func (b *LocalBus) dispatch(
 	ctx context.Context,
+	subject string,
 	e Event,
 	async bool,
 ) {
 	b.mu.RLock()
-	hList := b.handlers[e.Name()]
+	hList := b.handlers[subject]
 	b.mu.RUnlock()
 
 	if len(hList) == 0 {
@@ -132,12 +137,14 @@ func (b *LocalBus) dispatch(
 	}
 }
 
-func (b *LocalBus) Emit(ctx context.Context, e Event) {
-	b.dispatch(ctx, e, true)
+func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
+	cfg := ApplyEmitOptions(e, opts...)
+	b.dispatch(ctx, cfg.Subject, e, true)
 }
 
-func (b *LocalBus) EmitSync(ctx context.Context, e Event) {
-	b.dispatch(ctx, e, false)
+func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) {
+	cfg := ApplyEmitOptions(e, opts...)
+	b.dispatch(ctx, cfg.Subject, e, false)
 }
 
 func (b *LocalBus) runHandler(

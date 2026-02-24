@@ -50,3 +50,9 @@ type Subscriber interface {
 	Name() string
 	Events() map[string]HandleFn
 }
+
+// SubscribeOptionsProvider can be implemented by Subscriber to provide
+// additional subscribe options (e.g. stream name for JetStream).
+type SubscribeOptionsProvider interface {
+	SubscribeOptions() []SubscribeOption
+}

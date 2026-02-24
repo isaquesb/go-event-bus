@@ -22,6 +22,12 @@ var ErrStreamRequired = errors.New("stream is required for JetStream subscriptio
 
 var tracer = otel.Tracer("go-event-bus")
 
+// jsBackend is an internal interface over jetstream.JetStream to allow testing.
+type jsBackend interface {
+	Publish(ctx context.Context, subject string, payload []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error)
+	CreateOrUpdateConsumer(ctx context.Context, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error)
+}
+
 type BusOptions struct {
 	Invoker event.Invoker
 
@@ -38,7 +44,7 @@ type BusOptions struct {
 }
 
 type Bus struct {
-	js       jetstream.JetStream
+	js       jsBackend
 	registry event.Registry
 	onErr    func(ctx context.Context, evt event.Event, err error, handler string)
 	invoker  event.Invoker
@@ -51,7 +57,7 @@ type Bus struct {
 }
 
 func NewBus(
-	js jetstream.JetStream,
+	js jsBackend,
 	registry event.Registry,
 	opts BusOptions,
 ) *Bus {
@@ -81,14 +87,16 @@ func NewBus(
 
 func (b *Bus) Emit(
 	ctx context.Context,
-	subject string,
 	evt event.Event,
+	opts ...event.EmitOption,
 ) error {
+	cfg := event.ApplyEmitOptions(evt, opts...)
+
 	ctx, span := tracer.Start(ctx, "eventbus.emit",
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(
 			attribute.String("messaging.system", "nats"),
-			attribute.String("messaging.destination", subject),
+			attribute.String("messaging.destination", cfg.Subject),
 			attribute.String("event.name", evt.Name()),
 		),
 	)
@@ -101,7 +109,7 @@ func (b *Bus) Emit(
 		return err
 	}
 
-	_, err = b.js.Publish(ctx, subject, data)
+	_, err = b.js.Publish(ctx, cfg.Subject, data)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -191,6 +199,24 @@ func (b *Bus) Subscribe(
 	b.consumers = append(b.consumers, cc)
 	b.mu.Unlock()
 
+	return nil
+}
+
+// RegisterSubscribers registers multiple subscribers at once.
+// Each subscriber must implement event.SubscribeOptionsProvider to supply at
+// minimum event.WithStream, otherwise ErrStreamRequired is returned.
+func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber) error {
+	for _, s := range subs {
+		opts := []event.SubscribeOption{event.WithHandlerName(s.Name())}
+		if p, ok := s.(event.SubscribeOptionsProvider); ok {
+			opts = append(opts, p.SubscribeOptions()...)
+		}
+		for evtName, handler := range s.Events() {
+			if err := b.Subscribe(ctx, evtName, handler, opts...); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
