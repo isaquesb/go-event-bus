@@ -34,7 +34,7 @@ type SyncBus interface {
 
 ## RegisterSubscribers
 
-Groups multiple event handlers into a single subscriber:
+Groups multiple event handlers into a single subscriber. Available on **all buses** (LocalBus, NatsBus, JetStreamBus):
 
 ```go
 type RegisterSubscribers interface {
@@ -69,6 +69,38 @@ func (s *EmailSubscriber) Events() map[string]event.HandleFn {
 bus.RegisterSubscribers(ctx, &EmailSubscriber{}, &BillingSubscriber{})
 ```
 
+Each subscriber's `Name()` is automatically used as the handler name for metrics and logging.
+
+## SubscribeOptionsProvider
+
+Subscribers can implement `SubscribeOptionsProvider` to carry transport-specific options (e.g. JetStream stream name). `RegisterSubscribers` detects this interface automatically:
+
+```go
+type SubscribeOptionsProvider interface {
+    SubscribeOptions() []SubscribeOption
+}
+```
+
+Example for JetStream:
+
+```go
+type ChatSubscriber struct{}
+
+func (s *ChatSubscriber) Name() string { return "chat-subscriber" }
+
+func (s *ChatSubscriber) Events() map[string]event.HandleFn {
+    return map[string]event.HandleFn{"chat.message.*": s.handle}
+}
+
+// Provides stream/consumer options for all handlers in this subscriber.
+func (s *ChatSubscriber) SubscribeOptions() []event.SubscribeOption {
+    return []event.SubscribeOption{
+        event.WithStream("CHAT_EVENTS"),
+        event.WithConsumer("chat-processor"),
+    }
+}
+```
+
 ## LocalBus
 
 The `LocalBus` is the simplest bus implementation for in-process event dispatch:
@@ -82,8 +114,8 @@ bus := event.NewLocalBus(event.LocalBusOptions{
 ```
 
 It provides:
-- `Emit(ctx, event)` - Asynchronous, fire-and-forget dispatch
-- `EmitSync(ctx, event)` - Synchronous dispatch, waits for handlers
+- `Emit(ctx, event, opts...)` - Asynchronous, fire-and-forget dispatch
+- `EmitSync(ctx, event, opts...)` - Synchronous dispatch, waits for handlers
 - `Subscribe(ctx, subject, handler, opts...)` - Register handlers
 - `RegisterSubscribers(ctx, subs...)` - Bulk handler registration
 - `Close()` - No-op for LocalBus (no external connections)

@@ -56,11 +56,13 @@ bus.Subscribe(ctx, "chat.message.*", handler,
     event.WithConsumer("chat-processor"),
 )
 
-bus.Emit(ctx, "chat.message.room-general", &ChatMessage{
-    MessageID: "msg-1",
-    RoomID:    "room-general",
-    Content:   "Hello world",
-})
+// Subject defaults to evt.Name() ("chat.message")
+bus.Emit(ctx, &ChatMessage{MessageID: "msg-1", RoomID: "room-general", Content: "Hello world"})
+
+// Override subject for hierarchical routing
+bus.Emit(ctx, &ChatMessage{MessageID: "msg-2", RoomID: "room-general", Content: "Hello again"},
+    event.WithSubject("chat.message.room-general"),
+)
 ```
 
 ## Replay from DLQ

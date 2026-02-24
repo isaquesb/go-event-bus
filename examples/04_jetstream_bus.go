@@ -160,7 +160,7 @@ func ExampleJetStreamBus() {
 		}
 
 		subject := fmt.Sprintf("chat.message.%s", msg.RoomID)
-		if err := bus.Emit(ctx, subject, msg); err != nil {
+		if err := bus.Emit(ctx, msg, event.WithSubject(subject)); err != nil {
 			slog.Error("failed to publish", "error", err)
 		}
 	}

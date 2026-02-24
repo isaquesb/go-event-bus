@@ -57,6 +57,45 @@ bus.RegisterSubscribers(ctx,
 
 Each subscriber's `Name()` is used as the handler name for metrics and logging.
 
+## JetStream Subscribers with SubscribeOptionsProvider
+
+For JetStream buses, subscribers must provide stream configuration. Implement `SubscribeOptionsProvider` to carry these options:
+
+```go
+type ChatSubscriber struct{}
+
+func (s *ChatSubscriber) Name() string { return "chat-subscriber" }
+
+func (s *ChatSubscriber) Events() map[string]event.HandleFn {
+    return map[string]event.HandleFn{
+        "chat.message.*": s.handleMessage,
+    }
+}
+
+// SubscribeOptions provides JetStream-specific options for all handlers.
+func (s *ChatSubscriber) SubscribeOptions() []event.SubscribeOption {
+    return []event.SubscribeOption{
+        event.WithStream("CHAT_EVENTS"),
+        event.WithConsumer("chat-processor"),
+        event.WithMaxDeliver(5),
+    }
+}
+
+func (s *ChatSubscriber) handleMessage(ctx context.Context, evt event.Event) error {
+    msg := evt.(*ChatMessage)
+    slog.Info("processing message", "id", msg.MessageID, "room", msg.RoomID)
+    return nil
+}
+```
+
+Registration is identical across all buses:
+
+```go
+jsBus.RegisterSubscribers(ctx, &ChatSubscriber{})
+```
+
+`RegisterSubscribers` automatically detects `SubscribeOptionsProvider` and merges the provided options with the handler name.
+
 ## OnErr Interface
 
 Events can implement `OnErr` for event-level error notification:

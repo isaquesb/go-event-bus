@@ -147,6 +147,18 @@ and a shared invoker chain.
 
 ---
 
+## Emit API
+
+All buses share a unified `Emit` signature with optional functional options:
+
+```go
+// Subject defaults to evt.Name()
+bus.Emit(ctx, myEvent)
+
+// Override subject (e.g. for hierarchical NATS/JetStream subjects)
+bus.Emit(ctx, myEvent, event.WithSubject("chat.message.room-general"))
+```
+
 ## Subscribe API
 
 All buses use a unified Subscribe signature with functional options:
@@ -165,6 +177,28 @@ bus.Subscribe(ctx, "chat.message.*", handler,
     event.WithHandlerName("persist-message"),
     event.WithConsumer("chat-processor"),
 )
+```
+
+## RegisterSubscribers
+
+All buses support bulk subscriber registration. Implement `Subscriber` to group related handlers:
+
+```go
+bus.RegisterSubscribers(ctx,
+    NewEmailSubscriber(),
+    NewBillingSubscriber(),
+)
+```
+
+For JetStream, implement `SubscribeOptionsProvider` on the subscriber to carry stream options:
+
+```go
+func (s *ChatSubscriber) SubscribeOptions() []event.SubscribeOption {
+    return []event.SubscribeOption{
+        event.WithStream("CHAT_EVENTS"),
+        event.WithConsumer("chat-processor"),
+    }
+}
 ```
 
 ---
@@ -324,7 +358,7 @@ Production-ready implementations for distributed scenarios:
 github.com/isaquesb/go-event-bus/
 ├── event.go              # Core interfaces (Event, Invoker, Subscriber)
 ├── bus.go                # Bus interface
-├── options.go            # SubscribeOption functional options
+├── options.go            # EmitOption and SubscribeOption functional options
 ├── registry.go           # Registry interface & Envelope
 ├── local-bus.go          # In-process event bus
 ├── invoker/              # Execution pipeline components

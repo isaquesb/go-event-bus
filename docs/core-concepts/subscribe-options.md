@@ -1,11 +1,46 @@
 ---
 layout: default
-title: Subscribe Options
+title: Options
 parent: Core Concepts
 nav_order: 5
 ---
 
-# Subscribe Options
+# Options
+
+## Emit Options
+
+All buses accept functional options when emitting events:
+
+```go
+bus.Emit(ctx, event, opts...)
+```
+
+### EmitOptions Struct
+
+```go
+type EmitOptions struct {
+    Subject string // defaults to evt.Name()
+}
+```
+
+### WithSubject
+
+```go
+bus.Emit(ctx, myEvent, event.WithSubject("chat.message.room-general"))
+```
+
+Overrides the publish subject. If not set, the subject defaults to `evt.Name()`. This is useful for buses like JetStream that support hierarchical NATS subjects.
+
+### ApplyEmitOptions Helper
+
+```go
+cfg := event.ApplyEmitOptions(evt, opts...)
+// cfg.Subject is pre-seeded with evt.Name()
+```
+
+---
+
+## Subscribe Options
 
 All buses accept functional options when subscribing:
 

@@ -45,10 +45,14 @@ bus := jetstream.NewBus(js, registry, jetstream.BusOptions{
 ## Publishing
 
 ```go
-err := bus.Emit(ctx, "chat.message.room-general", chatMessage)
+// Subject defaults to evt.Name()
+err := bus.Emit(ctx, chatMessage)
+
+// Override subject (e.g. for hierarchical NATS subjects)
+err = bus.Emit(ctx, chatMessage, event.WithSubject("chat.message.room-general"))
 ```
 
-The subject is explicit (not derived from `Name()`) to support hierarchical NATS subjects.
+The subject defaults to `evt.Name()`. Use `WithSubject` to override it for hierarchical routing.
 
 ## Subscribing
 
@@ -111,6 +115,39 @@ err := replayer.Replay(ctx, jetstream.ReplayOptions{
 ```go
 dlq := jetstream.NewDQL(js, registry, "dlq")
 // Use with: invoker.NewDLQ(dlq, metrics)
+```
+
+## RegisterSubscribers
+
+Bulk registration using the `Subscriber` interface:
+
+```go
+bus.RegisterSubscribers(ctx,
+    NewChatSubscriber(),
+    NewAuditSubscriber(),
+)
+```
+
+For JetStream, subscribers must provide stream options via the `SubscribeOptionsProvider` interface:
+
+```go
+type ChatSubscriber struct{}
+
+func (s *ChatSubscriber) Name() string { return "chat-subscriber" }
+
+func (s *ChatSubscriber) Events() map[string]event.HandleFn {
+    return map[string]event.HandleFn{
+        "chat.message.*": s.handleMessage,
+    }
+}
+
+// SubscribeOptions provides JetStream-specific options for all handlers in this subscriber.
+func (s *ChatSubscriber) SubscribeOptions() []event.SubscribeOption {
+    return []event.SubscribeOption{
+        event.WithStream("CHAT_EVENTS"),
+        event.WithConsumer("chat-processor"),
+    }
+}
 ```
 
 ## Close
