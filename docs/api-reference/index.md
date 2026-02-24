@@ -32,6 +32,14 @@ Full API documentation is available on pkg.go.dev:
 - [`Registry`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#Registry) - Serialization interface
 - [`Envelope`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#Envelope) - Wire format
 - [`LocalBus`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#LocalBus) - In-process bus
+- [`Subscriber`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#Subscriber) - Grouped handler interface
+- [`SubscribeOptionsProvider`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#SubscribeOptionsProvider) - Optional interface for subscriber-level subscribe options
+- [`EmitOption`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#EmitOption) - Functional option for Emit
+- [`WithSubject`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithSubject) - Overrides the publish subject (defaults to `evt.Name()`)
+- [`SubscribeOption`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#SubscribeOption) - Functional option for Subscribe
+- [`WithHandlerName`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithHandlerName) - Sets handler name for metrics/logging
+- [`WithStream`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithStream) - JetStream stream name (required for JetStream)
+- [`WithConsumer`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithConsumer) - JetStream durable consumer name
 
 ### Invoker
 

@@ -42,10 +42,14 @@ bus := eventnats.NewNatsBus(nc, registry, eventnats.BusOptions{
 ### Fire-and-Forget (Emit)
 
 ```go
+// Subject defaults to evt.Name()
 err := bus.Emit(ctx, myEvent)
+
+// Override subject
+err = bus.Emit(ctx, myEvent, event.WithSubject("custom.subject"))
 ```
 
-Encodes the event via the registry and publishes to the event's `Name()` subject.
+Encodes the event via the registry and publishes to `evt.Name()` by default. Use `WithSubject` to override.
 
 ### Request/Reply (EmitSync)
 
@@ -68,6 +72,19 @@ bus.SubscribeSync(ctx, "user.created", handler, event.WithHandlerName("responder
 ```
 
 `SubscribeSync` decodes the incoming message, runs the handler through the invoker chain, then encodes and responds with the event.
+
+## RegisterSubscribers
+
+Bulk registration using the `Subscriber` interface — consistent with LocalBus and JetStreamBus:
+
+```go
+bus.RegisterSubscribers(ctx,
+    NewEmailSubscriber(),
+    NewAuditSubscriber(),
+)
+```
+
+Subscribers implementing `SubscribeOptionsProvider` will have their options merged automatically.
 
 ## Tracing
 

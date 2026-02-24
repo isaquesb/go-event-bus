@@ -64,6 +64,19 @@ Errors from handlers are reported via:
 
 Errors do **not** propagate to the caller of `Emit` or `EmitSync`.
 
+## RegisterSubscribers
+
+Bulk registration for organized handler grouping:
+
+```go
+bus.RegisterSubscribers(ctx,
+    NewEmailSubscriber(),
+    NewBillingSubscriber(),
+)
+```
+
+Each subscriber's `Name()` is used as the handler name. Subscribers implementing `SubscribeOptionsProvider` will have their options merged automatically.
+
 ## Close
 
 `Close()` is a no-op for LocalBus since there are no external connections.
