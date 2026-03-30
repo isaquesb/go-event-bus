@@ -1,13 +1,13 @@
 module github.com/isaquesb/go-event-bus/json
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/isaquesb/go-event-bus v0.1.0
-	go.opentelemetry.io/otel/trace v1.40.0
+	go.opentelemetry.io/otel/trace v1.42.0
 )
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	go.opentelemetry.io/otel v1.40.0 // indirect
+	go.opentelemetry.io/otel v1.42.0 // indirect
 )
