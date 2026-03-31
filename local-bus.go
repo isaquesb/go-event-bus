@@ -142,9 +142,10 @@ func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 	b.dispatch(ctx, cfg.Subject, e, true)
 }
 
-func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) {
+func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) (Event, error) {
 	cfg := ApplyEmitOptions(e, opts...)
 	b.dispatch(ctx, cfg.Subject, e, false)
+	return e, nil
 }
 
 func (b *LocalBus) runHandler(
