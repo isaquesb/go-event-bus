@@ -20,12 +20,13 @@ func NewRedisRateLimitStore(c *redis.Client) *RateLimitStore {
 -- ARGV[1] = rate
 -- ARGV[2] = period (ms)
 -- ARGV[3] = burst
--- ARGV[4] = now (ms)
 
 local rate   = tonumber(ARGV[1])
 local period = tonumber(ARGV[2])
 local burst  = tonumber(ARGV[3])
-local now    = tonumber(ARGV[4])
+
+local time_result = redis.call("TIME")
+local now = tonumber(time_result[1]) * 1000 + math.floor(tonumber(time_result[2]) / 1000)
 
 local data = redis.call("HMGET", KEYS[1], "tokens", "ts")
 local tokens = tonumber(data[1])
@@ -62,9 +63,6 @@ func (s *RateLimitStore) Allow(
 	period time.Duration,
 	burst int,
 ) (bool, error) {
-
-	now := time.Now().UnixMilli()
-
 	res, err := s.script.Run(
 		ctx,
 		s.client,
@@ -72,7 +70,6 @@ func (s *RateLimitStore) Allow(
 		rate,
 		period.Milliseconds(),
 		burst,
-		now,
 	).Int()
 
 	if err != nil {
