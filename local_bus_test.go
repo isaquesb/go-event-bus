@@ -490,3 +490,25 @@ func TestLocalBus_RegisterSubscribers_NoSubscribers(t *testing.T) {
 		t.Errorf("expected nil error for empty subscribers, got %v", err)
 	}
 }
+
+func TestLocalBus_NilInvoker_NoPanic(t *testing.T) {
+	ctx := context.Background()
+	// NewLocalBus with zero-value options (nil Invoker) must not panic.
+	// The bus should default to a passthrough invoker defined in the root module.
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	var called bool
+	err := bus.Subscribe(ctx, "test.event", func(ctx context.Context, e event.Event) error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+
+	bus.EmitSync(ctx, &testEvent{name: "test.event"})
+
+	if !called {
+		t.Error("expected handler to be called with nil invoker, but it was not")
+	}
+}

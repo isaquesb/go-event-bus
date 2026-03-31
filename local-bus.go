@@ -8,6 +8,19 @@ import (
 
 const DefaultMaxConcurrent = 16
 
+// passthroughInvoker is a no-op Invoker that calls the handler directly.
+// Used as default when no Invoker chain is configured.
+type passthroughInvoker struct{}
+
+func (p *passthroughInvoker) Invoke(
+	ctx context.Context,
+	_ Event,
+	_ string,
+	fn func(context.Context) error,
+) error {
+	return fn(ctx)
+}
+
 type LocalBusOptions struct {
 	Invoker       Invoker
 	OnErr         func(ctx context.Context, evt Event, err error, handler string)
@@ -17,6 +30,9 @@ type LocalBusOptions struct {
 func NewLocalBus(opts LocalBusOptions) *LocalBus {
 	if opts.MaxConcurrent <= 0 {
 		opts.MaxConcurrent = DefaultMaxConcurrent
+	}
+	if opts.Invoker == nil {
+		opts.Invoker = &passthroughInvoker{}
 	}
 	return &LocalBus{
 		handlers: make(map[string][]*namedHandle),

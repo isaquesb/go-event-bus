@@ -102,6 +102,9 @@ func (r *Registry) Decode(ctx context.Context, data []byte) (context.Context, ev
 		}
 	}
 
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	current := env.Version
 	payload := env.Payload
 
