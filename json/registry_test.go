@@ -2,6 +2,7 @@ package json_test
 
 import (
 	"context"
+	"sync"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -366,4 +367,37 @@ func TestRegistry_UpcasterError(t *testing.T) {
 	if err == nil {
 		t.Error("expected error from failing upcaster")
 	}
+}
+
+func TestRegistry_ConcurrentDecodeRegister(t *testing.T) {
+	reg := eventjson.NewRegistry()
+	reg.Register("test.event", func() event.Event { return &SimpleEvent{} }, 1)
+
+	// Encode a test event to get valid data for decoding.
+	data, err := reg.Encode(context.Background(), &SimpleEvent{Message: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+
+	// 100 concurrent Decode calls
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = reg.Decode(context.Background(), data)
+		}()
+	}
+
+	// 10 concurrent Register calls
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(v int) {
+			defer wg.Done()
+			reg.Register("other.event", func() event.Event { return &SimpleEvent{} }, v+2)
+		}(i)
+	}
+
+	wg.Wait()
 }
