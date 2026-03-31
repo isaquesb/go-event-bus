@@ -152,7 +152,7 @@ func (b *Bus) Subscribe(
 	}
 
 	_, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
-		msgCtx, evt, err := b.reg.Decode(context.Background(), msg.Data)
+		msgCtx, evt, err := b.reg.Decode(ctx, msg.Data)
 		if err != nil {
 			slog.Error(
 				"failed to decode event",
@@ -202,7 +202,7 @@ func (b *Bus) SubscribeSync(
 	}
 
 	_, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
-		msgCtx, evt, err := b.reg.Decode(context.Background(), msg.Data)
+		msgCtx, evt, err := b.reg.Decode(ctx, msg.Data)
 		if err != nil {
 			return
 		}
