@@ -23,7 +23,10 @@ func (s *IdempotencyStore) Put(
 	rec invoker.IdempotencyRecord,
 ) error {
 
-	data, _ := json.Marshal(rec)
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
 
 	var ttl time.Duration
 	switch rec.Status {

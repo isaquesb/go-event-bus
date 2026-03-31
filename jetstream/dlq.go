@@ -10,7 +10,7 @@ import (
 )
 
 type DLQ struct {
-	js      jetstream.JetStream
+	js      jsBackend
 	metrics invoker.MetricProvider
 	prefix  string
 }
@@ -34,10 +34,13 @@ func (d *DLQ) Publish(
 	evt event.Event,
 	err error,
 ) error {
-	data, _ := json.Marshal(map[string]any{
+	data, marshalErr := json.Marshal(map[string]any{
 		"event": evt,
 		"error": err.Error(),
 	})
+	if marshalErr != nil {
+		return marshalErr
+	}
 
 	_, err = d.js.Publish(ctx, d.prefix+evt.Name(), data)
 
