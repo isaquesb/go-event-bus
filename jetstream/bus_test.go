@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/isaquesb/go-event-bus"
 	"github.com/isaquesb/go-event-bus/invoker"
@@ -221,3 +222,48 @@ type plainSubscriber struct {
 
 func (s *plainSubscriber) Name() string                      { return s.name }
 func (s *plainSubscriber) Events() map[string]event.HandleFn { return s.events }
+
+func TestJetStreamBus_Subscribe_MaxDeliverValidation_TooLow(t *testing.T) {
+	bus := newTestBus(&mockJS{})
+	ctx := context.Background()
+
+	err := bus.Subscribe(ctx, "test.subject", noopHandler,
+		event.WithStream("S"),
+		event.WithMaxDeliver(3),
+		event.WithBackOff([]time.Duration{time.Second, 2 * time.Second, 3 * time.Second}),
+	)
+
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig (MaxDeliver=3 <= len(BackOff)=3), got %v", err)
+	}
+}
+
+func TestJetStreamBus_Subscribe_MaxDeliverValidation_Valid(t *testing.T) {
+	bus := newTestBus(&mockJS{})
+	ctx := context.Background()
+
+	err := bus.Subscribe(ctx, "test.subject", noopHandler,
+		event.WithStream("S"),
+		event.WithMaxDeliver(5),
+		event.WithBackOff([]time.Duration{time.Second, 2 * time.Second, 3 * time.Second}),
+	)
+
+	if err != nil {
+		t.Errorf("expected no error (MaxDeliver=5 > len(BackOff)=3), got %v", err)
+	}
+}
+
+func TestJetStreamBus_Subscribe_MaxDeliverValidation_ZeroSkips(t *testing.T) {
+	bus := newTestBus(&mockJS{})
+	ctx := context.Background()
+
+	err := bus.Subscribe(ctx, "test.subject", noopHandler,
+		event.WithStream("S"),
+		event.WithMaxDeliver(0),
+		event.WithBackOff([]time.Duration{time.Second, 2 * time.Second, 3 * time.Second}),
+	)
+
+	if err != nil {
+		t.Errorf("expected no error (MaxDeliver=0 means unlimited, skip validation), got %v", err)
+	}
+}
