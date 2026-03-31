@@ -5,7 +5,7 @@ import (
 )
 
 type SyncBus interface {
-	EmitSync(ctx context.Context, e Event)
+	EmitSync(ctx context.Context, e Event) (Event, error)
 }
 
 type RegisterSubscribers interface {
