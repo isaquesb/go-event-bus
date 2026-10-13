@@ -40,7 +40,12 @@ Before the first layer:
 
 1. Update `docs/` (transports, core concepts, examples, `docs/api-reference/index.md`), add a
    `## [X.Y.Z]` section to `CHANGELOG.md` (Added, Changed, Fixed, Dependencies) and make sure
-   `examples/*.go` still build (they are compiled in CI).
+   `examples/*.go` still build (they are compiled in CI). If the release changes root API (for
+   example a new return value), also check that `examples` passes `scripts/ci-local.sh examples`
+   against the new root: before the layer-4 bump the per-module leg still builds against the old
+   published root, so a break (v0.3.0: `errcheck` on the new `EmitSync` result) only shows up in
+   the layer-4 bump. Fix it in a normal commit pushed before `scripts/release.sh VERSION 4`; the
+   bump commit then descends from that fix and still touches only `examples/go.mod` and `go.sum`.
 2. Run the full local CI equivalent: `scripts/ci-local.sh --integration`.
 3. Push `main` and wait for its CI run to be green. The root tag points at this end-of-phase commit,
    so nothing may be tagged from an unpublished or red commit.
@@ -55,13 +60,17 @@ Repeat for layers 1 to 4, in order. VERSION is for example `v0.3.0`; N is the la
 2. `scripts/ci-local.sh --integration` for the full picture.
 3. `git push origin main` (layers 2 to 4 have a bump commit; layer 1 usually has nothing new) and
    wait for green CI on that exact commit.
-4. Human checkpoint. Review the tag-to-commit mapping (`git rev-parse TAG^{commit}` for every
+4. Pre-publication proof (layers 2 to 4): `scripts/verify-release.sh --ref HEAD VERSION MODULE...`
+   for the layer's modules. It resolves those modules from the local tagged tree and their
+   dependencies from the proxy, so it needs no tag on origin. (Layer 1 used
+   `GOPROXY=off scripts/verify-release.sh --ref VERSION VERSION root`.)
+5. Human checkpoint. Review the tag-to-commit mapping (`git rev-parse TAG^{commit}` for every
    tag of the layer) and run `git merge-base --is-ancestor TAG origin/main` for each tag. Only
    continue when every tag points at the intended, published, green commit.
-5. Push the layer's tags by explicit refspec only, for example
+6. Push the layer's tags by explicit refspec only, for example
    `git push origin refs/tags/v0.3.0` or
    `git push origin refs/tags/invoker/v0.3.0 refs/tags/json/v0.3.0 refs/tags/nats/v0.3.0 refs/tags/telemetry/v0.3.0`.
-6. `scripts/verify-release.sh --wait 30 VERSION MODULE...` for every module published so far
+7. `scripts/verify-release.sh --wait 30 VERSION MODULE...` for every module published so far
    (the script prints the exact command). Do not start the next layer until it exits 0.
 
 The layers by module name for `verify-release.sh` are: layer 1 `root`; layer 2 adds
