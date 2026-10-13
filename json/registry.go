@@ -166,18 +166,42 @@ func (r *Registry) EncodeWith(ctx context.Context, evt event.Event, md event.Met
 	return json.Marshal(env)
 }
 
+// Decode decodes untrusted envelope bytes into an event. It never panics on
+// malformed input: every failure is a *event.DecodeError carrying the envelope
+// Name and the version reached, and classified by one of the event sentinels
+// (ErrMalformedEnvelope, ErrUnknownEvent, ErrUnknownVersion, ErrMissingUpcaster)
+// so callers use errors.Is, or errors.As for the catch-all. An upcaster's own
+// error comes back as a *event.DecodeError without a sentinel.
+//
+// An envelope with version 0, or without a version key, decodes as version 1.
+// Once the envelope has parsed, the returned ctx carries its Metadata even
+// when decoding fails. No registry lock is held while user upcaster code runs,
+// so an upcaster may call Register or Decode on the same registry.
 func (r *Registry) Decode(ctx context.Context, data []byte) (context.Context, event.Event, error) {
 	var env event.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
-		return ctx, nil, err
+		return ctx, nil, &event.DecodeError{
+			Name:    env.Name,
+			Version: env.Version,
+			Err:     fmt.Errorf("%w: %w", event.ErrMalformedEnvelope, err),
+		}
 	}
 
-	ctx = r.extractTrace(ctx, &env)
+	// {} , null and a DLQ record {"event":...,"error":...} land here.
+	if env.Name == "" || env.Version < 0 {
+		return ctx, nil, &event.DecodeError{
+			Name:    env.Name,
+			Version: env.Version,
+			Err:     fmt.Errorf("%w: missing name or negative version", event.ErrMalformedEnvelope),
+		}
+	}
 
 	version := env.Version
 	if version == 0 {
 		version = 1
 	}
+
+	ctx = r.extractTrace(ctx, &env)
 	ctx = event.WithMetadata(ctx, event.Metadata{
 		ID:            env.ID,
 		CorrelationID: env.CorrelationID,
@@ -188,41 +212,74 @@ func (r *Registry) Decode(ctx context.Context, data []byte) (context.Context, ev
 		Headers:       maps.Clone(env.Headers),
 	})
 
+	// latest is snapshotted once, so a concurrent Register cannot move the
+	// target of the upcast loop below.
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	latest := r.latest[env.Name]
+	r.mu.RUnlock()
 
-	current := env.Version
+	if latest == 0 {
+		return ctx, nil, &event.DecodeError{Name: env.Name, Version: version, Err: event.ErrUnknownEvent}
+	}
+	if version > latest {
+		return ctx, nil, &event.DecodeError{Name: env.Name, Version: version, Err: event.ErrUnknownVersion}
+	}
+
 	payload := env.Payload
+	for version != latest {
+		r.mu.RLock()
+		up, ok := r.upcasters[eventKey{env.Name, version}]
+		r.mu.RUnlock()
 
-	for {
-		latest := r.latest[env.Name]
-		if current == latest {
-			break
-		}
-
-		key := eventKey{env.Name, current}
-		up, ok := r.upcasters[key]
 		if !ok {
-			return ctx, nil, fmt.Errorf(
-				"no upcaster for %s v%d → v%d",
-				env.Name, current, latest,
-			)
+			return ctx, nil, &event.DecodeError{
+				Name:    env.Name,
+				Version: version,
+				Err:     fmt.Errorf("%w: v%d to v%d", event.ErrMissingUpcaster, version, latest),
+			}
 		}
 
+		next := up.ToVersion()
+		if next <= version || next > latest {
+			return ctx, nil, &event.DecodeError{
+				Name:    env.Name,
+				Version: version,
+				Err: fmt.Errorf(
+					"upcaster for %s v%d does not advance to a valid version (to v%d, latest v%d)",
+					env.Name, version, next, latest,
+				),
+			}
+		}
+
+		// User code: no registry lock is held here.
 		var err error
 		payload, err = up.Upcast(ctx, payload)
 		if err != nil {
-			return ctx, nil, err
+			return ctx, nil, &event.DecodeError{Name: env.Name, Version: version, Err: err}
 		}
 
-		current = up.ToVersion()
+		version = next
 	}
 
-	factory := r.factories[eventKey{env.Name, current}]
+	r.mu.RLock()
+	factory := r.factories[eventKey{env.Name, version}]
+	r.mu.RUnlock()
+
+	if factory == nil {
+		return ctx, nil, &event.DecodeError{Name: env.Name, Version: version, Err: event.ErrUnknownEvent}
+	}
+
 	evt := factory()
+	if evt == nil {
+		return ctx, nil, &event.DecodeError{Name: env.Name, Version: version, Err: event.ErrUnknownEvent}
+	}
 
 	if err := json.Unmarshal(payload, evt); err != nil {
-		return ctx, nil, err
+		return ctx, nil, &event.DecodeError{
+			Name:    env.Name,
+			Version: version,
+			Err:     fmt.Errorf("%w: %w", event.ErrMalformedEnvelope, err),
+		}
 	}
 
 	return ctx, evt, nil
