@@ -293,3 +293,159 @@ func TestNatsBus_Emit_RegistryWithoutEnvelopeEncoder(t *testing.T) {
 		t.Errorf("data = %q, want {} (Registry.Encode fallback)", conn.published[0].data)
 	}
 }
+
+// *Bus must keep satisfying event.SyncBus: EmitSync takes no options.
+var _ event.SyncBus = (*Bus)(nil)
+
+func TestNatsBus_EmitSync_Lineage(t *testing.T) {
+	conn := newMdConn()
+	reg := newMdRegistry("quote.get")
+	bus := newMdBus(conn, reg)
+
+	reply, err := reg.EncodeWith(context.Background(), &mdEvent{name: "quote.get", Payload: "answer"},
+		event.Metadata{ID: "reply-1", Timestamp: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("EncodeWith: %v", err)
+	}
+	conn.reply = reply
+	reg.resetEncoded()
+
+	ctx := event.WithMetadata(context.Background(), event.Metadata{ID: "p-1", CorrelationID: "c-1"})
+	got, err := bus.EmitSync(ctx, &mdEvent{name: "quote.get", Payload: "ask"})
+	if err != nil {
+		t.Fatalf("EmitSync: %v", err)
+	}
+	evt, ok := got.(*mdEvent)
+	if !ok {
+		t.Fatalf("EmitSync returned %T, want *mdEvent", got)
+	}
+	if evt.Payload != "answer" {
+		t.Errorf("reply payload = %q, want answer", evt.Payload)
+	}
+
+	md := reg.lastEncoded(t)
+	if md.CausationID != "p-1" {
+		t.Errorf("request CausationID = %q, want p-1", md.CausationID)
+	}
+	if md.CorrelationID != "c-1" {
+		t.Errorf("request CorrelationID = %q, want c-1", md.CorrelationID)
+	}
+	if md.ID == "" || md.ID == "p-1" {
+		t.Errorf("request ID = %q, want a new id", md.ID)
+	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if len(conn.requests) != 1 || conn.requests[0].subject != "quote.get" {
+		t.Errorf("requests = %+v, want one on quote.get", conn.requests)
+	}
+}
+
+func TestSubscribeSync_ReplyLineage(t *testing.T) {
+	conn := newMdConn()
+	reg := newMdRegistry("quote.get")
+	bus := newMdBus(conn, reg)
+
+	var seen event.Metadata
+	err := bus.SubscribeSync(context.Background(), "quote.get", func(ctx context.Context, _ event.Event) error {
+		seen, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("SubscribeSync: %v", err)
+	}
+
+	// The request event is a WithId event: its Id() is the request id, the
+	// case where the reply would reuse the request id without D-22.
+	req, err := reg.EncodeWith(context.Background(),
+		&mdEvent{name: "quote.get", EventID: "req-1"},
+		event.Metadata{ID: "req-1", CorrelationID: "corr-9", Timestamp: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("EncodeWith: %v", err)
+	}
+	reg.resetEncoded()
+
+	// msg.Respond fails without a live subscription; the bus ignores it.
+	conn.handler(t, "quote.get")(&natsgo.Msg{Subject: "quote.get", Data: req, Reply: "_INBOX.test"})
+
+	if seen.ID != "req-1" {
+		t.Fatalf("handler saw ID %q, want req-1", seen.ID)
+	}
+	md := reg.lastEncoded(t)
+	if md.ID == "" || md.ID == "req-1" {
+		t.Errorf("reply ID = %q, want a fresh id different from the request id", md.ID)
+	}
+	if md.CausationID != "req-1" {
+		t.Errorf("reply CausationID = %q, want req-1", md.CausationID)
+	}
+	if md.CorrelationID != "corr-9" {
+		t.Errorf("reply CorrelationID = %q, want corr-9", md.CorrelationID)
+	}
+	if md.ID == md.CausationID {
+		t.Errorf("reply id equals its causation id %q", md.ID)
+	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if len(conn.published) != 0 {
+		t.Errorf("reply must go through msg.Respond only, got %d publishes", len(conn.published))
+	}
+}
+
+func TestNatsBus_NewNatsBus_MetadataOptions(t *testing.T) {
+	var n int
+	var mu sync.Mutex
+	gen := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		n++
+		return fmt.Sprintf("gen-%d", n)
+	}
+	conn := newMdConn()
+	bus := NewNatsBus(nil, newMdRegistry("root.event", "child.event"), BusOptions{
+		IDGenerator:    gen,
+		InheritHeaders: []string{"tenant"},
+	})
+	bus.nc = conn
+
+	var root, child event.Metadata
+	err := bus.Subscribe(context.Background(), "root.event", func(ctx context.Context, _ event.Event) error {
+		root, _ = event.MetadataFromContext(ctx)
+		return bus.Emit(ctx, &mdEvent{name: "child.event"})
+	})
+	if err != nil {
+		t.Fatalf("Subscribe root: %v", err)
+	}
+	err = bus.Subscribe(context.Background(), "child.event", func(ctx context.Context, _ event.Event) error {
+		child, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Subscribe child: %v", err)
+	}
+
+	err = bus.Emit(context.Background(), &mdEvent{name: "root.event"},
+		event.WithHeader("tenant", "acme"),
+		event.WithHeader("secret", "s"),
+	)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	if root.ID != "gen-1" {
+		t.Errorf("root ID = %q, want gen-1", root.ID)
+	}
+	if child.ID != "gen-2" {
+		t.Errorf("child ID = %q, want gen-2", child.ID)
+	}
+	if child.CausationID != "gen-1" {
+		t.Errorf("child CausationID = %q, want gen-1", child.CausationID)
+	}
+	if child.Headers["tenant"] != "acme" {
+		t.Errorf("child Headers = %v, want tenant=acme", child.Headers)
+	}
+	if _, leaked := child.Headers["secret"]; leaked {
+		t.Errorf("child Headers = %v, non-allowlisted key secret must not be inherited", child.Headers)
+	}
+	if root.Headers["secret"] != "s" {
+		t.Errorf("root Headers = %v, want the explicit secret header on the root", root.Headers)
+	}
+}

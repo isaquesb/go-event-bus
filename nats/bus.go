@@ -78,6 +78,17 @@ func (b *Bus) resolve(ctx context.Context, e event.Event, cfg event.EmitOptions)
 	return event.ResolveOutbound(ctx, e, cfg)
 }
 
+// newID returns a fresh event id from the bus generator, falling back to
+// event.NewID when none is configured or it returns an empty id.
+func (b *Bus) newID() string {
+	if b.idGen != nil {
+		if id := b.idGen(); id != "" {
+			return id
+		}
+	}
+	return event.NewID()
+}
+
 func (b *Bus) Emit(ctx context.Context, e event.Event, opts ...event.EmitOption) error {
 	cfg := event.ApplyEmitOptions(e, opts...)
 	md := b.resolve(ctx, e, cfg)
@@ -114,6 +125,10 @@ func (b *Bus) Emit(ctx context.Context, e event.Event, opts ...event.EmitOption)
 }
 
 func (b *Bus) EmitSync(ctx context.Context, e event.Event) (event.Event, error) {
+	// No user options: the signature stays EmitSync(ctx, e) so *Bus keeps
+	// satisfying event.SyncBus. Lineage comes from the Metadata in ctx.
+	md := b.resolve(ctx, e, event.ApplyEmitOptions(e))
+
 	ctx, span := tracer.Start(ctx, "eventbus.emit_sync",
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(
@@ -124,7 +139,7 @@ func (b *Bus) EmitSync(ctx context.Context, e event.Event) (event.Event, error) 
 	)
 	defer span.End()
 
-	data, err := b.reg.Encode(ctx, e)
+	data, err := event.EncodeEvent(ctx, b.reg, e, md)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -244,7 +259,14 @@ func (b *Bus) SubscribeSync(
 			return
 		}
 
-		resp, err := b.reg.Encode(msgCtx, evt)
+		// The reply is a new message caused by the request: a fresh id (a
+		// WithId request event echoed back must not reuse the request id),
+		// CausationID = request id and the request CorrelationID, both
+		// resolved from the Metadata in msgCtx.
+		rcfg := event.ApplyEmitOptions(evt)
+		rcfg.ID = b.newID()
+		md := b.resolve(msgCtx, evt, rcfg)
+		resp, err := event.EncodeEvent(msgCtx, b.reg, evt, md)
 		if err != nil {
 			return
 		}
