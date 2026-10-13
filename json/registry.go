@@ -4,11 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/isaquesb/go-event-bus"
+	"maps"
 	"sync"
 	"time"
 
+	"github.com/isaquesb/go-event-bus"
 	"go.opentelemetry.io/otel/trace"
+)
+
+var (
+	_ event.Registry        = (*Registry)(nil)
+	_ event.EnvelopeEncoder = (*Registry)(nil)
 )
 
 type Registry struct {
@@ -16,14 +22,37 @@ type Registry struct {
 	factories map[eventKey]event.Factory
 	upcasters map[eventKey]event.Upcaster
 	latest    map[string]int
+	idGen     func() string
 }
 
-func NewRegistry() *Registry {
-	return &Registry{
+// Option configures a Registry created by NewRegistry.
+type Option func(*Registry)
+
+// WithIDGenerator sets the function that mints the id of events that carry
+// neither an explicit id nor an Id() method. A nil gen keeps the default
+// UUIDv7 generator.
+func WithIDGenerator(gen func() string) Option {
+	return func(r *Registry) {
+		if gen != nil {
+			r.idGen = gen
+		}
+	}
+}
+
+// NewRegistry returns an empty Registry. Options are optional, so existing
+// NewRegistry() callers compile unchanged.
+func NewRegistry(opts ...Option) *Registry {
+	r := &Registry{
 		factories: make(map[eventKey]event.Factory),
 		upcasters: make(map[eventKey]event.Upcaster),
 		latest:    make(map[string]int),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(r)
+		}
+	}
+	return r
 }
 
 func (r *Registry) Register(
@@ -50,7 +79,27 @@ func (r *Registry) RegisterUpcaster(u event.Upcaster) {
 	r.upcasters[key] = u
 }
 
+// Encode encodes evt, resolving its Metadata from ctx: a parent Metadata in
+// ctx makes evt its child (causation and correlation), so a registry used
+// directly still applies the causal rules.
 func (r *Registry) Encode(ctx context.Context, evt event.Event) ([]byte, error) {
+	return r.EncodeWith(ctx, evt, event.ResolveOutbound(ctx, evt, event.EmitOptions{IDGenerator: r.idGen}))
+}
+
+// EncodeWith encodes evt with md already resolved by the caller. When md.ID is
+// empty it resolves md itself from ctx, keeping md.CorrelationID and
+// md.Headers, so every envelope carries an id and the causal rules stay in
+// event.ResolveOutbound. The envelope timestamp is md.Timestamp, or the
+// current time when it is zero.
+func (r *Registry) EncodeWith(ctx context.Context, evt event.Event, md event.Metadata) ([]byte, error) {
+	if md.ID == "" {
+		md = event.ResolveOutbound(ctx, evt, event.EmitOptions{
+			IDGenerator:   r.idGen,
+			CorrelationID: md.CorrelationID,
+			Headers:       md.Headers,
+		})
+	}
+
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return nil, err
@@ -61,11 +110,22 @@ func (r *Registry) Encode(ctx context.Context, evt event.Event) ([]byte, error) 
 		v = withVersion.Version()
 	}
 
+	ts := md.Timestamp.UTC()
+	if md.Timestamp.IsZero() {
+		ts = time.Now().UTC()
+	}
+
 	env := event.Envelope{
-		Name:      evt.Name(),
-		Version:   v,
-		Timestamp: time.Now().UTC(),
-		Payload:   payload,
+		Name:          evt.Name(),
+		Version:       v,
+		Timestamp:     ts,
+		ID:            md.ID,
+		CorrelationID: md.CorrelationID,
+		CausationID:   md.CausationID,
+		Payload:       payload,
+	}
+	if len(md.Headers) > 0 {
+		env.Headers = maps.Clone(md.Headers)
 	}
 
 	span := trace.SpanFromContext(ctx)
@@ -101,6 +161,20 @@ func (r *Registry) Decode(ctx context.Context, data []byte) (context.Context, ev
 			)
 		}
 	}
+
+	version := env.Version
+	if version == 0 {
+		version = 1
+	}
+	ctx = event.WithMetadata(ctx, event.Metadata{
+		ID:            env.ID,
+		CorrelationID: env.CorrelationID,
+		CausationID:   env.CausationID,
+		Name:          env.Name,
+		Version:       version,
+		Timestamp:     env.Timestamp,
+		Headers:       maps.Clone(env.Headers),
+	})
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
