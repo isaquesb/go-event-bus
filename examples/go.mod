@@ -3,12 +3,12 @@ module github.com/isaquesb/go-event-bus/examples
 go 1.26.0
 
 require (
-	github.com/isaquesb/go-event-bus v0.2.0
-	github.com/isaquesb/go-event-bus/invoker v0.2.0
-	github.com/isaquesb/go-event-bus/jetstream v0.2.0
-	github.com/isaquesb/go-event-bus/json v0.2.0
-	github.com/isaquesb/go-event-bus/redis v0.2.0
-	github.com/isaquesb/go-event-bus/telemetry v0.2.0
+	github.com/isaquesb/go-event-bus v0.3.0
+	github.com/isaquesb/go-event-bus/invoker v0.3.0
+	github.com/isaquesb/go-event-bus/jetstream v0.3.0
+	github.com/isaquesb/go-event-bus/json v0.3.0
+	github.com/isaquesb/go-event-bus/redis v0.3.0
+	github.com/isaquesb/go-event-bus/telemetry v0.3.0
 	github.com/nats-io/nats.go v1.54.0
 	github.com/redis/go-redis/v9 v9.23.0
 	go.opentelemetry.io/otel v1.47.0
