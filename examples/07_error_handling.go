@@ -266,39 +266,47 @@ func ExampleErrorHandling() {
 
 	// Valid payment - succeeds
 	slog.Info("=== Valid payment ===")
-	bus.EmitSync(ctx, PaymentRequest{
+	if _, err := bus.EmitSync(ctx, PaymentRequest{
 		PaymentID: "pay-001",
 		Amount:    100.00,
 		Currency:  "USD",
 		CardToken: "tok_xxx",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// Invalid amount - permanent error -> DLQ
 	slog.Info("=== Invalid amount (permanent) ===")
-	bus.EmitSync(ctx, PaymentRequest{
+	if _, err := bus.EmitSync(ctx, PaymentRequest{
 		PaymentID: "pay-002",
 		Amount:    -50.00,
 		Currency:  "USD",
 		CardToken: "tok_xxx",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// Business rule violation - permanent -> DLQ
 	slog.Info("=== Exceeds limit (business rule) ===")
-	bus.EmitSync(ctx, PaymentRequest{
+	if _, err := bus.EmitSync(ctx, PaymentRequest{
 		PaymentID: "pay-003",
 		Amount:    50000.00,
 		Currency:  "USD",
 		CardToken: "tok_xxx",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// Missing currency - permanent -> DLQ
 	slog.Info("=== Missing currency (validation) ===")
-	bus.EmitSync(ctx, PaymentRequest{
+	if _, err := bus.EmitSync(ctx, PaymentRequest{
 		PaymentID: "pay-004",
 		Amount:    100.00,
 		Currency:  "",
 		CardToken: "tok_xxx",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 }
 
 // =============================================================================

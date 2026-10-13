@@ -103,11 +103,13 @@ func ExampleBasicLocalBus() {
 	}
 
 	// Synchronous - waits for all handlers to complete
-	bus.EmitSync(ctx, UserCreated{
+	if _, err := bus.EmitSync(ctx, UserCreated{
 		UserID:   "user-123",
 		Email:    "john@example.com",
 		UserName: "John Doe",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// Asynchronous - fire and forget
 	bus.Emit(ctx, OrderPlaced{

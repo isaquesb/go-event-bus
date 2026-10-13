@@ -196,26 +196,32 @@ func ExampleFullInvokerChain() {
 	// Emit events
 
 	// Normal payment - processed successfully
-	bus.EmitSync(ctx, PaymentProcessed{
+	if _, err := bus.EmitSync(ctx, PaymentProcessed{
 		PaymentID: "pay-001",
 		UserID:    "user-123",
 		Amount:    100.00,
 		Currency:  "USD",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// Same payment again - blocked by idempotency
-	bus.EmitSync(ctx, PaymentProcessed{
+	if _, err := bus.EmitSync(ctx, PaymentProcessed{
 		PaymentID: "pay-001",
 		UserID:    "user-123",
 		Amount:    100.00,
 		Currency:  "USD",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// Large payment - sent to DLQ
-	bus.EmitSync(ctx, PaymentProcessed{
+	if _, err := bus.EmitSync(ctx, PaymentProcessed{
 		PaymentID: "pay-002",
 		UserID:    "user-123",
 		Amount:    50000.00,
 		Currency:  "USD",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 }

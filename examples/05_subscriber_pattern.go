@@ -273,21 +273,25 @@ func ExampleSubscriberPattern() {
 	// - AnalyticsSubscriber.trackSignup
 	// - BillingSubscriber.createCustomer
 	// - audit-log handler
-	bus.EmitSync(ctx, UserSignedUp{
+	if _, err := bus.EmitSync(ctx, UserSignedUp{
 		UserID: "user-123",
 		Email:  "john@example.com",
 		Plan:   "pro",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// This will trigger:
 	// - EmailSubscriber.handleUserUpgraded
 	// - AnalyticsSubscriber.trackUpgrade
 	// - BillingSubscriber.updateSubscription
-	bus.EmitSync(ctx, UserUpgraded{
+	if _, err := bus.EmitSync(ctx, UserUpgraded{
 		UserID:  "user-123",
 		OldPlan: "pro",
 		NewPlan: "enterprise",
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// Example with OnErr interface
 	errChan := make(chan error, 1)
@@ -298,11 +302,13 @@ func ExampleSubscriberPattern() {
 		return
 	}
 
-	bus.EmitSync(ctx, &CriticalEvent{
+	if _, err := bus.EmitSync(ctx, &CriticalEvent{
 		ID:      "critical-1",
 		Payload: "important data",
 		onErr: func(err error) {
 			errChan <- err
 		},
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 }

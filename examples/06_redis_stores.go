@@ -160,19 +160,25 @@ func ExampleRedisStores() {
 
 	// First attempt - succeeds
 	slog.Info("=== First attempt ===")
-	bus.EmitSync(ctx, order)
+	if _, err := bus.EmitSync(ctx, order); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// Second attempt - blocked by idempotency
 	slog.Info("=== Second attempt (should be blocked) ===")
-	bus.EmitSync(ctx, order)
+	if _, err := bus.EmitSync(ctx, order); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 
 	// Different order - succeeds
 	slog.Info("=== Different order ===")
-	bus.EmitSync(ctx, OrderCreated{
+	if _, err := bus.EmitSync(ctx, OrderCreated{
 		OrderID:    "order-12346",
 		CustomerID: "cust-789",
 		Total:      149.99,
-	})
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
 }
 
 // =============================================================================
