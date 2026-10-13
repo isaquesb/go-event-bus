@@ -1,6 +1,6 @@
 module github.com/isaquesb/go-event-bus/prometheus
 
-go 1.23.0
+go 1.23
 
 require (
 	github.com/isaquesb/go-event-bus/invoker v0.2.0

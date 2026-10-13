@@ -3,6 +3,7 @@ package jetstream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -19,6 +20,9 @@ import (
 
 // ErrStreamRequired is returned when Subscribe is called without a stream
 var ErrStreamRequired = errors.New("stream is required for JetStream subscription")
+
+// ErrInvalidConfig is returned when consumer configuration is invalid.
+var ErrInvalidConfig = errors.New("eventbus: invalid consumer configuration")
 
 var tracer = otel.Tracer("go-event-bus")
 
@@ -165,6 +169,14 @@ func (b *Bus) Subscribe(
 			"consumer", consumerName,
 			"default", defaultBackOff,
 			"hint", "use event.WithBackOff([]time.Duration{...}) to configure",
+		)
+	}
+
+	if cfg.MaxDeliver > 0 && cfg.MaxDeliver <= len(backOff) {
+		return fmt.Errorf(
+			"%w: MaxDeliver (%d) must be greater than len(BackOff) (%d) — "+
+				"NATS requires MaxDeliver > len(BackOff) to apply the backoff schedule",
+			ErrInvalidConfig, cfg.MaxDeliver, len(backOff),
 		)
 	}
 

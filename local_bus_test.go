@@ -62,7 +62,7 @@ func TestLocalBus_SubscribeAndEmitSync(t *testing.T) {
 	}
 
 	evt := &testEvent{name: "user.created", message: "hello"}
-	bus.EmitSync(ctx, evt)
+	_, _ = bus.EmitSync(ctx, evt)
 
 	if received != "hello" {
 		t.Errorf("expected message 'hello', got '%s'", received)
@@ -86,7 +86,7 @@ func TestLocalBus_SubscribeDefaultHandlerName(t *testing.T) {
 	}
 
 	evt := &testEvent{name: "user.created"}
-	bus.EmitSync(ctx, evt)
+	_, _ = bus.EmitSync(ctx, evt)
 
 	if !called {
 		t.Error("expected handler to be called")
@@ -138,7 +138,7 @@ func TestLocalBus_MultipleHandlers(t *testing.T) {
 	}, event.WithHandlerName("handler2"))
 
 	evt := &testEvent{name: "user.created"}
-	bus.EmitSync(ctx, evt)
+	_, _ = bus.EmitSync(ctx, evt)
 
 	if count.Load() != 2 {
 		t.Errorf("expected 2 handlers to be called, got %d", count.Load())
@@ -164,7 +164,7 @@ func TestLocalBus_OnErrCallback(t *testing.T) {
 	}, event.WithHandlerName("failing-handler"))
 
 	evt := &testEvent{name: "user.created"}
-	bus.EmitSync(ctx, evt)
+	_, _ = bus.EmitSync(ctx, evt)
 
 	if capturedErr != handlerErr {
 		t.Errorf("expected error '%v', got '%v'", handlerErr, capturedErr)
@@ -188,7 +188,7 @@ func TestLocalBus_EventOnErrInterface(t *testing.T) {
 	}, event.WithHandlerName("handler"))
 
 	evt := &testEventWithOnErr{name: "user.created", onErrChan: errChan}
-	bus.EmitSync(ctx, evt)
+	_, _ = bus.EmitSync(ctx, evt)
 
 	select {
 	case err := <-errChan:
@@ -207,7 +207,7 @@ func TestLocalBus_NoHandlers(t *testing.T) {
 
 	// Should not panic when no handlers registered
 	evt := &testEvent{name: "unknown.event"}
-	bus.EmitSync(context.Background(), evt)
+	_, _ = bus.EmitSync(context.Background(), evt)
 }
 
 func TestLocalBus_ContextCancellation(t *testing.T) {
@@ -315,8 +315,8 @@ func TestLocalBus_RegisterSubscribers(t *testing.T) {
 		t.Fatalf("RegisterSubscribers failed: %v", err)
 	}
 
-	bus.EmitSync(ctx, &testEvent{name: "user.created"})
-	bus.EmitSync(ctx, &testEvent{name: "user.deleted"})
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created"})
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.deleted"})
 
 	if len(received) != 2 {
 		t.Errorf("expected 2 events received, got %d", len(received))
@@ -413,8 +413,8 @@ func TestLocalBus_RegisterSubscribers_MultipleSubscribers(t *testing.T) {
 		t.Fatalf("RegisterSubscribers failed: %v", err)
 	}
 
-	bus.EmitSync(ctx, &testEvent{name: "order.placed"})
-	bus.EmitSync(ctx, &testEvent{name: "order.shipped"})
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "order.placed"})
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "order.shipped"})
 
 	if received["order.placed"] != 1 {
 		t.Errorf("expected order.placed count 1, got %d", received["order.placed"])
@@ -447,7 +447,7 @@ func TestLocalBus_RegisterSubscribers_HandlerNameFromSubscriberName(t *testing.T
 		t.Fatalf("RegisterSubscribers failed: %v", err)
 	}
 
-	bus.EmitSync(ctx, &testEvent{name: "user.created"})
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created"})
 
 	if capturedHandler != "my-service" {
 		t.Errorf("expected handler name 'my-service', got '%s'", capturedHandler)
@@ -476,7 +476,7 @@ func TestLocalBus_RegisterSubscribers_WithSubscribeOptionsProvider(t *testing.T)
 		t.Fatalf("RegisterSubscribers failed: %v", err)
 	}
 
-	bus.EmitSync(ctx, &testEvent{name: "item.updated"})
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "item.updated"})
 	if !called {
 		t.Error("expected handler to be called")
 	}
@@ -488,5 +488,46 @@ func TestLocalBus_RegisterSubscribers_NoSubscribers(t *testing.T) {
 
 	if err := bus.RegisterSubscribers(ctx); err != nil {
 		t.Errorf("expected nil error for empty subscribers, got %v", err)
+	}
+}
+
+func TestLocalBus_NilInvoker_NoPanic(t *testing.T) {
+	ctx := context.Background()
+	// NewLocalBus with zero-value options (nil Invoker) must not panic.
+	// The bus should default to a passthrough invoker defined in the root module.
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	var called bool
+	err := bus.Subscribe(ctx, "test.event", func(ctx context.Context, e event.Event) error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "test.event"})
+
+	if !called {
+		t.Error("expected handler to be called with nil invoker, but it was not")
+	}
+}
+
+func TestLocalBus_EmitSync_ReturnsEventAndNil(t *testing.T) {
+	bus := event.NewLocalBus(event.LocalBusOptions{Invoker: &passthroughInvoker{}})
+	ctx := context.Background()
+	evt := &testEvent{name: "test.sync"}
+
+	// Subscribe so dispatch has something to call
+	_ = bus.Subscribe(ctx, "test.sync", func(_ context.Context, _ event.Event) error {
+		return nil
+	})
+
+	got, err := bus.EmitSync(ctx, evt)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if got != evt {
+		t.Errorf("expected same event back, got %v", got)
 	}
 }

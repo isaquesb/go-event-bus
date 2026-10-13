@@ -1,6 +1,6 @@
 module github.com/isaquesb/go-event-bus/jetstream
 
-go 1.25.0
+go 1.23
 
 require (
 	github.com/isaquesb/go-event-bus v0.2.0

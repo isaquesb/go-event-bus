@@ -23,19 +23,37 @@ func (f *fakeInvoker) Invoke(ctx context.Context, _ event.Event, _ string, fn fu
 	return fn(ctx)
 }
 
-// mockNatsConn records calls to Subscribe.
+// mockNatsConn records calls to Subscribe and optionally captures the callback.
 type mockNatsConn struct {
-	mu          sync.Mutex
-	subscribed  []string // subjects passed to Subscribe
+	mu           sync.Mutex
+	subscribed   []string // subjects passed to Subscribe
 	subscribeErr error
+	lastCb       natsgo.MsgHandler // capture the most recent callback
 }
 
-func (m *mockNatsConn) Subscribe(subj string, _ natsgo.MsgHandler) (*natsgo.Subscription, error) {
+func (m *mockNatsConn) Subscribe(subj string, cb natsgo.MsgHandler) (*natsgo.Subscription, error) {
 	m.mu.Lock()
 	m.subscribed = append(m.subscribed, subj)
+	m.lastCb = cb
 	m.mu.Unlock()
 	return nil, m.subscribeErr
 }
+
+// contextCapturingRegistry records the context passed to Decode.
+type contextCapturingRegistry struct {
+	decodeCalled bool
+	decodeCtx    context.Context
+}
+
+func (r *contextCapturingRegistry) Encode(_ context.Context, _ event.Event) ([]byte, error) {
+	return []byte("{}"), nil
+}
+func (r *contextCapturingRegistry) Decode(ctx context.Context, _ []byte) (context.Context, event.Event, error) {
+	r.decodeCalled = true
+	r.decodeCtx = ctx
+	return ctx, &fakeEvent{name: "test"}, nil
+}
+func (r *contextCapturingRegistry) Register(_ string, _ event.Factory, _ int) {}
 
 func (m *mockNatsConn) Publish(_ string, _ []byte) error           { return nil }
 func (m *mockNatsConn) Request(_ string, _ []byte, _ time.Duration) (*natsgo.Msg, error) {
@@ -162,5 +180,89 @@ func TestNatsBus_RegisterSubscribers_WithSubscribeOptionsProvider(t *testing.T) 
 
 	if len(subjects) != 1 || subjects[0] != "item.updated" {
 		t.Errorf("expected subscription on 'item.updated', got %v", subjects)
+	}
+}
+
+type ctxKey string
+
+func TestNatsBus_Subscribe_PropagatesContext(t *testing.T) {
+	mock := &mockNatsConn{}
+	reg := &contextCapturingRegistry{}
+	bus := &Bus{
+		nc:      mock,
+		reg:     reg,
+		timeout: 5 * time.Second,
+	}
+
+	const key ctxKey = "test-key"
+	parentCtx := context.WithValue(context.Background(), key, "test-value")
+
+	err := bus.Subscribe(parentCtx, "test.subject", noopHandler)
+	if err != nil {
+		t.Fatalf("unexpected Subscribe error: %v", err)
+	}
+
+	// Trigger the callback synchronously
+	mock.mu.Lock()
+	cb := mock.lastCb
+	mock.mu.Unlock()
+
+	if cb == nil {
+		t.Fatal("expected callback to be captured, got nil")
+	}
+
+	cb(&natsgo.Msg{Data: []byte("{}")})
+
+	if !reg.decodeCalled {
+		t.Fatal("expected Decode to be called")
+	}
+
+	if reg.decodeCtx == nil {
+		t.Fatal("expected Decode to receive a non-nil context")
+	}
+
+	if reg.decodeCtx.Value(key) != "test-value" {
+		t.Errorf("expected parent context to be propagated (key=%q), got context without the value", key)
+	}
+}
+
+func TestNatsBus_SubscribeSync_PropagatesContext(t *testing.T) {
+	mock := &mockNatsConn{}
+	reg := &contextCapturingRegistry{}
+	bus := &Bus{
+		nc:      mock,
+		reg:     reg,
+		timeout: 5 * time.Second,
+	}
+
+	const key ctxKey = "sync-test-key"
+	parentCtx := context.WithValue(context.Background(), key, "sync-test-value")
+
+	err := bus.SubscribeSync(parentCtx, "test.subject", noopHandler)
+	if err != nil {
+		t.Fatalf("unexpected SubscribeSync error: %v", err)
+	}
+
+	// Trigger the callback synchronously
+	mock.mu.Lock()
+	cb := mock.lastCb
+	mock.mu.Unlock()
+
+	if cb == nil {
+		t.Fatal("expected callback to be captured, got nil")
+	}
+
+	cb(&natsgo.Msg{Data: []byte("{}")})
+
+	if !reg.decodeCalled {
+		t.Fatal("expected Decode to be called")
+	}
+
+	if reg.decodeCtx == nil {
+		t.Fatal("expected Decode to receive a non-nil context")
+	}
+
+	if reg.decodeCtx.Value(key) != "sync-test-value" {
+		t.Errorf("expected parent context to be propagated (key=%q), got context without the value", key)
 	}
 }

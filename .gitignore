@@ -33,3 +33,7 @@ go.work.sum
 
 # Debug
 __debug_bin*
+
+# Local agent/planning files (never commit)
+CLAUDE.md
+.planning/
