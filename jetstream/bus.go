@@ -306,7 +306,7 @@ func (b *Bus) msgHandler(
 
 		default:
 			if b.onErr != nil {
-				b.onErr(ctx, evt, err, handlerName)
+				b.onErr(msgCtx, evt, err, handlerName)
 			}
 			_ = msg.Nak()
 		}

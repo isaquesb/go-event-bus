@@ -3,6 +3,7 @@ package jetstream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"sync"
@@ -281,4 +282,155 @@ func TestJetStreamBus_Emit_RegistryWithoutEnvelopeEncoder(t *testing.T) {
 	if string(pub.data) != "{}" {
 		t.Errorf("data = %q, want {} (Registry.Encode fallback)", pub.data)
 	}
+}
+
+func TestJetStreamBus_OnErrReceivesMessageContext(t *testing.T) {
+	var onErrCtx context.Context
+	js := &mdJS{}
+	bus := newMdBus(js, newMdRegistry("order.created"), BusOptions{
+		OnErr: func(ctx context.Context, _ event.Event, _ error, _ string) { onErrCtx = ctx },
+	})
+
+	if err := bus.Emit(context.Background(), &mdEvent{name: "order.created"}, event.WithID("id-err")); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	msg := &mdMsg{data: js.payload(t, 0).data}
+	bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
+		return errors.New("boom")
+	})(msg)
+
+	if onErrCtx == nil {
+		t.Fatal("OnErr was not called")
+	}
+	md, ok := event.MetadataFromContext(onErrCtx)
+	if !ok || md.ID != "id-err" {
+		t.Errorf("OnErr ctx metadata = %+v ok=%v, want ID id-err", md, ok)
+	}
+	if acks, naks, _ := msg.counts(); naks != 1 || acks != 0 {
+		t.Errorf("acks=%d naks=%d, want 0/1", acks, naks)
+	}
+}
+
+func TestJetStreamBus_DecodeFailureTerms(t *testing.T) {
+	var onErrCalled, fnCalled bool
+	bus := newMdBus(&mdJS{}, newMdRegistry("order.created"), BusOptions{
+		OnErr: func(context.Context, event.Event, error, string) { onErrCalled = true },
+	})
+
+	msg := &mdMsg{data: []byte("not json")}
+	bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
+		fnCalled = true
+		return nil
+	})(msg)
+
+	if acks, naks, terms := msg.counts(); terms != 1 || acks != 0 || naks != 0 {
+		t.Errorf("acks=%d naks=%d terms=%d, want 0/0/1", acks, naks, terms)
+	}
+	if onErrCalled || fnCalled {
+		t.Errorf("onErr called=%v, handler called=%v; want neither", onErrCalled, fnCalled)
+	}
+}
+
+func TestJetStreamBus_Metadata_NestedEmitLineage(t *testing.T) {
+	js := &mdJS{}
+	reg := newMdRegistry("order.created", "invoice.created")
+	bus := newMdBus(js, reg, BusOptions{})
+
+	if err := bus.Emit(context.Background(), &mdEvent{name: "order.created"}); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	msg := &mdMsg{data: js.payload(t, 0).data}
+	bus.msgHandler(context.Background(), "h", func(ctx context.Context, _ event.Event) error {
+		return bus.Emit(ctx, &mdEvent{name: "invoice.created"})
+	})(msg)
+	if acks, _, _ := msg.counts(); acks != 1 {
+		t.Errorf("acks = %d, want 1", acks)
+	}
+
+	if js.count() != 2 {
+		t.Fatalf("published %d messages, want 2", js.count())
+	}
+	parent := mdDecodeMetadata(t, reg, js.payload(t, 0).data)
+	child := mdDecodeMetadata(t, reg, js.payload(t, 1).data)
+
+	if parent.ID == "" {
+		t.Fatal("parent has no id")
+	}
+	if child.CausationID != parent.ID {
+		t.Errorf("child CausationID = %q, want parent ID %q", child.CausationID, parent.ID)
+	}
+	if child.CorrelationID != parent.CorrelationID {
+		t.Errorf("child CorrelationID = %q, want %q", child.CorrelationID, parent.CorrelationID)
+	}
+	if child.ID == "" || child.ID == parent.ID {
+		t.Errorf("child ID = %q, want a new id different from %q", child.ID, parent.ID)
+	}
+}
+
+func TestJetStreamBus_MetadataOptions(t *testing.T) {
+	var (
+		mu sync.Mutex
+		n  int
+	)
+	gen := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		n++
+		return fmt.Sprintf("gen-%d", n)
+	}
+	js := &mdJS{}
+	reg := newMdRegistry("root.event", "child.event")
+	bus := newMdBus(js, reg, BusOptions{
+		IDGenerator:    gen,
+		InheritHeaders: []string{"tenant"},
+	})
+
+	err := bus.Emit(context.Background(), &mdEvent{name: "root.event"},
+		event.WithHeader("tenant", "acme"),
+		event.WithHeader("secret", "s"),
+	)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	msg := &mdMsg{data: js.payload(t, 0).data}
+	bus.msgHandler(context.Background(), "h", func(ctx context.Context, _ event.Event) error {
+		return bus.Emit(ctx, &mdEvent{name: "child.event"})
+	})(msg)
+
+	root := mdDecodeMetadata(t, reg, js.payload(t, 0).data)
+	child := mdDecodeMetadata(t, reg, js.payload(t, 1).data)
+
+	if root.ID != "gen-1" {
+		t.Errorf("root ID = %q, want gen-1", root.ID)
+	}
+	if root.Headers["secret"] != "s" {
+		t.Errorf("root Headers = %v, want the explicit secret header on the root", root.Headers)
+	}
+	if child.ID != "gen-2" {
+		t.Errorf("child ID = %q, want gen-2", child.ID)
+	}
+	if child.CausationID != "gen-1" {
+		t.Errorf("child CausationID = %q, want gen-1", child.CausationID)
+	}
+	if child.Headers["tenant"] != "acme" {
+		t.Errorf("child Headers = %v, want tenant=acme", child.Headers)
+	}
+	if _, leaked := child.Headers["secret"]; leaked {
+		t.Errorf("child Headers = %v, non-allowlisted key secret must not be inherited", child.Headers)
+	}
+}
+
+// mdDecodeMetadata decodes data with reg and returns the Metadata it carries.
+func mdDecodeMetadata(t *testing.T, reg *mdRegistry, data []byte) event.Metadata {
+	t.Helper()
+	ctx, _, err := reg.Decode(context.Background(), data)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	md, ok := event.MetadataFromContext(ctx)
+	if !ok {
+		t.Fatal("decoded ctx carries no Metadata")
+	}
+	return md
 }
