@@ -17,12 +17,6 @@ type fakeEvent struct{ name string }
 
 func (e *fakeEvent) Name() string { return e.name }
 
-type fakeInvoker struct{}
-
-func (f *fakeInvoker) Invoke(ctx context.Context, _ event.Event, _ string, fn func(context.Context) error) error {
-	return fn(ctx)
-}
-
 // mockNatsConn records calls to Subscribe and optionally captures the callback.
 type mockNatsConn struct {
 	mu           sync.Mutex

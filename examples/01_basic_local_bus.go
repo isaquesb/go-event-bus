@@ -89,9 +89,18 @@ func ExampleBasicLocalBus() {
 	ctx := context.Background()
 
 	// Register handlers
-	bus.Subscribe(ctx, "user.created", SendWelcomeEmail, event.WithHandlerName("send-welcome-email"))
-	bus.Subscribe(ctx, "user.created", CreateUserProfile, event.WithHandlerName("create-user-profile"))
-	bus.Subscribe(ctx, "order.placed", NotifyWarehouse, event.WithHandlerName("notify-warehouse"))
+	if err := bus.Subscribe(ctx, "user.created", SendWelcomeEmail, event.WithHandlerName("send-welcome-email")); err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return
+	}
+	if err := bus.Subscribe(ctx, "user.created", CreateUserProfile, event.WithHandlerName("create-user-profile")); err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return
+	}
+	if err := bus.Subscribe(ctx, "order.placed", NotifyWarehouse, event.WithHandlerName("notify-warehouse")); err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return
+	}
 
 	// Synchronous - waits for all handlers to complete
 	bus.EmitSync(ctx, UserCreated{

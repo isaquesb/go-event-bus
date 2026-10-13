@@ -165,7 +165,7 @@ func ExampleFullInvokerChain() {
 	ctx := context.Background()
 
 	// Register handler
-	bus.Subscribe(ctx, "payment.processed", func(ctx context.Context, evt event.Event) error {
+	if err := bus.Subscribe(ctx, "payment.processed", func(ctx context.Context, evt event.Event) error {
 		payment := evt.(PaymentProcessed)
 		slog.Info("processing payment",
 			"payment_id", payment.PaymentID,
@@ -188,7 +188,10 @@ func ExampleFullInvokerChain() {
 		}
 
 		return nil
-	}, event.WithHandlerName("update-balance"))
+	}, event.WithHandlerName("update-balance")); err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return
+	}
 
 	// Emit events
 

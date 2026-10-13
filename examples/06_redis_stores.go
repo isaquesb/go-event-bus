@@ -64,7 +64,7 @@ func ExampleRedisStores() {
 		slog.Error("failed to connect to Redis", "error", err)
 		return
 	}
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	// Create Redis-backed stores
 	idempotencyStore := redis.NewIdempotencyStore(rdb)
@@ -137,7 +137,7 @@ func ExampleRedisStores() {
 	})
 
 	// Register handler
-	bus.Subscribe(ctx, "order.created", func(ctx context.Context, evt event.Event) error {
+	if err := bus.Subscribe(ctx, "order.created", func(ctx context.Context, evt event.Event) error {
 		order := evt.(OrderCreated)
 		slog.Info("processing order",
 			"order_id", order.OrderID,
@@ -146,7 +146,10 @@ func ExampleRedisStores() {
 		)
 		// ... process order
 		return nil
-	}, event.WithHandlerName("process-order"))
+	}, event.WithHandlerName("process-order")); err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return
+	}
 
 	// Test scenarios
 	order := OrderCreated{

@@ -33,11 +33,7 @@ func (r *Replayer) Replay(
 
 	count := 0
 
-	for {
-		if opts.Limit > 0 && count >= opts.Limit {
-			break
-		}
-
+	for opts.Limit <= 0 || count < opts.Limit {
 		msg, err := c.Next()
 		if err != nil {
 			break

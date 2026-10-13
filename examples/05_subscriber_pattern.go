@@ -103,9 +103,7 @@ func (s *EmailSubscriber) handleUserDeleted(ctx context.Context, evt event.Event
 // Analytics Subscriber - Tracks user events for analytics
 // =============================================================================
 
-type AnalyticsSubscriber struct {
-	analyticsClient interface{} // Your analytics client
-}
+type AnalyticsSubscriber struct{}
 
 func NewAnalyticsSubscriber() *AnalyticsSubscriber {
 	return &AnalyticsSubscriber{}
@@ -251,18 +249,24 @@ func ExampleSubscriberPattern() {
 	ctx := context.Background()
 
 	// Register all subscribers at once
-	bus.RegisterSubscribers(ctx,
+	if err := bus.RegisterSubscribers(ctx,
 		NewEmailSubscriber("smtp.example.com", "noreply@example.com"),
 		NewAnalyticsSubscriber(),
 		NewBillingSubscriber("sk_test_xxx"),
-	)
+	); err != nil {
+		slog.Error("register subscribers failed", "error", err)
+		return
+	}
 
 	// Alternative: Register individual handlers
-	bus.Subscribe(ctx, "user.signed_up", func(ctx context.Context, evt event.Event) error {
+	if err := bus.Subscribe(ctx, "user.signed_up", func(ctx context.Context, evt event.Event) error {
 		e := evt.(UserSignedUp)
 		slog.Info("audit: user signed up", "user_id", e.UserID)
 		return nil
-	}, event.WithHandlerName("audit-log"))
+	}, event.WithHandlerName("audit-log")); err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return
+	}
 
 	// This will trigger:
 	// - EmailSubscriber.handleUserSignedUp
@@ -287,9 +291,12 @@ func ExampleSubscriberPattern() {
 
 	// Example with OnErr interface
 	errChan := make(chan error, 1)
-	bus.Subscribe(ctx, "critical.event", func(ctx context.Context, evt event.Event) error {
+	if err := bus.Subscribe(ctx, "critical.event", func(ctx context.Context, evt event.Event) error {
 		return errors.New("simulated failure")
-	}, event.WithHandlerName("failing-handler"))
+	}, event.WithHandlerName("failing-handler")); err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return
+	}
 
 	bus.EmitSync(ctx, &CriticalEvent{
 		ID:      "critical-1",

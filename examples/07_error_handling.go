@@ -259,7 +259,10 @@ func ExampleErrorHandling() {
 
 	ctx := context.Background()
 
-	bus.Subscribe(ctx, "payment.request", ProcessPayment, event.WithHandlerName("process-payment"))
+	if err := bus.Subscribe(ctx, "payment.request", ProcessPayment, event.WithHandlerName("process-payment")); err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return
+	}
 
 	// Valid payment - succeeds
 	slog.Info("=== Valid payment ===")
