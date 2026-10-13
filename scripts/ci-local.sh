@@ -5,7 +5,8 @@
 #   MODULE: root (alias "."), invoker, json, nats, jetstream, redis,
 #           telemetry, prometheus, examples. No MODULE = all 9 + workspace check.
 #   --integration: also run the JetStream integration tests against nats:2.15.1
-#           (uses $NATS_URL as-is when already set, otherwise starts docker).
+#           (uses $NATS_URL as-is when already set, otherwise starts docker;
+#           override host ports with NATS_HOST_PORT / NATS_MON_PORT, default 4222 / 8222).
 #
 # Never touches ./go.work or ./go.work.sum, never pushes, never edits tracked files.
 set -euo pipefail
@@ -96,11 +97,14 @@ fi
 
 if [ "$INTEGRATION" -eq 1 ]; then
   if [ -z "${NATS_URL:-}" ]; then
-    docker run -d --rm --name nats-ci-local -p 4222:4222 -p 8222:8222 nats:2.15.1 -js -m 8222 >/dev/null
+    # Host ports default to the CI values; override when 4222/8222 are taken.
+    NATS_HOST_PORT="${NATS_HOST_PORT:-4222}"
+    NATS_MON_PORT="${NATS_MON_PORT:-8222}"
+    docker run -d --rm --name nats-ci-local -p "${NATS_HOST_PORT}:4222" -p "${NATS_MON_PORT}:8222" nats:2.15.1 -js -m 8222 >/dev/null
     trap 'docker stop nats-ci-local >/dev/null 2>&1 || true; rm -rf "${TMPDIR_WS:-}"' EXIT
     ready=0
     for _ in $(seq 1 30); do
-      if curl -sf 'http://localhost:8222/healthz?js-enabled-only=true' >/dev/null; then
+      if curl -sf "http://localhost:${NATS_MON_PORT}/healthz?js-enabled-only=true" >/dev/null; then
         ready=1
         break
       fi
@@ -110,7 +114,7 @@ if [ "$INTEGRATION" -eq 1 ]; then
       docker logs nats-ci-local || true
       fail integration "nats-server not healthy"
     fi
-    export NATS_URL=nats://localhost:4222
+    export NATS_URL="nats://localhost:${NATS_HOST_PORT}"
   fi
   (
     cd "$ROOT/jetstream"
