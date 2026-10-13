@@ -3,7 +3,7 @@ module github.com/isaquesb/go-event-bus/json
 go 1.26.0
 
 require (
-	github.com/isaquesb/go-event-bus v0.2.0
+	github.com/isaquesb/go-event-bus v0.3.0
 	go.opentelemetry.io/otel/trace v1.47.0
 )
 
