@@ -37,10 +37,27 @@ Full API documentation is available on pkg.go.dev:
 - [`SubscribeOptionsProvider`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#SubscribeOptionsProvider) - Optional interface for subscriber-level subscribe options
 - [`EmitOption`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#EmitOption) - Functional option for Emit
 - [`WithSubject`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithSubject) - Overrides the publish subject (defaults to `evt.Name()`)
+- [`Metadata`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#Metadata) - Identity, causal lineage and headers of one event, read by handlers
+- [`WithMetadata`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithMetadata) - Returns a context that carries a `Metadata`
+- [`MetadataFromContext`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#MetadataFromContext) - Reads the `Metadata` of the event being handled from the handler context
+- [`ResolveOutbound`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#ResolveOutbound) - Resolves the `Metadata` of an event about to be emitted (id, correlation, causation, headers)
+- [`EnvelopeEncoder`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#EnvelopeEncoder) - Optional registry interface: `EncodeWith` encodes with already resolved `Metadata`
+- [`EncodeEvent`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#EncodeEvent) - Encodes with `EncodeWith` when the registry implements `EnvelopeEncoder`, else `Encode`
+- [`NewID`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#NewID) - Generates a UUIDv7 message id
+- [`WithID`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithID) - Sets the message id of an emitted event
+- [`WithCorrelationID`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithCorrelationID) - Sets the correlation id of an emitted event
+- [`WithHeader`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithHeader) - Attaches a user header to an emitted event (repeatable)
 - [`SubscribeOption`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#SubscribeOption) - Functional option for Subscribe
 - [`WithHandlerName`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithHandlerName) - Sets handler name for metrics/logging
 - [`WithStream`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithStream) - JetStream stream name (required for JetStream)
 - [`WithConsumer`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#WithConsumer) - JetStream durable consumer name
+
+### JSON Registry
+
+- [`Option`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/json#Option) - Functional option for `json.NewRegistry`
+- [`WithPropagator`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/json#WithPropagator) - Replaces the default W3C trace context and baggage propagator
+- [`WithIDGenerator`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/json#WithIDGenerator) - Sets the id generator used for events without an explicit id
+- [`EncodeWith`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/json#Registry.EncodeWith) - Encodes an event with explicit `Metadata`
 
 ### Invoker
 
@@ -61,5 +78,10 @@ Full API documentation is available on pkg.go.dev:
 - [`ErrRateLimited`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#ErrRateLimited) - Rate limit exceeded
 - [`ErrCircuitOpen`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#ErrCircuitOpen) - Circuit breaker open
 - [`ErrSendToDLQ`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#ErrSendToDLQ) - Terminal error signal
+- [`ErrUnknownEvent`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#ErrUnknownEvent) - Decode: the envelope names an event that is not registered
+- [`ErrMalformedEnvelope`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#ErrMalformedEnvelope) - Decode: undecodable bytes, missing name, negative version or a payload that does not fit the event
+- [`ErrMissingUpcaster`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#ErrMissingUpcaster) - Decode: no upcaster for an intermediate version
+- [`ErrUnknownVersion`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#ErrUnknownVersion) - Decode: the envelope version is newer than the latest registered version
+- [`DecodeError`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#DecodeError) - Wraps a decode failure with the event name and version; `errors.Is` and `errors.As` both work
 - [`ErrStreamRequired`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/jetstream#ErrStreamRequired) - JetStream `Subscribe` called without `WithStream`
 - [`ErrInvalidConfig`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/jetstream#ErrInvalidConfig) - Invalid JetStream consumer configuration (for example `MaxDeliver` inconsistent with the backoff length)
