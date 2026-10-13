@@ -41,6 +41,10 @@ bus := jetstream.NewBus(js, registry, jetstream.BusOptions{
 | `OnErr` | `func(...)` | nil | Error callback |
 | `CircuitOpenDelay` | `time.Duration` | 30s (warning) | NAK delay when circuit is open |
 | `RateLimitDelay` | `time.Duration` | 5s (warning) | NAK delay when rate limited |
+| `IDGenerator` | `func() string` | `event.NewID` (UUIDv7) | Mints the message id of events that carry neither `event.WithID` nor an `Id()` method |
+| `InheritHeaders` | `[]string` | empty | Header keys copied from the handled event to events emitted with its context |
+
+Header inheritance is opt-in: only the keys listed in `InheritHeaders` are copied from the handled event to events emitted with its context, and an explicit `event.WithHeader` overrides an inherited value. Trace context and correlation propagate regardless of this list. Headers are producer data visible to every consumer, so never carry secrets in them or allowlist secret-bearing keys.
 
 ## Publishing
 
@@ -53,6 +57,8 @@ err = bus.Emit(ctx, chatMessage, event.WithSubject("chat.message.room-general"))
 ```
 
 The subject defaults to `evt.Name()`. Use `WithSubject` to override it for hierarchical routing.
+
+`Emit` also accepts the [metadata options]({{ site.baseurl }}/core-concepts/event-interface/#event-metadata) `event.WithID`, `event.WithCorrelationID` and repeatable `event.WithHeader`. Every envelope carries a message id, the W3C `traceparent` header and, when `ctx` is a handler context, the causal lineage of the handled event.
 
 ## Subscribing
 
@@ -80,6 +86,21 @@ The bus classifies invoker errors to decide message acknowledgment:
 | `ErrRateLimited` | `msg.NakWithDelay(RateLimitDelay)` |
 | Other errors | `msg.Nak()` (immediate retry, bounded by MaxDeliver/BackOff) |
 | Decode failure | `msg.Term()` (malformed, never retried) |
+
+The decode failure is a typed `*event.DecodeError` wrapping `event.ErrMalformedEnvelope`, `event.ErrUnknownEvent`, `event.ErrUnknownVersion` or `event.ErrMissingUpcaster`; see [JSON Registry]({{ site.baseurl }}/serialization/json-registry/#decode-errors).
+
+## Metadata
+
+The consumer decodes the envelope and puts the event [Metadata]({{ site.baseurl }}/core-concepts/event-interface/#event-metadata) in the handler context, together with the producer's trace context. Handlers read it with `event.MetadataFromContext(ctx)`.
+
+The `OnErr` callback receives the **message context**, which carries the event Metadata and trace, not the subscription context. Use it to log the message id and correlation id of a failed delivery:
+
+```go
+OnErr: func(ctx context.Context, evt event.Event, err error, handler string) {
+    md, _ := event.MetadataFromContext(ctx)
+    slog.Error("handler failed", "handler", handler, "message", md.ID, "correlation", md.CorrelationID, "error", err)
+},
+```
 
 ## Stream Configuration
 
