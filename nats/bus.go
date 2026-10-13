@@ -3,6 +3,7 @@ package nats
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/isaquesb/go-event-bus"
@@ -30,6 +31,12 @@ type BusOptions struct {
 	// Invoker for cross-cutting concerns (retry, metrics, etc.)
 	Invoker event.Invoker
 	OnErr   func(ctx context.Context, evt event.Event, err error, handler string)
+	// IDGenerator mints event ids when neither WithID nor the event's Id()
+	// provides one. Nil means event.NewID.
+	IDGenerator func() string
+	// InheritHeaders lists the header keys copied from the handled event to
+	// events emitted with its ctx. Empty by default.
+	InheritHeaders []string
 }
 
 func NewNatsBus(
@@ -47,6 +54,8 @@ func NewNatsBus(
 		timeout: opts.RequestTimeout,
 		invoker: opts.Invoker,
 		onErr:   opts.OnErr,
+		idGen:   opts.IDGenerator,
+		inherit: slices.Clone(opts.InheritHeaders),
 	}
 }
 
@@ -57,10 +66,21 @@ type Bus struct {
 	timeout time.Duration
 	invoker event.Invoker
 	onErr   func(ctx context.Context, evt event.Event, err error, handler string)
+	idGen   func() string
+	inherit []string
+}
+
+// resolve applies the bus-owned options to cfg and resolves the Metadata of an
+// event about to be emitted.
+func (b *Bus) resolve(ctx context.Context, e event.Event, cfg event.EmitOptions) event.Metadata {
+	cfg.IDGenerator = b.idGen
+	cfg.InheritHeaders = b.inherit
+	return event.ResolveOutbound(ctx, e, cfg)
 }
 
 func (b *Bus) Emit(ctx context.Context, e event.Event, opts ...event.EmitOption) error {
 	cfg := event.ApplyEmitOptions(e, opts...)
+	md := b.resolve(ctx, e, cfg)
 
 	ctx, span := tracer.Start(ctx, "eventbus.emit",
 		trace.WithSpanKind(trace.SpanKindProducer),
@@ -72,7 +92,7 @@ func (b *Bus) Emit(ctx context.Context, e event.Event, opts ...event.EmitOption)
 	)
 	defer span.End()
 
-	data, err := b.reg.Encode(ctx, e)
+	data, err := event.EncodeEvent(ctx, b.reg, e, md)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
