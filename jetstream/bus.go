@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -45,6 +46,13 @@ type BusOptions struct {
 	// RateLimitDelay is the delay before redelivery when rate limited.
 	// If zero, defaults to 5s and logs a warning.
 	RateLimitDelay time.Duration
+
+	// IDGenerator generates event ids. Nil means event.NewID.
+	IDGenerator func() string
+
+	// InheritHeaders lists the header keys copied from the handled event to
+	// events emitted with its ctx. Empty by default: nothing is inherited.
+	InheritHeaders []string
 }
 
 type Bus struct {
@@ -52,6 +60,8 @@ type Bus struct {
 	registry event.Registry
 	onErr    func(ctx context.Context, evt event.Event, err error, handler string)
 	invoker  event.Invoker
+	idGen    func() string
+	inherit  []string
 
 	circuitOpenDelay time.Duration
 	rateLimitDelay   time.Duration
@@ -86,7 +96,17 @@ func NewBus(
 		invoker:          opts.Invoker,
 		circuitOpenDelay: opts.CircuitOpenDelay,
 		rateLimitDelay:   opts.RateLimitDelay,
+		idGen:            opts.IDGenerator,
+		inherit:          slices.Clone(opts.InheritHeaders),
 	}
+}
+
+// resolve applies the bus-owned options to cfg and resolves the Metadata of an
+// event about to be emitted.
+func (b *Bus) resolve(ctx context.Context, e event.Event, cfg event.EmitOptions) event.Metadata {
+	cfg.IDGenerator = b.idGen
+	cfg.InheritHeaders = b.inherit
+	return event.ResolveOutbound(ctx, e, cfg)
 }
 
 func (b *Bus) Emit(
@@ -95,6 +115,7 @@ func (b *Bus) Emit(
 	opts ...event.EmitOption,
 ) error {
 	cfg := event.ApplyEmitOptions(evt, opts...)
+	md := b.resolve(ctx, evt, cfg)
 
 	ctx, span := tracer.Start(ctx, "eventbus.emit",
 		trace.WithSpanKind(trace.SpanKindProducer),
@@ -106,7 +127,7 @@ func (b *Bus) Emit(
 	)
 	defer span.End()
 
-	data, err := b.registry.Encode(ctx, evt)
+	data, err := event.EncodeEvent(ctx, b.registry, evt, md)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
