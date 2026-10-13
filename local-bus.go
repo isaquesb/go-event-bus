@@ -25,6 +25,10 @@ type LocalBusOptions struct {
 	Invoker       Invoker
 	OnErr         func(ctx context.Context, evt Event, err error, handler string)
 	MaxConcurrent int
+
+	// IDGenerator mints ids for events that carry no id of their own.
+	// Nil means NewID.
+	IDGenerator func() string
 }
 
 func NewLocalBus(opts LocalBusOptions) *LocalBus {
@@ -39,6 +43,7 @@ func NewLocalBus(opts LocalBusOptions) *LocalBus {
 		onErr:    opts.OnErr,
 		invoker:  opts.Invoker,
 		sem:      make(chan struct{}, opts.MaxConcurrent),
+		idGen:    opts.IDGenerator,
 	}
 }
 
@@ -50,6 +55,7 @@ type LocalBus struct {
 	onErr    func(ctx context.Context, evt Event, err error, handler string)
 	invoker  Invoker
 	sem      chan struct{}
+	idGen    func() string
 }
 
 // Subscribe registers a handler for events on the given subject.
@@ -155,12 +161,16 @@ func (b *LocalBus) dispatch(
 
 func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 	cfg := ApplyEmitOptions(e, opts...)
-	b.dispatch(ctx, cfg.Subject, e, true)
+	cfg.IDGenerator = b.idGen
+	md := ResolveOutbound(ctx, e, cfg)
+	b.dispatch(WithMetadata(ctx, md), cfg.Subject, e, true)
 }
 
 func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) (Event, error) {
 	cfg := ApplyEmitOptions(e, opts...)
-	b.dispatch(ctx, cfg.Subject, e, false)
+	cfg.IDGenerator = b.idGen
+	md := ResolveOutbound(ctx, e, cfg)
+	b.dispatch(WithMetadata(ctx, md), cfg.Subject, e, false)
 	return e, nil
 }
 

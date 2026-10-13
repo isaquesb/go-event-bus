@@ -3,6 +3,7 @@ package event_test
 import (
 	"context"
 	"errors"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -537,5 +538,134 @@ func TestLocalBus_EmitSync_ReturnsEventAndNil(t *testing.T) {
 	}
 	if got != evt {
 		t.Errorf("expected same event back, got %v", got)
+	}
+}
+
+func TestLocalBus_Metadata_EmitSyncHandlerReadsMetadata(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	var (
+		got event.Metadata
+		ok  bool
+	)
+	_ = bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		got, ok = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created"},
+		event.WithID("id-1"), event.WithCorrelationID("corr-1"))
+
+	if !ok {
+		t.Fatal("expected metadata in handler ctx")
+	}
+	if got.ID != "id-1" || got.CorrelationID != "corr-1" {
+		t.Errorf("got ID %q CorrelationID %q", got.ID, got.CorrelationID)
+	}
+	if got.CausationID != "" {
+		t.Errorf("expected empty CausationID, got %q", got.CausationID)
+	}
+	if got.Name != "user.created" || got.Version != 1 {
+		t.Errorf("got Name %q Version %d", got.Name, got.Version)
+	}
+	if got.Timestamp.IsZero() {
+		t.Error("expected non-zero Timestamp")
+	}
+}
+
+var uuidV7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+func TestLocalBus_Metadata_AsyncEmit(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	ch := make(chan event.Metadata, 1)
+	_ = bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		md, _ := event.MetadataFromContext(ctx)
+		ch <- md
+		return nil
+	})
+
+	bus.Emit(ctx, &testEvent{name: "user.created"})
+
+	select {
+	case md := <-ch:
+		if !uuidV7Re.MatchString(md.ID) {
+			t.Errorf("ID %q is not a UUIDv7", md.ID)
+		}
+		if md.CorrelationID != md.ID {
+			t.Errorf("root CorrelationID %q should equal ID %q", md.CorrelationID, md.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for handler")
+	}
+}
+
+func TestLocalBus_Metadata_NestedEmitLineage(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	var order, invoice event.Metadata
+	_ = bus.Subscribe(ctx, "order.created", func(ctx context.Context, e event.Event) error {
+		order, _ = event.MetadataFromContext(ctx)
+		_, err := bus.EmitSync(ctx, &testEvent{name: "invoice.created"})
+		return err
+	})
+	_ = bus.Subscribe(ctx, "invoice.created", func(ctx context.Context, e event.Event) error {
+		invoice, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "order.created"})
+
+	if order.ID == "" {
+		t.Fatal("order metadata missing")
+	}
+	if invoice.CausationID != order.ID {
+		t.Errorf("CausationID %q, want order ID %q", invoice.CausationID, order.ID)
+	}
+	if invoice.CorrelationID != order.CorrelationID || order.CorrelationID != order.ID {
+		t.Errorf("CorrelationID invoice %q order %q order ID %q",
+			invoice.CorrelationID, order.CorrelationID, order.ID)
+	}
+	if invoice.ID == order.ID {
+		t.Error("child must have its own id")
+	}
+}
+
+func TestLocalBus_Metadata_WithIdEventIsMessageID(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	var got event.Metadata
+	_ = bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		got, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created", id: "evt-7"})
+
+	if got.ID != "evt-7" {
+		t.Errorf("ID %q, want evt-7", got.ID)
+	}
+}
+
+func TestLocalBus_Metadata_IDGeneratorOption(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{
+		IDGenerator: func() string { return "gen-1" },
+	})
+
+	var got event.Metadata
+	_ = bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		got, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created"})
+
+	if got.ID != "gen-1" {
+		t.Errorf("ID %q, want gen-1", got.ID)
 	}
 }

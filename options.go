@@ -6,6 +6,19 @@ import "time"
 type EmitOptions struct {
 	// Subject overrides the default publish subject (defaults to evt.Name())
 	Subject string
+
+	// ID is the message id set by WithID. Empty means unset.
+	ID string
+
+	// CorrelationID is the correlation id set by WithCorrelationID.
+	// Empty means unset.
+	CorrelationID string
+
+	// IDGenerator mints an id when neither WithID nor the event's Id()
+	// provides one. It is populated by the bus from its own options after
+	// the user options are applied; a value set through an EmitOption is
+	// overwritten by the bus. Nil means NewID.
+	IDGenerator func() string
 }
 
 // EmitOption configures Emit behavior
@@ -16,6 +29,22 @@ type EmitOption func(*EmitOptions)
 func WithSubject(subject string) EmitOption {
 	return func(o *EmitOptions) {
 		o.Subject = subject
+	}
+}
+
+// WithID sets the message id of the emitted event, overriding both the
+// event's Id() and the generated id. An empty id leaves the id unset.
+func WithID(id string) EmitOption {
+	return func(o *EmitOptions) {
+		o.ID = id
+	}
+}
+
+// WithCorrelationID sets the correlation id of the emitted event, overriding
+// the one inherited from the parent event. An empty id leaves it unset.
+func WithCorrelationID(id string) EmitOption {
+	return func(o *EmitOptions) {
+		o.CorrelationID = id
 	}
 }
 
