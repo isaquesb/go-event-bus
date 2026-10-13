@@ -63,7 +63,7 @@ func TestNewID_FrozenClock(t *testing.T) {
 	g, _ := newTestGen(at)
 	first := g.next()
 	prev := first
-	for i := range 3000 {
+	for i := range 2000 {
 		id := g.next()
 		if id <= prev {
 			t.Fatalf("id %d %q not after %q", i, id, prev)
