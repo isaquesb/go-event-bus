@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/isaquesb/go-event-bus"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -23,6 +24,7 @@ type Registry struct {
 	upcasters map[eventKey]event.Upcaster
 	latest    map[string]int
 	idGen     func() string
+	prop      propagation.TextMapPropagator
 }
 
 // Option configures a Registry created by NewRegistry.
@@ -39,6 +41,17 @@ func WithIDGenerator(gen func() string) Option {
 	}
 }
 
+// WithPropagator replaces the default W3C trace context and baggage
+// propagator used to write and read trace headers in the envelope. A nil p
+// keeps the default. The process-global propagator is never used.
+func WithPropagator(p propagation.TextMapPropagator) Option {
+	return func(r *Registry) {
+		if p != nil {
+			r.prop = p
+		}
+	}
+}
+
 // NewRegistry returns an empty Registry. Options are optional, so existing
 // NewRegistry() callers compile unchanged.
 func NewRegistry(opts ...Option) *Registry {
@@ -46,6 +59,10 @@ func NewRegistry(opts ...Option) *Registry {
 		factories: make(map[eventKey]event.Factory),
 		upcasters: make(map[eventKey]event.Upcaster),
 		latest:    make(map[string]int),
+		prop: propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{},
+			propagation.Baggage{},
+		),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -124,8 +141,18 @@ func (r *Registry) EncodeWith(ctx context.Context, evt event.Event, md event.Met
 		CausationID:   md.CausationID,
 		Payload:       payload,
 	}
-	if len(md.Headers) > 0 {
-		env.Headers = maps.Clone(md.Headers)
+
+	// System wins (D-12): drop any user header the propagator owns, then let
+	// it write. The map is always allocated, because MapCarrier.Set panics on
+	// a nil map when the span context is valid.
+	headers := make(map[string]string, len(md.Headers)+3)
+	maps.Copy(headers, md.Headers)
+	for _, k := range r.prop.Fields() {
+		delete(headers, k)
+	}
+	r.prop.Inject(ctx, propagation.MapCarrier(headers))
+	if len(headers) > 0 {
+		env.Headers = headers
 	}
 
 	span := trace.SpanFromContext(ctx)
@@ -145,22 +172,7 @@ func (r *Registry) Decode(ctx context.Context, data []byte) (context.Context, ev
 		return ctx, nil, err
 	}
 
-	if env.TraceID != "" {
-		traceId, tErr := trace.TraceIDFromHex(env.TraceID)
-		spanId, sErr := trace.SpanIDFromHex(env.SpanID)
-
-		if tErr == nil && sErr == nil {
-			ctx = trace.ContextWithSpanContext(
-				ctx,
-				trace.NewSpanContext(trace.SpanContextConfig{
-					TraceID:    traceId,
-					SpanID:     spanId,
-					TraceFlags: trace.FlagsSampled,
-					Remote:     true,
-				}),
-			)
-		}
-	}
+	ctx = r.extractTrace(ctx, &env)
 
 	version := env.Version
 	if version == 0 {
@@ -214,6 +226,45 @@ func (r *Registry) Decode(ctx context.Context, data []byte) (context.Context, ev
 	}
 
 	return ctx, evt, nil
+}
+
+// extractTrace restores the producer's trace context. A valid remote span
+// context extracted from the W3C headers wins, so the producer's sampled flag
+// and tracestate are honored (D-15). Otherwise, an envelope that carries
+// legacy trace_id and span_id is read as sampled and remote (D-16), which also
+// covers a malformed traceparent.
+//
+// Extract has no error result, so success is detected on the result: a
+// successful extraction always yields a remote span context, while a local
+// span already in ctx comes back unchanged and not remote.
+func (r *Registry) extractTrace(ctx context.Context, env *event.Envelope) context.Context {
+	base := ctx
+	if len(env.Headers) > 0 {
+		out := r.prop.Extract(ctx, propagation.MapCarrier(env.Headers))
+		if sc := trace.SpanContextFromContext(out); sc.IsValid() && sc.IsRemote() {
+			return out
+		}
+		base = out // keeps baggage extracted from the headers
+	}
+
+	if env.TraceID != "" {
+		traceId, tErr := trace.TraceIDFromHex(env.TraceID)
+		spanId, sErr := trace.SpanIDFromHex(env.SpanID)
+
+		if tErr == nil && sErr == nil {
+			return trace.ContextWithSpanContext(
+				base,
+				trace.NewSpanContext(trace.SpanContextConfig{
+					TraceID:    traceId,
+					SpanID:     spanId,
+					TraceFlags: trace.FlagsSampled,
+					Remote:     true,
+				}),
+			)
+		}
+	}
+
+	return base
 }
 
 type eventKey struct {
