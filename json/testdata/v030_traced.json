@@ -1,0 +1,1 @@
+{"name":"user.created","version":1,"ts":"2026-10-13T15:32:18.140707127Z","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","payload":{"user_id":"user-123","name":"John"}}
