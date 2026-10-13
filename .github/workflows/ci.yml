@@ -6,38 +6,146 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
+env:
+  # A go.mod that needs a newer Go fails instead of silently auto-downloading a toolchain.
+  GOTOOLCHAIN: local
+
 jobs:
   test:
+    name: test (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { module: ".", flag: root }
+          - { module: invoker, flag: invoker }
+          - { module: json, flag: json }
+          - { module: nats, flag: nats }
+          - { module: jetstream, flag: jetstream }
+          - { module: redis, flag: redis }
+          - { module: telemetry, flag: telemetry }
+          - { module: prometheus, flag: prometheus }
+          - { module: examples, flag: examples }
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
+
+      - name: Go directive guard
+        run: |
+          grep -qx 'go 1.26.0' go.mod || { echo "go.mod must declare exactly 'go 1.26.0'"; exit 1; }
+          if grep -q '^toolchain ' go.mod; then echo "go.mod must not carry a toolchain line"; exit 1; fi
+
+      - name: Check go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        if: matrix.module != 'examples'
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload coverage to Codecov
+        if: matrix.module != 'examples' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: codecov/codecov-action@v7
+        with:
+          files: ${{ matrix.module }}/coverage.out
+          flags: ${{ matrix.flag }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  lint:
+    name: lint (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", invoker, json, nats, jetstream, redis, telemetry, prometheus, examples]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14
+          working-directory: ${{ matrix.module }}
+
+  workspace:
+    name: workspace
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.23"
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
 
-      - name: Run tests with coverage
-        run: go test -race -coverprofile=coverage.out -covermode=atomic $(go list ./... | grep -v /examples)
+      - name: Generate ephemeral go.work (9 modules)
+        run: go work init . invoker json nats jetstream redis telemetry prometheus examples
 
-      - name: Upload coverage to Codecov
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: codecov/codecov-action@v7
-        with:
-          files: coverage.out
-          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Build all modules
+        run: go build $(go list -m -f '{{.Path}}/...')
 
-  lint:
+      - name: Test all modules
+        run: go test -race $(go list -m -f '{{.Path}}/...')
+
+  integration:
+    name: integration (nats-server)
     runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+      NATS_URL: nats://localhost:4222
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.23"
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
 
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
+      - name: Start nats-server with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.15.1 -js -m 8222
+          for i in $(seq 1 30); do
+            if curl -sf 'http://localhost:8222/healthz?js-enabled-only=true' >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs nats
+          exit 1
+
+      - name: Integration tests
+        working-directory: jetstream
+        run: go test -tags integration -race -count=1 ./...

@@ -4,34 +4,101 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
   - package-ecosystem: "gomod"
     directory: "/invoker"
     schedule:
       interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
   - package-ecosystem: "gomod"
     directory: "/json"
     schedule:
       interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
   - package-ecosystem: "gomod"
     directory: "/nats"
     schedule:
       interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
   - package-ecosystem: "gomod"
     directory: "/jetstream"
     schedule:
       interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
   - package-ecosystem: "gomod"
     directory: "/redis"
     schedule:
       interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
   - package-ecosystem: "gomod"
     directory: "/telemetry"
     schedule:
       interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
   - package-ecosystem: "gomod"
     directory: "/prometheus"
     schedule:
       interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
+  - package-ecosystem: "gomod"
+    directory: "/examples"
+    schedule:
+      interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      nats:
+        patterns:
+          - "github.com/nats-io/*"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
