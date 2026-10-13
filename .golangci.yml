@@ -1,9 +1,6 @@
+version: "2"
+run:
+  build-tags:
+    - integration # lints jetstream/*_integration_test.go too
 linters:
-  disable-all: true
-  enable:
-    - staticcheck
-    - errcheck
-    - govet
-
-issues:
-  exclude-use-default: false
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused

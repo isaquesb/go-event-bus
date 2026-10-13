@@ -103,11 +103,13 @@ func TestLocalBus_Emit(t *testing.T) {
 	wg.Add(1)
 
 	var received string
-	bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+	if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
 		defer wg.Done()
 		received = e.(*testEvent).message
 		return nil
-	}, event.WithHandlerName("handler1"))
+	}, event.WithHandlerName("handler1")); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 
 	evt := &testEvent{name: "user.created", message: "async-hello"}
 	bus.Emit(ctx, evt)
@@ -127,15 +129,19 @@ func TestLocalBus_MultipleHandlers(t *testing.T) {
 
 	var count atomic.Int32
 
-	bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+	if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
 		count.Add(1)
 		return nil
-	}, event.WithHandlerName("handler1"))
+	}, event.WithHandlerName("handler1")); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 
-	bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+	if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
 		count.Add(1)
 		return nil
-	}, event.WithHandlerName("handler2"))
+	}, event.WithHandlerName("handler2")); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 
 	evt := &testEvent{name: "user.created"}
 	_, _ = bus.EmitSync(ctx, evt)
@@ -159,9 +165,11 @@ func TestLocalBus_OnErrCallback(t *testing.T) {
 	})
 
 	handlerErr := errors.New("handler failed")
-	bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+	if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
 		return handlerErr
-	}, event.WithHandlerName("failing-handler"))
+	}, event.WithHandlerName("failing-handler")); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 
 	evt := &testEvent{name: "user.created"}
 	_, _ = bus.EmitSync(ctx, evt)
@@ -183,9 +191,11 @@ func TestLocalBus_EventOnErrInterface(t *testing.T) {
 	errChan := make(chan error, 1)
 	handlerErr := errors.New("handler failed")
 
-	bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+	if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
 		return handlerErr
-	}, event.WithHandlerName("handler"))
+	}, event.WithHandlerName("handler")); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 
 	evt := &testEventWithOnErr{name: "user.created", onErrChan: errChan}
 	_, _ = bus.EmitSync(ctx, evt)
@@ -221,11 +231,13 @@ func TestLocalBus_ContextCancellation(t *testing.T) {
 
 	// Register multiple handlers
 	for i := 0; i < 5; i++ {
-		bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
 			time.Sleep(50 * time.Millisecond)
 			count.Add(1)
 			return nil
-		}, event.WithHandlerName("handler"))
+		}, event.WithHandlerName("handler")); err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
 	}
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
@@ -255,7 +267,7 @@ func TestLocalBus_ConcurrencyLimit(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
-		bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
 			defer wg.Done()
 			current := concurrent.Add(1)
 			defer concurrent.Add(-1)
@@ -270,7 +282,9 @@ func TestLocalBus_ConcurrencyLimit(t *testing.T) {
 
 			time.Sleep(20 * time.Millisecond)
 			return nil
-		}, event.WithHandlerName("handler"))
+		}, event.WithHandlerName("handler")); err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
 	}
 
 	evt := &testEvent{name: "user.created"}
@@ -333,10 +347,12 @@ func TestLocalBus_DefaultMaxConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	bus.Subscribe(ctx, "test", func(ctx context.Context, e event.Event) error {
+	if err := bus.Subscribe(ctx, "test", func(ctx context.Context, e event.Event) error {
 		defer wg.Done()
 		return nil
-	}, event.WithHandlerName("handler"))
+	}, event.WithHandlerName("handler")); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 
 	bus.Emit(ctx, &testEvent{name: "test"})
 	wg.Wait()
@@ -369,14 +385,6 @@ type testSubscriberWithOpts struct {
 }
 
 func (s *testSubscriberWithOpts) SubscribeOptions() []event.SubscribeOption { return s.opts }
-
-// errSubscribeLocalBus wraps LocalBus so Subscribe always fails after n successes
-type errAfterLocalBus struct {
-	*event.LocalBus
-	count    int
-	failAt   int
-	failWith error
-}
 
 func TestLocalBus_RegisterSubscribers_MultipleSubscribers(t *testing.T) {
 	ctx := context.Background()
