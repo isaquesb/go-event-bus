@@ -19,6 +19,15 @@ type EmitOptions struct {
 	// the user options are applied; a value set through an EmitOption is
 	// overwritten by the bus. Nil means NewID.
 	IDGenerator func() string
+
+	// Headers holds the user headers set by WithHeader. It is nil until the
+	// first WithHeader.
+	Headers map[string]string
+
+	// InheritHeaders lists the header keys copied from the parent event's
+	// Metadata to the emitted event. It is populated by the bus from its own
+	// options after the user options are applied and overwritten by the bus.
+	InheritHeaders []string
 }
 
 // EmitOption configures Emit behavior
@@ -45,6 +54,22 @@ func WithID(id string) EmitOption {
 func WithCorrelationID(id string) EmitOption {
 	return func(o *EmitOptions) {
 		o.CorrelationID = id
+	}
+}
+
+// WithHeader attaches a user header to the emitted event. It can be repeated;
+// the last value for a key wins and an empty key is ignored. An explicit
+// header overrides a value inherited from the parent event. The reserved
+// trace keys (traceparent, tracestate, baggage) are owned by the transport.
+func WithHeader(key, value string) EmitOption {
+	return func(o *EmitOptions) {
+		if key == "" {
+			return
+		}
+		if o.Headers == nil {
+			o.Headers = make(map[string]string)
+		}
+		o.Headers[key] = value
 	}
 }
 

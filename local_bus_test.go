@@ -669,3 +669,25 @@ func TestLocalBus_Metadata_IDGeneratorOption(t *testing.T) {
 		t.Errorf("ID %q, want gen-1", got.ID)
 	}
 }
+
+func TestLocalBus_Metadata_InheritHeadersAllowlist(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{InheritHeaders: []string{"tenant"}})
+
+	var child event.Metadata
+	_ = bus.Subscribe(ctx, "order.created", func(ctx context.Context, e event.Event) error {
+		_, err := bus.EmitSync(ctx, &testEvent{name: "invoice.created"})
+		return err
+	})
+	_ = bus.Subscribe(ctx, "invoice.created", func(ctx context.Context, e event.Event) error {
+		child, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "order.created"},
+		event.WithHeader("tenant", "acme"), event.WithHeader("secret", "s"))
+
+	if len(child.Headers) != 1 || child.Headers["tenant"] != "acme" {
+		t.Errorf("child headers %v, want only tenant=acme", child.Headers)
+	}
+}

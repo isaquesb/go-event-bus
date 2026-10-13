@@ -3,6 +3,7 @@ package event
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"sync"
 )
 
@@ -29,6 +30,11 @@ type LocalBusOptions struct {
 	// IDGenerator mints ids for events that carry no id of their own.
 	// Nil means NewID.
 	IDGenerator func() string
+
+	// InheritHeaders lists the header keys copied from the parent event's
+	// Metadata to events emitted from its handlers. Empty by default: no
+	// header crosses a causal hop unless listed here.
+	InheritHeaders []string
 }
 
 func NewLocalBus(opts LocalBusOptions) *LocalBus {
@@ -44,6 +50,7 @@ func NewLocalBus(opts LocalBusOptions) *LocalBus {
 		invoker:  opts.Invoker,
 		sem:      make(chan struct{}, opts.MaxConcurrent),
 		idGen:    opts.IDGenerator,
+		inherit:  slices.Clone(opts.InheritHeaders),
 	}
 }
 
@@ -56,6 +63,7 @@ type LocalBus struct {
 	invoker  Invoker
 	sem      chan struct{}
 	idGen    func() string
+	inherit  []string
 }
 
 // Subscribe registers a handler for events on the given subject.
@@ -162,6 +170,7 @@ func (b *LocalBus) dispatch(
 func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 	cfg := ApplyEmitOptions(e, opts...)
 	cfg.IDGenerator = b.idGen
+	cfg.InheritHeaders = b.inherit
 	md := ResolveOutbound(ctx, e, cfg)
 	b.dispatch(WithMetadata(ctx, md), cfg.Subject, e, true)
 }
@@ -169,6 +178,7 @@ func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) (Event, error) {
 	cfg := ApplyEmitOptions(e, opts...)
 	cfg.IDGenerator = b.idGen
+	cfg.InheritHeaders = b.inherit
 	md := ResolveOutbound(ctx, e, cfg)
 	b.dispatch(WithMetadata(ctx, md), cfg.Subject, e, false)
 	return e, nil

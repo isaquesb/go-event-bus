@@ -90,6 +90,7 @@ func ResolveOutbound(ctx context.Context, evt Event, opts EmitOptions) Metadata 
 		Name:          evt.Name(),
 		Version:       version,
 		Timestamp:     time.Now().UTC(),
+		Headers:       resolveHeaders(parent, hasParent, opts),
 	}
 }
 
@@ -108,4 +109,28 @@ func EncodeEvent(ctx context.Context, r Registry, evt Event, md Metadata) ([]byt
 		return enc.EncodeWith(ctx, evt, md)
 	}
 	return r.Encode(ctx, evt)
+}
+
+// resolveHeaders builds a fresh headers map: the allowlisted parent headers
+// first, then the explicit headers on top. The result never aliases the
+// parent or the options maps and is nil when empty.
+func resolveHeaders(parent Metadata, hasParent bool, opts EmitOptions) map[string]string {
+	var out map[string]string
+	if hasParent {
+		for _, k := range opts.InheritHeaders {
+			if v, ok := parent.Headers[k]; ok {
+				if out == nil {
+					out = make(map[string]string, len(opts.Headers)+1)
+				}
+				out[k] = v
+			}
+		}
+	}
+	for k, v := range opts.Headers {
+		if out == nil {
+			out = make(map[string]string, len(opts.Headers))
+		}
+		out[k] = v
+	}
+	return out
 }

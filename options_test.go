@@ -144,3 +144,32 @@ func TestApplyOptions_AllOptions(t *testing.T) {
 		t.Errorf("BackOff: expected [2s], got %v", cfg.BackOff)
 	}
 }
+
+func TestApplyEmitOptions_WithHeaderRepeatedLastWins(t *testing.T) {
+	o := event.ApplyEmitOptions(&testEvent{name: "x"},
+		event.WithHeader("tenant", "acme"), event.WithHeader("tenant", "beta"))
+	if len(o.Headers) != 1 || o.Headers["tenant"] != "beta" {
+		t.Errorf("Headers %v", o.Headers)
+	}
+}
+
+func TestApplyEmitOptions_WithHeaderEmptyKeyIgnored(t *testing.T) {
+	o := event.ApplyEmitOptions(&testEvent{name: "x"}, event.WithHeader("", "x"))
+	if len(o.Headers) != 0 {
+		t.Errorf("Headers %v", o.Headers)
+	}
+}
+
+func TestApplyEmitOptions_NoHeadersIsNil(t *testing.T) {
+	o := event.ApplyEmitOptions(&testEvent{name: "x"})
+	if o.Headers != nil {
+		t.Errorf("Headers %v", o.Headers)
+	}
+}
+
+func TestApplyEmitOptions_EmptyWithIDKeepsUnset(t *testing.T) {
+	o := event.ApplyEmitOptions(&testEvent{name: "x"}, event.WithID(""), event.WithCorrelationID(""))
+	if o.ID != "" || o.CorrelationID != "" {
+		t.Errorf("ID %q CorrelationID %q", o.ID, o.CorrelationID)
+	}
+}
