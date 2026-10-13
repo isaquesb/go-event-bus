@@ -28,6 +28,7 @@ Full API documentation is available on pkg.go.dev:
 
 - [`Event`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#Event) - Base event interface
 - [`Bus`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#Bus) - Bus interface (Subscribe, Close)
+- [`SyncBus`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#SyncBus) - Synchronous dispatch interface (`EmitSync` returns `(Event, error)`)
 - [`Invoker`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#Invoker) - Middleware interface
 - [`Registry`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#Registry) - Serialization interface
 - [`Envelope`](https://pkg.go.dev/github.com/isaquesb/go-event-bus#Envelope) - Wire format
@@ -60,3 +61,5 @@ Full API documentation is available on pkg.go.dev:
 - [`ErrRateLimited`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#ErrRateLimited) - Rate limit exceeded
 - [`ErrCircuitOpen`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#ErrCircuitOpen) - Circuit breaker open
 - [`ErrSendToDLQ`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#ErrSendToDLQ) - Terminal error signal
+- [`ErrStreamRequired`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/jetstream#ErrStreamRequired) - JetStream `Subscribe` called without `WithStream`
+- [`ErrInvalidConfig`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/jetstream#ErrInvalidConfig) - Invalid JetStream consumer configuration (for example `MaxDeliver` inconsistent with the backoff length)

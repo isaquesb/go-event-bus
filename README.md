@@ -36,7 +36,7 @@ go get github.com/isaquesb/go-event-bus
 
 ## Requirements
 
-- Go 1.23+
+- Go 1.26+
 
 ## Quick Start
 

@@ -26,11 +26,11 @@ For buses that support synchronous dispatch:
 
 ```go
 type SyncBus interface {
-    EmitSync(ctx context.Context, e Event)
+    EmitSync(ctx context.Context, e Event) (Event, error)
 }
 ```
 
-`LocalBus` implements `SyncBus` to wait for all handlers to complete before returning.
+`LocalBus` implements `SyncBus` to wait for all handlers to complete before returning: it returns the same event and a nil error once all handlers finish. The NATS bus returns the decoded reply event.
 
 ## RegisterSubscribers
 
@@ -115,7 +115,7 @@ bus := event.NewLocalBus(event.LocalBusOptions{
 
 It provides:
 - `Emit(ctx, event, opts...)` - Asynchronous, fire-and-forget dispatch
-- `EmitSync(ctx, event, opts...)` - Synchronous dispatch, waits for handlers
+- `EmitSync(ctx, event, opts...) (Event, error)` - Synchronous dispatch, waits for handlers
 - `Subscribe(ctx, subject, handler, opts...)` - Register handlers
 - `RegisterSubscribers(ctx, subs...)` - Bulk handler registration
 - `Close()` - No-op for LocalBus (no external connections)

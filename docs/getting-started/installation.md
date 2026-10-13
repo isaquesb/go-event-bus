@@ -17,7 +17,7 @@ This gives you the core interfaces (`Event`, `Bus`, `Invoker`), `LocalBus`, and 
 
 ## Requirements
 
-- **Go 1.23** or later
+- **Go 1.26** or later
 
 ## Optional Dependencies
 

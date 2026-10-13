@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-13
+
+### Added
+
+#### JetStream Transport (`github.com/isaquesb/go-event-bus/jetstream`)
+- `ErrInvalidConfig` — returned by `Subscribe` when the consumer configuration is invalid
+- Integration test harness against a real `nats-server -js` (build tag `integration`) with reusable helpers
+- Unit tests for the DLQ publisher
+
+#### Tests and tooling
+- Unit tests for `telemetry`, `prometheus`, `redis` and `json`
+- Per-module CI: `GOWORK=off` build, `-race` test and golangci-lint v2 matrix over all 9 modules, a workspace job and a real nats-server JetStream integration job
+- `RELEASING.md`, `scripts/release.sh`, `scripts/verify-release.sh` and `scripts/ci-local.sh` (layered release procedure and local CI equivalent)
+
+### Changed
+
+#### Core (`github.com/isaquesb/go-event-bus`)
+- **Breaking:** `SyncBus.EmitSync` now returns `(Event, error)`. `LocalBus.EmitSync` returns the same event and a nil error after all handlers finish. Update callers: `evt, err := bus.EmitSync(ctx, e)`.
+- Minimum Go version is now 1.26: every module declares `go 1.26.0`.
+
+#### Invoker Chain (`github.com/isaquesb/go-event-bus/invoker`)
+- `go.mod` now declares its requirement on the root module
+
+#### All modules
+- All in-repo modules require each other at `v0.3.0`
+
+### Fixed
+
+#### Core (`github.com/isaquesb/go-event-bus`)
+- `NewLocalBus` defaults a nil `Invoker` to a passthrough invoker instead of panicking
+
+#### JSON Serialization (`github.com/isaquesb/go-event-bus/json`)
+- `Registry.Decode` no longer races with `Register` (read lock)
+
+#### JetStream Transport (`github.com/isaquesb/go-event-bus/jetstream`)
+- `DLQ.Publish` returns marshal errors instead of dropping them
+- `Subscribe` validates `MaxDeliver` against the backoff length and returns `ErrInvalidConfig`
+
+#### NATS Transport (`github.com/isaquesb/go-event-bus/nats`)
+- `Subscribe` and `SubscribeSync` pass the subscription context to handlers
+
+#### Redis Stores (`github.com/isaquesb/go-event-bus/redis`)
+- `IdempotencyStore.Put` returns marshal errors
+- The rate-limit Lua script uses the server-side `TIME`
+
+### Dependencies
+
+- `go.opentelemetry.io/otel` (and `trace`, `sdk`) bumped to `v1.47.0` in `/json`, `/nats`, `/telemetry`, `/jetstream`, `/examples`
+- `github.com/nats-io/nats.go` bumped to `v1.54.0` in `/nats`, `/jetstream`, `/examples`
+- `github.com/redis/go-redis/v9` bumped to `v9.23.0` in `/redis`, `/examples`
+- `github.com/prometheus/client_golang` bumped to `v1.25.0` in `/prometheus`
+
 ## [0.2.0] - 2026-02-24
 
 ### Added
