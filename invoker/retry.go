@@ -67,6 +67,11 @@ func classify(err error) (retry bool, terminal bool) {
 		return false, false
 	}
 
+	// Another execution is still running: the transport redelivers later.
+	if errors.Is(err, event.ErrInProgress) {
+		return false, false
+	}
+
 	// A dead-lettered result is final and is never retried.
 	if errors.Is(err, event.ErrDeadLettered) ||
 		errors.Is(err, event.ErrDeadLetterFailed) {
@@ -124,7 +129,11 @@ func (r *Retry) Invoke(
 ) error {
 	var lastErr error
 
-	for attempt := 1; attempt <= r.policy.MaxAttempts; attempt++ {
+	// A policy below 1 still runs the handler once, so a FailureError never
+	// carries a nil cause.
+	maxAttempts := max(r.policy.MaxAttempts, 1)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		r.metrics.IncCounter(
 			"eventbus_retry_attempt_total",
 			1,
@@ -160,7 +169,7 @@ func (r *Retry) Invoke(
 
 		lastErr = err
 
-		if attempt == r.policy.MaxAttempts {
+		if attempt == maxAttempts {
 			break
 		}
 
@@ -188,7 +197,7 @@ func (r *Retry) Invoke(
 	return &event.FailureError{
 		Cause:    lastErr,
 		Reason:   event.ReasonRetriesExhausted,
-		Attempts: r.policy.MaxAttempts,
+		Attempts: maxAttempts,
 	}
 }
 

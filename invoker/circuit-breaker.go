@@ -24,7 +24,9 @@ const (
 	stateHalfOpen
 )
 
-var ErrCircuitOpen = errors.New("circuit breaker open")
+// ErrCircuitOpen is the root sentinel event.ErrCircuitOpen, kept here for
+// source compatibility.
+var ErrCircuitOpen = event.ErrCircuitOpen
 
 type handlerBreaker struct {
 	state     circuitState

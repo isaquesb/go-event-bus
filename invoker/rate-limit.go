@@ -2,12 +2,13 @@ package invoker
 
 import (
 	"context"
-	"errors"
 	"github.com/isaquesb/go-event-bus"
 	"time"
 )
 
-var ErrRateLimited = errors.New("rate limit exceeded")
+// ErrRateLimited is the root sentinel event.ErrRateLimited, kept here for
+// source compatibility.
+var ErrRateLimited = event.ErrRateLimited
 
 type RateLimitStore interface {
 	Allow(

@@ -2,7 +2,6 @@ package invoker
 
 import (
 	"context"
-	"errors"
 	"github.com/isaquesb/go-event-bus"
 	"sync"
 	"time"
@@ -24,7 +23,9 @@ const (
 	StatusFailed     IdempotencyStatus = "failed"
 )
 
-var ErrDuplicate = errors.New("duplicate execution")
+// ErrDuplicate is the root sentinel event.ErrDuplicate, kept here for source
+// compatibility.
+var ErrDuplicate = event.ErrDuplicate
 
 type IdempotencyStore interface {
 	Get(ctx context.Context, key string) (IdempotencyRecord, bool, error)
