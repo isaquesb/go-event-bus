@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 
 	event "github.com/isaquesb/go-event-bus"
 
@@ -124,11 +125,20 @@ func (r *Replayer) Replay(ctx context.Context, opts ReplayOptions) (ReplayResult
 			return res, err
 		}
 		got := 0
+		var recErr error
 		for msg := range batch.Messages() {
 			got++
-			if rerr := r.replayOne(ctx, msg, opts, &res); rerr != nil {
-				return res, rerr
+			if recErr != nil {
+				// After a failure the rest of the batch is Nakked, not counted,
+				// so the next Replay gets it back immediately instead of after
+				// the ack wait.
+				_ = msg.Nak()
+				continue
 			}
+			recErr = r.replayOne(ctx, msg, opts, &res)
+		}
+		if recErr != nil {
+			return res, recErr
 		}
 		if err := batch.Error(); err != nil && !errors.Is(err, jetstream.ErrNoMessages) {
 			return res, err
@@ -196,7 +206,21 @@ func replayHeaders(src nats.Header) nats.Header {
 	return h
 }
 
-// validReplaySubject reports whether s can be a replay target.
+// validReplaySubject reports whether s can be a replay target: non-empty, no
+// whitespace or control characters, no empty token, and no wildcard token.
 func validReplaySubject(s string) bool {
-	return s != ""
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	for _, tok := range strings.Split(s, ".") {
+		if tok == "" || tok == "*" || tok == ">" {
+			return false
+		}
+	}
+	return true
 }
