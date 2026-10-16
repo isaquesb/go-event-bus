@@ -22,6 +22,7 @@ type natsConn interface {
 	Subscribe(subj string, cb nats.MsgHandler) (*nats.Subscription, error)
 	Publish(subj string, data []byte) error
 	Request(subj string, data []byte, timeout time.Duration) (*nats.Msg, error)
+	PublishMsg(m *nats.Msg) error
 	Close()
 }
 
@@ -37,6 +38,15 @@ type BusOptions struct {
 	// InheritHeaders lists the header keys copied from the handled event to
 	// events emitted with its ctx. Empty by default.
 	InheritHeaders []string
+	// DLQPublisher is the per-bus dead-letter backstop. It receives the failures
+	// the invoker chain did not dead-letter (no DLQ invoker, or a failure raised
+	// outside the chain) and every decode failure, which happens before the
+	// chain runs. Nil means such failures are only reported and logged.
+	DLQPublisher event.DLQPublisher
+	// ReplyErrorMessage makes the Eventbus-Error reply of a failed SubscribeSync
+	// request carry the truncated error text after the reason code. Default
+	// false, so internal error text never reaches remote requesters.
+	ReplyErrorMessage bool
 }
 
 func NewNatsBus(
@@ -56,6 +66,9 @@ func NewNatsBus(
 		onErr:   opts.OnErr,
 		idGen:   opts.IDGenerator,
 		inherit: slices.Clone(opts.InheritHeaders),
+
+		dlq:         opts.DLQPublisher,
+		replyErrMsg: opts.ReplyErrorMessage,
 	}
 }
 
@@ -68,6 +81,28 @@ type Bus struct {
 	onErr   func(ctx context.Context, evt event.Event, err error, handler string)
 	idGen   func() string
 	inherit []string
+
+	dlq         event.DLQPublisher
+	replyErrMsg bool
+}
+
+// reply sends data and h to the reply subject of msg through the natsConn seam.
+// It does nothing for a message without a reply subject (a plain publish).
+func (b *Bus) reply(ctx context.Context, msg *nats.Msg, data []byte, h nats.Header) {
+	if msg.Reply == "" {
+		return
+	}
+	if err := b.nc.PublishMsg(&nats.Msg{Subject: msg.Reply, Header: h, Data: data}); err != nil {
+		slog.WarnContext(ctx, "nats reply failed", "subject", msg.Subject, "err", err)
+	}
+}
+
+// replyError sends the failure reply of a request: the HeaderError header and
+// no body.
+func (b *Bus) replyError(ctx context.Context, msg *nats.Msg, reason string, err error) {
+	h := nats.Header{}
+	h.Set(HeaderError, errorHeaderValue(reason, err, b.replyErrMsg))
+	b.reply(ctx, msg, nil, h)
 }
 
 // resolve applies the bus-owned options to cfg and resolves the Metadata of an
@@ -163,6 +198,13 @@ func (b *Bus) EmitSync(ctx context.Context, e event.Event) (event.Event, error) 
 		return nil, err
 	}
 
+	if value := msg.Header.Get(HeaderError); value != "" {
+		remote := parseRemoteError(e.Name(), value)
+		span.RecordError(remote)
+		span.SetStatus(codes.Error, remote.Error())
+		return nil, remote
+	}
+
 	_, evt, decErr := b.reg.Decode(ctx, msg.Data)
 	if decErr != nil {
 		span.RecordError(decErr)
@@ -242,6 +284,9 @@ func (b *Bus) SubscribeSync(
 			return
 		}
 
+		msgCtx = event.WithDelivery(msgCtx, deliveryOf(msg))
+		msgCtx = event.WithExecution(msgCtx, event.Execution{Handler: handlerName, StartedAt: time.Now()})
+
 		// Use Invoker if available
 		var handleErr error
 		if b.invoker != nil {
@@ -253,9 +298,19 @@ func (b *Bus) SubscribeSync(
 		}
 
 		if handleErr != nil {
-			if b.onErr != nil {
-				b.onErr(msgCtx, evt, handleErr, handlerName)
+			s := event.Settle(msgCtx, event.SettleInput{
+				SubscriptionCtx: ctx,
+				Evt:             evt,
+				Handler:         handlerName,
+				Err:             handleErr,
+				Publisher:       b.dlq,
+				OnErr:           b.onErr,
+			})
+			reason := s.Reason
+			if reason == "" {
+				reason = event.ReasonOf(handleErr)
 			}
+			b.replyError(msgCtx, msg, reason, handleErr)
 			return
 		}
 
@@ -268,13 +323,29 @@ func (b *Bus) SubscribeSync(
 		md := b.resolve(msgCtx, evt, rcfg)
 		resp, err := event.EncodeEvent(msgCtx, b.reg, evt, md)
 		if err != nil {
+			slog.ErrorContext(msgCtx, "failed to encode reply",
+				"subject", subject,
+				"err", err,
+			)
 			return
 		}
 
-		_ = msg.Respond(resp)
+		b.reply(msgCtx, msg, resp, nil)
 	})
 
 	return err
+}
+
+// deliveryOf describes msg as a delivery. NATS Core never redelivers, so every
+// delivery is also the final one.
+func deliveryOf(msg *nats.Msg) event.Delivery {
+	return event.Delivery{
+		Count:   1,
+		Max:     1,
+		Subject: msg.Subject,
+		Raw:     msg.Data,
+		Headers: map[string][]string(msg.Header),
+	}
 }
 
 // RegisterSubscribers registers multiple subscribers at once.

@@ -137,6 +137,7 @@ type mdConn struct {
 	published []mdPublished
 	requests  []mdRequested
 	reply     []byte
+	replies   []*natsgo.Msg // messages passed to PublishMsg
 }
 
 func newMdConn() *mdConn { return &mdConn{handlers: map[string]natsgo.MsgHandler{}} }
@@ -165,6 +166,13 @@ func (c *mdConn) Request(subj string, data []byte, _ time.Duration) (*natsgo.Msg
 	reply := c.reply
 	c.mu.Unlock()
 	return &natsgo.Msg{Subject: subj, Data: reply}, nil
+}
+
+func (c *mdConn) PublishMsg(m *natsgo.Msg) error {
+	c.mu.Lock()
+	c.replies = append(c.replies, m)
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *mdConn) Close() {}
@@ -364,7 +372,6 @@ func TestSubscribeSync_ReplyLineage(t *testing.T) {
 	}
 	reg.resetEncoded()
 
-	// msg.Respond fails without a live subscription; the bus ignores it.
 	conn.handler(t, "quote.get")(&natsgo.Msg{Subject: "quote.get", Data: req, Reply: "_INBOX.test"})
 
 	if seen.ID != "req-1" {
@@ -386,7 +393,16 @@ func TestSubscribeSync_ReplyLineage(t *testing.T) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	if len(conn.published) != 0 {
-		t.Errorf("reply must go through msg.Respond only, got %d publishes", len(conn.published))
+		t.Errorf("reply must not use Publish, got %d publishes", len(conn.published))
+	}
+	if len(conn.replies) != 1 {
+		t.Fatalf("replies = %d, want exactly one through PublishMsg", len(conn.replies))
+	}
+	if conn.replies[0].Subject != "_INBOX.test" {
+		t.Errorf("reply subject = %q, want _INBOX.test", conn.replies[0].Subject)
+	}
+	if got := conn.replies[0].Header.Get(HeaderError); got != "" {
+		t.Errorf("success reply carries %s = %q", HeaderError, got)
 	}
 }
 
