@@ -3,6 +3,7 @@ package jetstream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 
@@ -75,24 +76,35 @@ var ErrNoEnvelope = errors.New("jetstream: DLQ record has no envelope bytes and 
 // ...) that must not follow a message into the DLQ stream.
 const natsHeaderPrefix = "Nats-"
 
-// errEmptyRecord is returned for a record with no envelope bytes until the
-// registry path exists.
-var errEmptyRecord = errors.New("jetstream: DLQ record has no envelope bytes")
+// dlqMinimalCauseLimit bounds the cause in the minimal max-payload retry.
+const dlqMinimalCauseLimit = 128
 
-// Publish publishes rec to the prefix plus the original subject. The message
-// data is rec.Raw unchanged.
+// Publish publishes rec to the prefix plus the original subject. When rec.Raw
+// is present it is the message data, unchanged. A record without Raw (LocalBus
+// and NATS Core records) is encoded from rec.Evt through the registry given
+// with WithDLQRegistry; without a registry or an event Publish returns
+// ErrNoEnvelope and publishes nothing.
+//
+// When the broker rejects the message for exceeding its max payload, Publish
+// retries once with only the minimal failure headers, because the failure
+// headers add to the envelope size.
 func (d *DLQ) Publish(ctx context.Context, rec event.DLQRecord) error {
 	data := rec.Raw
 	if len(data) == 0 {
-		return errEmptyRecord
+		if d.registry == nil || rec.Evt == nil {
+			return ErrNoEnvelope
+		}
+		md, ok := event.MetadataFromContext(ctx)
+		if !ok {
+			md = event.ResolveOutbound(ctx, rec.Evt, event.ApplyEmitOptions(rec.Evt))
+		}
+		enc, err := event.EncodeEvent(ctx, d.registry, rec.Evt, md)
+		if err != nil {
+			return fmt.Errorf("jetstream: DLQ encode %q: %w", rec.Evt.Name(), err)
+		}
+		data = enc
 	}
-	return d.publish(ctx, rec, data)
-}
 
-// publish builds the headers for data and publishes it, counting the outcome
-// once.
-func (d *DLQ) publish(ctx context.Context, rec event.DLQRecord, data []byte) error {
-	subject := d.prefix + dlqSubject(rec)
 	h, origMsgID := dlqCopyHeaders(rec.Headers)
 	for k, v := range rec.FailureHeaders() {
 		h.Set(k, v)
@@ -100,14 +112,46 @@ func (d *DLQ) publish(ctx context.Context, rec event.DLQRecord, data []byte) err
 	if origMsgID != "" {
 		h.Set(event.HeaderDLQOriginalMsgID, event.TruncateHeader(origMsgID, event.DLQHeaderValueLimit))
 	}
+	subject := d.prefix + dlqSubject(rec)
 
-	_, err := d.js.PublishMsg(ctx, &nats.Msg{Subject: subject, Header: h, Data: data})
+	err := d.send(ctx, subject, h, data)
+	if errors.Is(err, nats.ErrMaxPayload) {
+		err = d.send(ctx, subject, dlqMinimalHeaders(rec), data)
+	}
 	if err != nil {
 		d.metrics.IncCounter("dlq_publish_error_total", 1, invoker.Labels{})
 		return err
 	}
 	d.metrics.IncCounter("dlq_published_total", 1, invoker.Labels{})
 	return nil
+}
+
+// send publishes one message with no publish options, so no message id is set.
+func (d *DLQ) send(ctx context.Context, subject string, h nats.Header, data []byte) error {
+	_, err := d.js.PublishMsg(ctx, &nats.Msg{Subject: subject, Header: h, Data: data})
+	return err
+}
+
+// dlqMinimalHeaders is the header set of the max-payload retry: the original
+// headers plus only the reason, original subject, event id, handler and a
+// shortened cause.
+func dlqMinimalHeaders(rec event.DLQRecord) nats.Header {
+	h, _ := dlqCopyHeaders(rec.Headers)
+	full := rec.FailureHeaders()
+	for _, k := range []string{
+		event.HeaderDLQReason,
+		event.HeaderDLQOriginalSubject,
+		event.HeaderDLQEventID,
+		event.HeaderDLQHandler,
+	} {
+		if v, ok := full[k]; ok {
+			h.Set(k, v)
+		}
+	}
+	if v, ok := full[event.HeaderDLQCause]; ok {
+		h.Set(event.HeaderDLQCause, event.TruncateHeader(v, dlqMinimalCauseLimit))
+	}
+	return h
 }
 
 // dlqSubject is the original subject of rec, falling back to the event name.
