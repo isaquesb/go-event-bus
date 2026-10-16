@@ -3,11 +3,13 @@ package jetstream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/isaquesb/go-event-bus"
+	"github.com/isaquesb/go-event-bus/invoker"
 )
 
 // dispPermanent is an error that is never worth retrying.
@@ -111,4 +113,294 @@ func TestJetStreamBus_FinalDeliveryTerminalDeadLetteredThenTermed(t *testing.T) 
 	if n := dispEventOnErr.Load(); n != 1 {
 		t.Errorf("event OnErr calls = %d, want 1 (D-16)", n)
 	}
+}
+
+// --- handler-error disposition matrix ---
+
+// dispInvoker is an event.Invoker that returns err without calling next, which
+// stands for a chain-level invoker deciding the outcome.
+type dispInvoker struct{ err error }
+
+func (i dispInvoker) Invoke(context.Context, event.Event, string, func(context.Context) error) error {
+	return i.err
+}
+
+// dispFailingPublisher is a DLQPublisher whose Publish always fails.
+type dispFailingPublisher struct{ calls atomic.Int64 }
+
+func (p *dispFailingPublisher) Publish(context.Context, event.DLQRecord) error {
+	p.calls.Add(1)
+	return errors.New("disp: broker down")
+}
+
+const dispEventName = "disp.matrix"
+
+var dispBackOff = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond}
+
+// dispRun feeds one message to the bus handler. The handler returns err (or the
+// chain invoker does when the bus was built with a dispInvoker).
+func dispRun(t *testing.T, ctx context.Context, bus *Bus, js *mdJS, delivered uint64, policy deliveryPolicy, err error) *mdMsg {
+	t.Helper()
+	msg := &mdMsg{data: dispEmit(t, bus, js, dispEventName), numDelivered: delivered}
+	bus.msgHandler(ctx, "h", func(context.Context, event.Event) error { return err }, policy)(msg)
+	if got := msg.snapshot(); got.plainTerms != 0 {
+		t.Fatalf("plain Term called %d times, the bus must only use TermWithReason", got.plainTerms)
+	}
+	return msg
+}
+
+func dispBus(opts BusOptions) (*Bus, *mdJS) {
+	js := &mdJS{}
+	return newMdBus(js, dispRegistry(dispEventName), opts), js
+}
+
+// dispWantDelay asserts exactly one NakWithDelay of want and nothing else.
+func dispWantDelay(t *testing.T, msg *mdMsg, want time.Duration) {
+	t.Helper()
+	got := msg.snapshot()
+	if len(got.nakDelays) != 1 || got.nakDelays[0] != want {
+		t.Errorf("nakDelays = %v, want [%v]", got.nakDelays, want)
+	}
+	if got.acks != 0 || got.naks != 0 || len(got.termReasons) != 0 {
+		t.Errorf("snapshot = %+v, want only a NakWithDelay", got)
+	}
+}
+
+func TestJetStreamBus_NonFinalTransientUsesBackOff(t *testing.T) {
+	var errs dispErrCounter
+	boom := errors.New("boom")
+	policy := deliveryPolicy{maxDeliver: 4, backOff: dispBackOff}
+	for _, tc := range []struct {
+		delivered uint64
+		want      time.Duration
+	}{{1, 10 * time.Millisecond}, {2, 20 * time.Millisecond}, {3, 40 * time.Millisecond}} {
+		bus, js := dispBus(BusOptions{DLQPublisher: event.NewMemoryDLQ(), OnErr: errs.onErr})
+		msg := dispRun(t, context.Background(), bus, js, tc.delivered, policy, boom)
+		dispWantDelay(t, msg, tc.want)
+	}
+	if n := errs.calls.Load(); n != 0 {
+		t.Errorf("OnErr calls = %d, want 0 on intermediate deliveries (D-16)", n)
+	}
+}
+
+func TestJetStreamBus_BackOffClampedToLast(t *testing.T) {
+	bus, js := dispBus(BusOptions{DLQPublisher: event.NewMemoryDLQ()})
+	policy := deliveryPolicy{maxDeliver: 4, backOff: dispBackOff[:2]}
+	msg := dispRun(t, context.Background(), bus, js, 3, policy, errors.New("boom"))
+	dispWantDelay(t, msg, 20*time.Millisecond)
+}
+
+func TestJetStreamBus_UnlimitedDeliveriesNeverTerm(t *testing.T) {
+	var errs dispErrCounter
+	dlq := event.NewMemoryDLQ()
+	bus, js := dispBus(BusOptions{DLQPublisher: dlq, OnErr: errs.onErr})
+	policy := deliveryPolicy{maxDeliver: 0, backOff: dispBackOff[:1]}
+	msg := dispRun(t, context.Background(), bus, js, 9, policy, errors.New("boom"))
+	dispWantDelay(t, msg, 10*time.Millisecond)
+	if dlq.Len() != 0 || errs.calls.Load() != 0 {
+		t.Errorf("records=%d OnErr=%d, want 0 and 0: unlimited deliveries are never final", dlq.Len(), errs.calls.Load())
+	}
+}
+
+func TestJetStreamBus_FlowControlDelays(t *testing.T) {
+	const circuit, rate = 111 * time.Millisecond, 222 * time.Millisecond
+	policy := deliveryPolicy{maxDeliver: 4, backOff: dispBackOff}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want time.Duration
+	}{
+		{"circuit open", fmt.Errorf("wrapped: %w", event.ErrCircuitOpen), circuit},
+		{"rate limited", fmt.Errorf("wrapped: %w", event.ErrRateLimited), rate},
+		{"in progress uses the BackOff schedule", fmt.Errorf("wrapped: %w", event.ErrInProgress), 20 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			js := &mdJS{}
+			bus := NewBus(js, dispRegistry(dispEventName), BusOptions{
+				Invoker:          invoker.NewChain(),
+				CircuitOpenDelay: circuit,
+				RateLimitDelay:   rate,
+				DLQPublisher:     event.NewMemoryDLQ(),
+			})
+			msg := dispRun(t, context.Background(), bus, js, 2, policy, tc.err)
+			dispWantDelay(t, msg, tc.want)
+		})
+	}
+}
+
+func TestJetStreamBus_FinalRateLimitedDeadLettered(t *testing.T) {
+	dlq := event.NewMemoryDLQ()
+	bus, js := dispBus(BusOptions{DLQPublisher: dlq})
+	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
+	msg := dispRun(t, context.Background(), bus, js, 3, policy, event.ErrRateLimited)
+
+	recs := dlq.Records()
+	if len(recs) != 1 || recs[0].Reason != event.ReasonRateLimited {
+		t.Fatalf("records = %+v, want one with reason rate_limited", recs)
+	}
+	got := msg.snapshot()
+	if len(got.termReasons) != 1 || got.termReasons[0] != "dead_lettered: rate_limited" {
+		t.Errorf("termReasons = %q, want [dead_lettered: rate_limited]", got.termReasons)
+	}
+	if got.acks != 0 || got.naks != 0 || len(got.nakDelays) != 0 {
+		t.Errorf("snapshot = %+v, want only a TermWithReason", got)
+	}
+}
+
+func TestJetStreamBus_DuplicateAcked(t *testing.T) {
+	var errs dispErrCounter
+	dlq := event.NewMemoryDLQ()
+	bus, js := dispBus(BusOptions{DLQPublisher: dlq, OnErr: errs.onErr})
+	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
+	msg := dispRun(t, context.Background(), bus, js, 3, policy, fmt.Errorf("seen: %w", event.ErrDuplicate))
+
+	got := msg.snapshot()
+	if got.acks != 1 || got.naks != 0 || len(got.nakDelays) != 0 || len(got.termReasons) != 0 {
+		t.Errorf("snapshot = %+v, want a single Ack", got)
+	}
+	if errs.calls.Load() != 0 || dlq.Len() != 0 {
+		t.Errorf("OnErr=%d records=%d, want 0 and 0", errs.calls.Load(), dlq.Len())
+	}
+}
+
+func TestJetStreamBus_ChainDeadLetteredAcked(t *testing.T) {
+	var errs dispErrCounter
+	dlq := event.NewMemoryDLQ()
+	chainErr := &event.DeadLetteredError{Cause: errors.New("boom"), Reason: event.ReasonRetriesExhausted}
+	bus, js := dispBus(BusOptions{Invoker: dispInvoker{err: chainErr}, DLQPublisher: dlq, OnErr: errs.onErr})
+	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
+	msg := dispRun(t, context.Background(), bus, js, 2, policy, nil)
+
+	got := msg.snapshot()
+	if got.acks != 1 || got.naks != 0 || len(got.nakDelays) != 0 || len(got.termReasons) != 0 {
+		t.Errorf("snapshot = %+v, want a single Ack, never a Term", got)
+	}
+	if dlq.Len() != 0 {
+		t.Errorf("bus publisher records = %d, want 0: the chain already dead-lettered it", dlq.Len())
+	}
+	if n := errs.calls.Load(); n != 1 {
+		t.Errorf("OnErr calls = %d, want 1", n)
+	}
+}
+
+func TestJetStreamBus_ChainDeadLetterFailedNaks(t *testing.T) {
+	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
+	for _, tc := range []struct {
+		delivered uint64
+		want      time.Duration
+		onErr     int64
+	}{{1, 10 * time.Millisecond, 0}, {3, 20 * time.Millisecond, 1}} {
+		var errs dispErrCounter
+		dlq := event.NewMemoryDLQ()
+		chainErr := &event.DeadLetterFailedError{
+			Cause:      errors.New("boom"),
+			Reason:     event.ReasonRetriesExhausted,
+			PublishErr: errors.New("broker down"),
+		}
+		bus, js := dispBus(BusOptions{Invoker: dispInvoker{err: chainErr}, DLQPublisher: dlq, OnErr: errs.onErr})
+		msg := dispRun(t, context.Background(), bus, js, tc.delivered, policy, nil)
+		dispWantDelay(t, msg, tc.want)
+		if n := errs.calls.Load(); n != tc.onErr {
+			t.Errorf("delivery %d: OnErr calls = %d, want %d", tc.delivered, n, tc.onErr)
+		}
+		if dlq.Len() != 0 {
+			t.Errorf("delivery %d: bus publisher records = %d, want 0", tc.delivered, dlq.Len())
+		}
+	}
+}
+
+func TestJetStreamBus_BackstopPublishFailureNeverTerms(t *testing.T) {
+	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
+
+	t.Run("non-final", func(t *testing.T) {
+		var errs dispErrCounter
+		pub := &dispFailingPublisher{}
+		bus, js := dispBus(BusOptions{DLQPublisher: pub, OnErr: errs.onErr})
+		msg := dispRun(t, context.Background(), bus, js, 1, policy, dispPermanent{})
+		if n := pub.calls.Load(); n != 1 {
+			t.Errorf("Publish calls = %d, want 1", n)
+		}
+		dispWantDelay(t, msg, 10*time.Millisecond)
+		if errs.calls.Load() != 0 {
+			t.Errorf("OnErr calls = %d, want 0 on a non-final delivery", errs.calls.Load())
+		}
+	})
+
+	t.Run("final", func(t *testing.T) {
+		var errs dispErrCounter
+		pub := &dispFailingPublisher{}
+		bus, js := dispBus(BusOptions{DLQPublisher: pub, OnErr: errs.onErr})
+		msg := dispRun(t, context.Background(), bus, js, 3, policy, dispPermanent{})
+		if n := pub.calls.Load(); n != 3 {
+			t.Errorf("Publish calls = %d, want 3 (bounded in-process retry)", n)
+		}
+		dispWantDelay(t, msg, 20*time.Millisecond)
+		if n := errs.calls.Load(); n != 1 {
+			t.Fatalf("OnErr calls = %d, want 1", n)
+		}
+		if !errors.Is(errs.lastErr(), event.ErrDeadLetterFailed) {
+			t.Errorf("OnErr error = %v, want it to match event.ErrDeadLetterFailed", errs.lastErr())
+		}
+	})
+}
+
+func TestJetStreamBus_NoPublisherDropped(t *testing.T) {
+	var errs dispErrCounter
+	bus, js := dispBus(BusOptions{OnErr: errs.onErr})
+	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
+	failure := &dispPermanentPtr{}
+	msg := dispRun(t, context.Background(), bus, js, 1, policy, failure)
+
+	got := msg.snapshot()
+	if len(got.termReasons) != 1 || got.termReasons[0] != "dropped: terminal" {
+		t.Errorf("termReasons = %q, want [dropped: terminal]", got.termReasons)
+	}
+	if got.acks != 0 || got.naks != 0 || len(got.nakDelays) != 0 {
+		t.Errorf("snapshot = %+v, want only a TermWithReason", got)
+	}
+	if n := errs.calls.Load(); n != 1 {
+		t.Fatalf("OnErr calls = %d, want 1", n)
+	}
+	if errs.lastErr() != error(failure) {
+		t.Errorf("OnErr error = %v, want the identical handler error", errs.lastErr())
+	}
+}
+
+// dispPermanentPtr is a pointer-identity terminal error.
+type dispPermanentPtr struct{}
+
+func (*dispPermanentPtr) Error() string  { return "disp: permanent failure (pointer)" }
+func (*dispPermanentPtr) Terminal() bool { return true }
+
+func TestJetStreamBus_InterruptedPlainNak(t *testing.T) {
+	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
+	for _, tc := range []struct {
+		delivered uint64
+		onErr     int64
+	}{{1, 0}, {3, 1}} {
+		var errs dispErrCounter
+		dlq := event.NewMemoryDLQ()
+		bus, js := dispBus(BusOptions{DLQPublisher: dlq, OnErr: errs.onErr})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		msg := dispRun(t, ctx, bus, js, tc.delivered, policy, ctx.Err())
+
+		got := msg.snapshot()
+		if got.naks != 1 || got.acks != 0 || len(got.nakDelays) != 0 || len(got.termReasons) != 0 {
+			t.Errorf("delivery %d: snapshot = %+v, want a single plain Nak", tc.delivered, got)
+		}
+		if dlq.Len() != 0 {
+			t.Errorf("delivery %d: records = %d, want 0: an interruption is never dead-lettered", tc.delivered, dlq.Len())
+		}
+		if n := errs.calls.Load(); n != tc.onErr {
+			t.Errorf("delivery %d: OnErr calls = %d, want %d", tc.delivered, n, tc.onErr)
+		}
+	}
+}
+
+func TestJetStreamBus_HandlerTimeoutIsTransient(t *testing.T) {
+	bus, js := dispBus(BusOptions{DLQPublisher: event.NewMemoryDLQ()})
+	policy := deliveryPolicy{maxDeliver: 4, backOff: dispBackOff}
+	msg := dispRun(t, context.Background(), bus, js, 2, policy, context.DeadlineExceeded)
+	dispWantDelay(t, msg, 20*time.Millisecond)
 }
