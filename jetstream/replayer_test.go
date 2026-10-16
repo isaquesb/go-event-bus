@@ -3,6 +3,8 @@ package jetstream
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -222,5 +224,233 @@ func TestReplayer_RoundTripToOriginalSubject(t *testing.T) {
 	}
 	if js.streams[0] != "DLQ" {
 		t.Errorf("consumer stream = %q, want DLQ", js.streams[0])
+	}
+}
+
+func rpReplay(t *testing.T, cons *rpConsumer, opts ReplayOptions) (*rpJS, ReplayResult, error) {
+	t.Helper()
+	js := &rpJS{consumer: cons}
+	if opts.FromStream == "" {
+		opts.FromStream = "DLQ"
+	}
+	res, err := NewReplayer(js).Replay(context.Background(), opts)
+	return js, res, err
+}
+
+func TestReplayer_DrainedReturnsPromptly(t *testing.T) {
+	cases := map[string]*rpConsumer{
+		"empty first batch":          {batches: []rpBatch{{}}},
+		"ErrNoMessages batch error":  {batches: []rpBatch{{err: jetstream.ErrNoMessages}}},
+		"ErrNoMessages fetch return": {fetchErr: jetstream.ErrNoMessages},
+	}
+	for name, cons := range cases {
+		t.Run(name, func(t *testing.T) {
+			start := time.Now()
+			js, res, err := rpReplay(t, cons, ReplayOptions{})
+			if err != nil {
+				t.Fatalf("Replay on a drained DLQ: %v", err)
+			}
+			if res != (ReplayResult{}) {
+				t.Errorf("result = %+v, want zero", res)
+			}
+			if len(js.published) != 0 {
+				t.Errorf("published %d messages from an empty DLQ", len(js.published))
+			}
+			if d := time.Since(start); d > time.Second {
+				t.Errorf("Replay took %v on an empty DLQ, want under 1 s", d)
+			}
+		})
+	}
+}
+
+func TestReplayer_LimitStopsEarly(t *testing.T) {
+	var first, second []*rpMsg
+	for i := uint64(1); i <= 3; i++ {
+		first = append(first, rpRecord(i, "orders.created", fmt.Sprintf("evt-%d", i), []byte("x")))
+	}
+	for i := uint64(4); i <= 5; i++ {
+		second = append(second, rpRecord(i, "orders.created", fmt.Sprintf("evt-%d", i), []byte("x")))
+	}
+	cons := &rpConsumer{batches: []rpBatch{{msgs: first}, {msgs: second}}}
+	js, res, err := rpReplay(t, cons, ReplayOptions{Limit: 3})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if res.Replayed != 3 || res.Failed != 0 {
+		t.Errorf("result = %+v, want Replayed 3", res)
+	}
+	if len(js.published) != 3 {
+		t.Errorf("published %d, want 3", len(js.published))
+	}
+	for _, n := range cons.ns {
+		if n > 3 {
+			t.Errorf("FetchNoWait(%d) with Limit 3, want n <= 3", n)
+		}
+	}
+	for _, m := range second {
+		if m.acks != 0 || m.naks != 0 {
+			t.Errorf("record beyond the limit was settled (acks=%d naks=%d)", m.acks, m.naks)
+		}
+	}
+}
+
+func TestReplayer_DurableConsumerName(t *testing.T) {
+	cons := &rpConsumer{}
+	js := &rpJS{consumer: cons}
+	r := NewReplayer(js)
+	for i := 0; i < 2; i++ {
+		if _, err := r.Replay(context.Background(), ReplayOptions{FromStream: "DLQ", Consumer: "ops"}); err != nil {
+			t.Fatalf("Replay %d: %v", i, err)
+		}
+	}
+	if len(js.cfgs) != 2 {
+		t.Fatalf("consumer configured %d times, want 2", len(js.cfgs))
+	}
+	for i, cfg := range js.cfgs {
+		if cfg.Name != "ops" || cfg.Durable != "ops" {
+			t.Errorf("call %d: Name=%q Durable=%q, want ops for both", i, cfg.Name, cfg.Durable)
+		}
+	}
+}
+
+func TestReplayer_DuplicatePubAckCountsReplayed(t *testing.T) {
+	rec := rpRecord(7, "orders.created", "evt-7", []byte("x"))
+	cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}, {}}}
+	js := &rpJS{consumer: cons, results: []rpPubResult{{ack: &jetstream.PubAck{Duplicate: true}}}}
+	res, err := NewReplayer(js).Replay(context.Background(), ReplayOptions{FromStream: "DLQ"})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if res != (ReplayResult{Replayed: 1}) {
+		t.Errorf("result = %+v, want Replayed 1", res)
+	}
+	if rec.acks != 1 || rec.naks != 0 {
+		t.Errorf("record acks=%d naks=%d, want 1 and 0", rec.acks, rec.naks)
+	}
+}
+
+func TestReplayer_PublishErrorNaksAndReturns(t *testing.T) {
+	recs := []*rpMsg{
+		rpRecord(1, "orders.created", "evt-1", []byte("x")),
+		rpRecord(2, "orders.created", "evt-2", []byte("x")),
+		rpRecord(3, "orders.created", "evt-3", []byte("x")),
+	}
+	boom := errors.New("publish refused")
+	cons := &rpConsumer{batches: []rpBatch{{msgs: recs}, {}}}
+	js := &rpJS{consumer: cons, results: []rpPubResult{{}, {err: boom}}}
+	res, err := NewReplayer(js).Replay(context.Background(), ReplayOptions{FromStream: "DLQ"})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want it to wrap the publish error", err)
+	}
+	if !strings.Contains(err.Error(), "seq 2") {
+		t.Errorf("err = %q, want it to name stream sequence 2", err)
+	}
+	if res != (ReplayResult{Replayed: 1, Failed: 1}) {
+		t.Errorf("result = %+v, want {Replayed:1 Failed:1}", res)
+	}
+	if recs[0].acks != 1 || recs[0].naks != 0 {
+		t.Errorf("record 1 acks=%d naks=%d, want 1 and 0", recs[0].acks, recs[0].naks)
+	}
+	for i, m := range recs[1:] {
+		if m.naks != 1 || m.acks != 0 {
+			t.Errorf("record %d acks=%d naks=%d, want 0 and 1", i+2, m.acks, m.naks)
+		}
+	}
+	if len(js.published) != 2 {
+		t.Errorf("published %d, want 2 (the record after the failure is not attempted)", len(js.published))
+	}
+}
+
+func TestReplayer_MissingSubjectFails(t *testing.T) {
+	rec := rpRecord(9, "", "evt-9", []byte("x"))
+	cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}}}
+	js, res, err := rpReplay(t, cons, ReplayOptions{})
+	if !errors.Is(err, ErrReplaySubject) {
+		t.Fatalf("err = %v, want ErrReplaySubject", err)
+	}
+	if res != (ReplayResult{Failed: 1}) {
+		t.Errorf("result = %+v, want Failed 1", res)
+	}
+	if rec.naks != 1 || rec.acks != 0 {
+		t.Errorf("record acks=%d naks=%d, want 0 and 1", rec.acks, rec.naks)
+	}
+	if len(js.published) != 0 {
+		t.Errorf("published %d messages without a target subject", len(js.published))
+	}
+}
+
+func TestReplayer_InvalidSubjectsRejected(t *testing.T) {
+	for _, subj := range []string{"a.*", "a.>", "*", ">", "a b", "a\tb", "a\nb", "a..b", ".a", "a.", "a.*.b"} {
+		t.Run(fmt.Sprintf("%q", subj), func(t *testing.T) {
+			rec := rpRecord(1, subj, "evt-1", []byte("x"))
+			cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}}}
+			js, res, err := rpReplay(t, cons, ReplayOptions{})
+			if !errors.Is(err, ErrReplaySubject) {
+				t.Fatalf("subject %q: err = %v, want ErrReplaySubject", subj, err)
+			}
+			if res.Failed != 1 || res.Replayed != 0 {
+				t.Errorf("result = %+v, want Failed 1", res)
+			}
+			if rec.naks != 1 || len(js.published) != 0 {
+				t.Errorf("naks=%d published=%d, want 1 and 0", rec.naks, len(js.published))
+			}
+		})
+	}
+	for _, subj := range []string{"orders.created", "a", "chat.message.x", "a-b.c_d"} {
+		if !validReplaySubject(subj) {
+			t.Errorf("validReplaySubject(%q) = false, want true", subj)
+		}
+	}
+}
+
+func TestReplayer_ToSubjectOverride(t *testing.T) {
+	rec := rpRecord(3, "orders.created", "evt-3", []byte("x"))
+	cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}, {}}}
+	js, res, err := rpReplay(t, cons, ReplayOptions{ToSubject: "retry.orders"})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if res.Replayed != 1 || len(js.published) != 1 {
+		t.Fatalf("result = %+v published = %d, want one replay", res, len(js.published))
+	}
+	if got := js.published[0].Subject; got != "retry.orders" {
+		t.Errorf("subject = %q, want retry.orders", got)
+	}
+}
+
+func TestReplayer_FilterSubjectPropagated(t *testing.T) {
+	js, _, err := rpReplay(t, &rpConsumer{}, ReplayOptions{FilterSubject: "dlq.>"})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(js.cfgs) != 1 || js.cfgs[0].FilterSubject != "dlq.>" {
+		t.Errorf("consumer configs = %+v, want FilterSubject dlq.>", js.cfgs)
+	}
+}
+
+func TestReplayer_EmptyStreamRequired(t *testing.T) {
+	js := &rpJS{consumer: &rpConsumer{}}
+	_, err := NewReplayer(js).Replay(context.Background(), ReplayOptions{})
+	if !errors.Is(err, ErrStreamRequired) {
+		t.Fatalf("err = %v, want ErrStreamRequired", err)
+	}
+	if len(js.cfgs) != 0 {
+		t.Errorf("consumer created %d times for an empty stream", len(js.cfgs))
+	}
+}
+
+func TestReplayer_MetadataErrorPublishesWithoutMsgID(t *testing.T) {
+	rec := rpRecord(5, "orders.created", "evt-5", []byte("x"))
+	rec.metaErr = errors.New("not a jetstream message")
+	cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}, {}}}
+	js, res, err := rpReplay(t, cons, ReplayOptions{})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if res.Replayed != 1 || len(js.published) != 1 {
+		t.Fatalf("result = %+v published = %d, want one replay", res, len(js.published))
+	}
+	if _, ok := js.published[0].Header[jetstream.MsgIDHeader]; ok {
+		t.Errorf("Nats-Msg-Id = %q, want none when Metadata fails", js.published[0].Header.Get(jetstream.MsgIDHeader))
 	}
 }
