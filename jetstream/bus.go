@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/isaquesb/go-event-bus"
-	"github.com/isaquesb/go-event-bus/invoker"
 
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel"
@@ -53,6 +52,13 @@ type BusOptions struct {
 	// InheritHeaders lists the header keys copied from the handled event to
 	// events emitted with its ctx. Empty by default: nothing is inherited.
 	InheritHeaders []string
+
+	// DLQPublisher is the per-bus dead-letter backstop. It receives failures
+	// that a chain DLQ invoker did not dead-letter and every undecodable
+	// message. It is usually the same jetstream.NewDLQ value given to
+	// invoker.NewDLQ. Nil means such messages are terminated with
+	// TermWithReason and reported as dropped.
+	DLQPublisher event.DLQPublisher
 }
 
 type Bus struct {
@@ -62,6 +68,7 @@ type Bus struct {
 	invoker  event.Invoker
 	idGen    func() string
 	inherit  []string
+	dlq      event.DLQPublisher
 
 	circuitOpenDelay time.Duration
 	rateLimitDelay   time.Duration
@@ -89,6 +96,11 @@ func NewBus(
 			"hint", "set BusOptions.RateLimitDelay to a value appropriate for your rate limit window",
 		)
 	}
+	if opts.DLQPublisher == nil {
+		slog.Warn("eventbus: BusOptions.DLQPublisher not configured, failures the chain did not dead-letter and undecodable messages are terminated and reported as dropped",
+			"hint", "set BusOptions.DLQPublisher to the jetstream.NewDLQ value given to invoker.NewDLQ",
+		)
+	}
 	return &Bus{
 		js:               js,
 		registry:         registry,
@@ -98,6 +110,7 @@ func NewBus(
 		rateLimitDelay:   opts.RateLimitDelay,
 		idGen:            opts.IDGenerator,
 		inherit:          slices.Clone(opts.InheritHeaders),
+		dlq:              opts.DLQPublisher,
 	}
 }
 
@@ -215,8 +228,9 @@ func (b *Bus) Subscribe(
 		return err
 	}
 
+	policy := deliveryPolicy{maxDeliver: cfg.MaxDeliver, backOff: backOff}
 	cc, err := c.Consume(
-		b.msgHandler(ctx, handlerName, handler),
+		b.msgHandler(ctx, handlerName, handler, policy),
 		jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
 			slog.Warn("consumer error",
 				"handler", handlerName,
@@ -269,46 +283,134 @@ func (b *Bus) Close() error {
 	return nil
 }
 
-// msgHandler returns a JetStream MessageHandler that decodes, invokes, and acks/naks messages.
-// It classifies errors to avoid infinite redelivery loops:
-//   - ErrDuplicate: message already processed, ack immediately
-//   - ErrCircuitOpen: downstream unavailable, delay redelivery
-//   - ErrRateLimited: too many events, delay redelivery
-//   - other errors: nak for immediate retry (bounded by MaxDeliver/BackOff)
+// deliveryPolicy is the redelivery configuration validated at Subscribe time.
+// The zero value is unlimited deliveries with the default backoff.
+type deliveryPolicy struct {
+	// maxDeliver is the consumer MaxDeliver; values at or below 0 mean unlimited
+	// and are never final.
+	maxDeliver int
+	// backOff is the consumer BackOff schedule, indexed by delivery count.
+	backOff []time.Duration
+}
+
+// delivery describes msg as a delivery attempt. The count comes from the
+// message metadata, so no Consumer.Info round trip is needed.
+func (b *Bus) delivery(msg jetstream.Msg, policy deliveryPolicy) event.Delivery {
+	d := event.Delivery{
+		Count:   1,
+		Max:     policy.maxDeliver,
+		Subject: msg.Subject(),
+		Raw:     msg.Data(),
+		Headers: map[string][]string(msg.Headers()),
+	}
+	md, err := msg.Metadata()
+	if err != nil {
+		slog.Warn("eventbus: message metadata unavailable, treating as first delivery",
+			"subject", d.Subject,
+			"error", err,
+		)
+		return d
+	}
+	if md.NumDelivered > 0 {
+		d.Count = int(md.NumDelivered)
+	}
+	d.Stream = md.Stream
+	d.Consumer = md.Consumer
+	d.StreamSeq = md.Sequence.Stream
+	d.PublishedAt = md.Timestamp
+	return d
+}
+
+// msgHandler returns a JetStream MessageHandler that decodes, invokes and
+// settles a message. Every outcome goes through event.Settle once and maps to
+// exactly one broker action:
+//
+//   - Ack: success, duplicate, or already dead-lettered by the chain
+//   - Nak: only the subscription context ended (the message is redelivered at
+//     once to another consumer)
+//   - NakWithDelay: transient or exhausted failure, flow control, or a failed
+//     dead-letter publish
+//   - TermWithReason: only after the DLQ publish succeeded, or when no
+//     DLQPublisher is configured (dropped)
 func (b *Bus) msgHandler(
 	ctx context.Context,
 	handlerName string,
 	fn event.HandleFn,
+	policy deliveryPolicy,
 ) jetstream.MessageHandler {
 	return func(msg jetstream.Msg) {
+		d := b.delivery(msg, policy)
+
 		msgCtx, evt, err := b.registry.Decode(ctx, msg.Data())
 		if err != nil {
 			_ = msg.Term() // malformed forever
 			return
 		}
 
+		msgCtx = event.WithDelivery(msgCtx, d)
+		msgCtx = event.WithExecution(msgCtx, event.Execution{Handler: handlerName, StartedAt: time.Now()})
+
 		err = b.invoker.Invoke(msgCtx, evt, handlerName, func(ctx context.Context) error {
 			return fn(ctx, evt)
 		})
 
-		switch {
-		case err == nil:
-			_ = msg.Ack()
-
-		case errors.Is(err, invoker.ErrDuplicate):
-			_ = msg.Ack() // already processed
-
-		case errors.Is(err, invoker.ErrCircuitOpen):
-			_ = msg.NakWithDelay(b.circuitOpenDelay)
-
-		case errors.Is(err, invoker.ErrRateLimited):
-			_ = msg.NakWithDelay(b.rateLimitDelay)
-
-		default:
-			if b.onErr != nil {
-				b.onErr(msgCtx, evt, err, handlerName)
-			}
-			_ = msg.Nak()
-		}
+		s := event.Settle(msgCtx, event.SettleInput{
+			SubscriptionCtx: ctx,
+			Evt:             evt,
+			Handler:         handlerName,
+			Err:             err,
+			Publisher:       b.dlq,
+			OnErr:           b.onErr,
+		})
+		b.apply(msg, handlerName, s, err, d, policy)
 	}
+}
+
+// apply performs the one broker action for s. A failing ack call is logged and
+// otherwise ignored: the server redelivers an unacknowledged message, which can
+// duplicate a DLQ record (at-least-once, D-13).
+func (b *Bus) apply(msg jetstream.Msg, handlerName string, s event.Settlement, err error, d event.Delivery, policy deliveryPolicy) {
+	var aerr error
+	switch s.Disposition {
+	case event.DispositionAck:
+		aerr = msg.Ack()
+	case event.DispositionRetry:
+		// Only the interruption path: the subscription context ended.
+		aerr = msg.Nak()
+	case event.DispositionRetryDelayed:
+		errForDelay := s.Err
+		if errForDelay == nil {
+			errForDelay = err
+		}
+		aerr = msg.NakWithDelay(b.delayFor(errForDelay, d, policy.backOff))
+	case event.DispositionTerminal:
+		aerr = msg.TermWithReason(string(s.Outcome) + ": " + s.Reason)
+	}
+	if aerr != nil {
+		slog.Warn("eventbus: acknowledging message failed, the broker may redeliver it",
+			"handler", handlerName,
+			"subject", d.Subject,
+			"disposition", s.Disposition.String(),
+			"error", aerr,
+		)
+	}
+}
+
+// delayFor is the redelivery delay for err on delivery d: the flow-control
+// delays for circuit-open and rate-limited failures, otherwise the BackOff
+// schedule indexed by the delivery count and clamped to its last entry.
+func (b *Bus) delayFor(err error, d event.Delivery, backOff []time.Duration) time.Duration {
+	if len(backOff) == 0 {
+		backOff = defaultBackOff
+	}
+	switch {
+	case errors.Is(err, event.ErrDeadLetterFailed):
+		// A failed dead-letter publish follows the schedule even when its cause
+		// is flow control.
+	case errors.Is(err, event.ErrCircuitOpen):
+		return b.circuitOpenDelay
+	case errors.Is(err, event.ErrRateLimited):
+		return b.rateLimitDelay
+	}
+	return backOff[min(max(d.Count-1, 0), len(backOff)-1)]
 }

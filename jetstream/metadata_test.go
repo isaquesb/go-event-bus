@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -147,24 +148,45 @@ func (m *mdJS) count() int {
 
 // --- fake jetstream.Msg ---
 
-// mdMsg is a jetstream.Msg over a data slice that counts ack dispositions.
+// mdMsg is a jetstream.Msg over a data slice that counts ack dispositions and
+// records the delays and reasons it was given.
 type mdMsg struct {
 	data []byte
+
+	// numDelivered is reported by Metadata; subject and headers by the
+	// accessors of the same name; metaErr, when set, fails Metadata.
+	numDelivered uint64
+	subject      string
+	headers      natsgo.Header
+	metaErr      error
 
 	mu            sync.Mutex
 	acks          int
 	naks          int
 	nakWithDelays int
 	terms         int
+	plainTerms    int
+	nakDelays     []time.Duration
+	termReasons   []string
 }
 
-func (m *mdMsg) Metadata() (*jetstream.MsgMetadata, error) { return &jetstream.MsgMetadata{}, nil }
-func (m *mdMsg) Data() []byte                              { return m.data }
-func (m *mdMsg) Headers() natsgo.Header                    { return nil }
-func (m *mdMsg) Subject() string                           { return "" }
-func (m *mdMsg) Reply() string                             { return "" }
-func (m *mdMsg) DoubleAck(context.Context) error           { return nil }
-func (m *mdMsg) InProgress() error                         { return nil }
+func (m *mdMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	if m.metaErr != nil {
+		return nil, m.metaErr
+	}
+	return &jetstream.MsgMetadata{
+		NumDelivered: m.numDelivered,
+		Stream:       "S",
+		Consumer:     "C",
+		Sequence:     jetstream.SequencePair{Stream: 7},
+	}, nil
+}
+func (m *mdMsg) Data() []byte                    { return m.data }
+func (m *mdMsg) Headers() natsgo.Header          { return m.headers }
+func (m *mdMsg) Subject() string                 { return m.subject }
+func (m *mdMsg) Reply() string                   { return "" }
+func (m *mdMsg) DoubleAck(context.Context) error { return nil }
+func (m *mdMsg) InProgress() error               { return nil }
 
 func (m *mdMsg) Ack() error {
 	m.mu.Lock()
@@ -180,24 +202,28 @@ func (m *mdMsg) Nak() error {
 	return nil
 }
 
-func (m *mdMsg) NakWithDelay(time.Duration) error {
+func (m *mdMsg) NakWithDelay(d time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nakWithDelays++
+	m.nakDelays = append(m.nakDelays, d)
 	return nil
 }
 
+// Term is the reason-less term; the bus must never call it.
 func (m *mdMsg) Term() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.terms++
+	m.plainTerms++
 	return nil
 }
 
-func (m *mdMsg) TermWithReason(string) error {
+func (m *mdMsg) TermWithReason(reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.terms++
+	m.termReasons = append(m.termReasons, reason)
 	return nil
 }
 
@@ -205,6 +231,25 @@ func (m *mdMsg) counts() (acks, naks, terms int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.acks, m.naks, m.terms
+}
+
+// mdDispositions is a locked snapshot of everything mdMsg recorded.
+type mdDispositions struct {
+	acks, naks, plainTerms int
+	nakDelays              []time.Duration
+	termReasons            []string
+}
+
+func (m *mdMsg) snapshot() mdDispositions {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return mdDispositions{
+		acks:        m.acks,
+		naks:        m.naks,
+		plainTerms:  m.plainTerms,
+		nakDelays:   append([]time.Duration(nil), m.nakDelays...),
+		termReasons: append([]string(nil), m.termReasons...),
+	}
 }
 
 func newMdBus(js jsBackend, reg event.Registry, opts BusOptions) *Bus {
@@ -249,7 +294,7 @@ func TestJetStreamBus_Metadata_EmitToHandler(t *testing.T) {
 		return nil
 	}
 	msg := &mdMsg{data: pub.data}
-	bus.msgHandler(context.Background(), "h", fn)(msg)
+	bus.msgHandler(context.Background(), "h", fn, deliveryPolicy{})(msg)
 
 	if seen != 1 || !ok {
 		t.Fatalf("handler runs=%d, metadata ok=%v; want 1 and true", seen, ok)
@@ -295,10 +340,11 @@ func TestJetStreamBus_OnErrReceivesMessageContext(t *testing.T) {
 		t.Fatalf("Emit: %v", err)
 	}
 
-	msg := &mdMsg{data: js.payload(t, 0).data}
+	// The final delivery: only a terminal outcome is reported (D-16).
+	msg := &mdMsg{data: js.payload(t, 0).data, numDelivered: 1}
 	bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
 		return errors.New("boom")
-	})(msg)
+	}, deliveryPolicy{maxDeliver: 1})(msg)
 
 	if onErrCtx == nil {
 		t.Fatal("OnErr was not called")
@@ -307,8 +353,12 @@ func TestJetStreamBus_OnErrReceivesMessageContext(t *testing.T) {
 	if !ok || md.ID != "id-err" {
 		t.Errorf("OnErr ctx metadata = %+v ok=%v, want ID id-err", md, ok)
 	}
-	if acks, naks, _ := msg.counts(); naks != 1 || acks != 0 {
-		t.Errorf("acks=%d naks=%d, want 0/1", acks, naks)
+	got := msg.snapshot()
+	if got.naks != 0 || got.plainTerms != 0 || got.acks != 0 || len(got.nakDelays) != 0 {
+		t.Errorf("snapshot = %+v, want only a TermWithReason", got)
+	}
+	if want := []string{"dropped: delivery_exhausted"}; !slices.Equal(got.termReasons, want) {
+		t.Errorf("termReasons = %q, want %q", got.termReasons, want)
 	}
 }
 
@@ -322,7 +372,7 @@ func TestJetStreamBus_DecodeFailureTerms(t *testing.T) {
 	bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
 		fnCalled = true
 		return nil
-	})(msg)
+	}, deliveryPolicy{})(msg)
 
 	if acks, naks, terms := msg.counts(); terms != 1 || acks != 0 || naks != 0 {
 		t.Errorf("acks=%d naks=%d terms=%d, want 0/0/1", acks, naks, terms)
@@ -343,7 +393,7 @@ func TestJetStreamBus_Metadata_NestedEmitLineage(t *testing.T) {
 	msg := &mdMsg{data: js.payload(t, 0).data}
 	bus.msgHandler(context.Background(), "h", func(ctx context.Context, _ event.Event) error {
 		return bus.Emit(ctx, &mdEvent{name: "invoice.created"})
-	})(msg)
+	}, deliveryPolicy{})(msg)
 	if acks, _, _ := msg.counts(); acks != 1 {
 		t.Errorf("acks = %d, want 1", acks)
 	}
@@ -396,7 +446,7 @@ func TestJetStreamBus_MetadataOptions(t *testing.T) {
 	msg := &mdMsg{data: js.payload(t, 0).data}
 	bus.msgHandler(context.Background(), "h", func(ctx context.Context, _ event.Event) error {
 		return bus.Emit(ctx, &mdEvent{name: "child.event"})
-	})(msg)
+	}, deliveryPolicy{})(msg)
 
 	root := mdDecodeMetadata(t, reg, js.payload(t, 0).data)
 	child := mdDecodeMetadata(t, reg, js.payload(t, 1).data)
