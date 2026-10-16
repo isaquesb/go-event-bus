@@ -199,20 +199,31 @@ func itStreamMsg(t testing.TB, js jetstream.JetStream, stream string, seq uint64
 	return m
 }
 
-// itStreamMsgs returns the number of messages currently in stream.
-func itStreamMsgs(t testing.TB, js jetstream.JetStream, stream string) uint64 {
-	t.Helper()
+// itStreamMsgsErr returns the number of messages currently in stream. Unlike
+// itStreamMsgs it reports a failure instead of failing the test, so it is safe
+// to call from a handler goroutine.
+func itStreamMsgsErr(js jetstream.JetStream, stream string) (uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s, err := js.Stream(ctx, stream)
 	if err != nil {
-		t.Fatalf("stream %s: %v", stream, err)
+		return 0, err
 	}
 	info, err := s.Info(ctx)
 	if err != nil {
+		return 0, err
+	}
+	return info.State.Msgs, nil
+}
+
+// itStreamMsgs returns the number of messages currently in stream.
+func itStreamMsgs(t testing.TB, js jetstream.JetStream, stream string) uint64 {
+	t.Helper()
+	n, err := itStreamMsgsErr(js, stream)
+	if err != nil {
 		t.Fatalf("stream %s info: %v", stream, err)
 	}
-	return info.State.Msgs
+	return n
 }
 
 // itWaitStreamMsgs polls the stream every 50ms for up to 10s until it holds at
@@ -259,6 +270,22 @@ func itAdvisories(t testing.TB, nc *nats.Conn, subject string) <-chan []byte {
 		t.Fatalf("flush after subscribing to %s: %v", subject, err)
 	}
 	return ch
+}
+
+// itNextAdvisory waits up to d for the next advisory on ch and decodes it.
+func itNextAdvisory(t testing.TB, ch <-chan []byte, d time.Duration) itAdvisory {
+	t.Helper()
+	select {
+	case data := <-ch:
+		var a itAdvisory
+		if err := json.Unmarshal(data, &a); err != nil {
+			t.Fatalf("decode advisory %q: %v", data, err)
+		}
+		return a
+	case <-time.After(d):
+		t.Fatalf("no advisory within %s", d)
+		return itAdvisory{}
+	}
 }
 
 // waitConsumerInfo polls the consumer info every 50ms for up to 5s until cond
