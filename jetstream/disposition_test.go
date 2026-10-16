@@ -492,6 +492,98 @@ func TestJetStreamBus_DecodeFailureDeadLetteredBeforeTerm(t *testing.T) {
 	}
 }
 
+// TestJetStreamBus_EmptyBodyDecodeFailureDeadLettered is the bus-level proof for
+// 08-REVIEW CR-02: an undecodable message with an empty body goes through
+// msgHandler, Settle and the real NewDLQ, is published with an empty body and
+// is only then terminated, on the first and on the final delivery.
+func TestJetStreamBus_EmptyBodyDecodeFailureDeadLettered(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		data      []byte
+		delivered uint64
+	}{
+		{"nil body, first delivery", nil, 1},
+		{"empty body, final delivery", []byte{}, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			js := &dlqtJS{}
+			msg := &mdMsg{
+				data:         tc.data,
+				numDelivered: tc.delivered,
+				subject:      "s.empty",
+				headers:      map[string][]string{"tenant": {"acme"}, "Nats-Msg-Id": {"m-empty"}},
+			}
+			var (
+				onErrCalls int64
+				onErrEvt   atomic.Value // holds *event.Event
+				onErrErr   atomic.Value // holds *error
+				handlerRan bool
+			)
+			bus := newMdBus(&mdJS{}, dispDecodeRegistry{err: &event.DecodeError{Err: event.ErrMalformedEnvelope}}, BusOptions{
+				DLQPublisher: NewDLQ(js, nil, ""),
+				OnErr: func(_ context.Context, evt event.Event, err error, _ string) {
+					atomic.AddInt64(&onErrCalls, 1)
+					onErrEvt.Store(&evt)
+					onErrErr.Store(&err)
+				},
+			})
+			policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
+			bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
+				handlerRan = true
+				return nil
+			}, policy)(msg)
+
+			if n := js.calls(); n != 1 {
+				t.Fatalf("DLQ publishes = %d, want 1", n)
+			}
+			pub := js.msg(0)
+			if pub.Subject != "dlq.s.empty" {
+				t.Errorf("subject = %q, want dlq.s.empty", pub.Subject)
+			}
+			if len(pub.Data) != 0 {
+				t.Errorf("data = %q, want a zero-length body", pub.Data)
+			}
+			for k, v := range map[string]string{
+				event.HeaderDLQReason:           event.ReasonDecodeMalformed,
+				event.HeaderDLQOriginalSubject:  "s.empty",
+				event.HeaderDLQOriginalStream:   "S",
+				event.HeaderDLQOriginalSequence: "7",
+				event.HeaderDLQDeliveryCount:    fmt.Sprint(tc.delivered),
+				event.HeaderDLQOriginalMsgID:    "m-empty",
+				"tenant":                        "acme",
+			} {
+				if got := pub.Header.Get(k); got != v {
+					t.Errorf("header %s = %q, want %q", k, got, v)
+				}
+			}
+			if _, ok := pub.Header["Nats-Msg-Id"]; ok {
+				t.Error("Nats-Msg-Id must not follow the message into the DLQ")
+			}
+
+			got := msg.snapshot()
+			if want := "dead_lettered: decode_malformed"; len(got.termReasons) != 1 || got.termReasons[0] != want {
+				t.Errorf("termReasons = %q, want [%s]", got.termReasons, want)
+			}
+			if got.acks != 0 || got.naks != 0 || len(got.nakDelays) != 0 || got.plainTerms != 0 {
+				t.Errorf("snapshot = %+v, want only a TermWithReason", got)
+			}
+			if n := atomic.LoadInt64(&onErrCalls); n != 1 {
+				t.Fatalf("OnErr calls = %d, want 1", n)
+			}
+			if p, _ := onErrEvt.Load().(*event.Event); p == nil || *p != nil {
+				t.Errorf("OnErr event = %v, want nil", p)
+			}
+			if p, _ := onErrErr.Load().(*error); p == nil ||
+				!errors.Is(*p, event.ErrDeadLettered) || !errors.Is(*p, event.ErrMalformedEnvelope) {
+				t.Errorf("OnErr error = %v, want ErrDeadLettered and ErrMalformedEnvelope", p)
+			}
+			if handlerRan {
+				t.Error("handler ran for an undecodable message")
+			}
+		})
+	}
+}
+
 func TestJetStreamBus_UnknownVersionWaitsForFinal(t *testing.T) {
 	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
 

@@ -238,15 +238,104 @@ func TestDLQ_NoEnvelopeWithoutRegistry(t *testing.T) {
 	}
 }
 
-func TestDLQ_NoEnvelopeWithoutEvent(t *testing.T) {
-	js := &dlqtJS{}
-	d := NewDLQ(js, nil, "", WithDLQRegistry(newMdRegistry("orders.created")))
-	err := d.Publish(context.Background(), event.DLQRecord{Subject: "orders.created"})
-	if !errors.Is(err, ErrNoEnvelope) {
-		t.Fatalf("err = %v, want ErrNoEnvelope", err)
-	}
-	if js.calls() != 0 {
-		t.Errorf("publish calls = %d, want 0", js.calls())
+// TestDLQ_DecodeFailureEmptyBodyPublishedVerbatim is the invariant for
+// 08-REVIEW CR-02: a record without an event is a decode failure whose Raw is
+// the complete wire form, so it is published as it is, even when empty, and
+// never gets ErrNoEnvelope or a registry lookup. Every record shape a transport
+// builds for a decode failure is a row.
+func TestDLQ_DecodeFailureEmptyBodyPublishedVerbatim(t *testing.T) {
+	decodeErr := &event.DecodeError{Err: event.ErrMalformedEnvelope}
+	for _, tc := range []struct {
+		name     string
+		rec      event.DLQRecord
+		registry event.Registry
+		subject  string
+		want     map[string]string
+		absent   []string
+	}{
+		{
+			name: "jetstream delivery",
+			rec: event.DLQRecord{
+				Headers: map[string][]string{"tenant": {"acme"}, "Nats-Msg-Id": {"m-1"}},
+				Subject: "orders.created",
+				Cause:   decodeErr,
+				Reason:  event.ReasonDecodeMalformed,
+				Handler: "h",
+				Delivery: event.Delivery{
+					Count: 1, Max: 3, Subject: "orders.created", Stream: "S", StreamSeq: 42,
+				},
+			},
+			subject: "dlq.orders.created",
+			want: map[string]string{
+				event.HeaderDLQReason:           event.ReasonDecodeMalformed,
+				event.HeaderDLQOriginalStream:   "S",
+				event.HeaderDLQOriginalSequence: "42",
+				event.HeaderDLQOriginalMsgID:    "m-1",
+				"tenant":                        "acme",
+			},
+			absent: []string{"Nats-Msg-Id"},
+		},
+		{
+			name: "nats core delivery",
+			rec: event.DLQRecord{
+				Raw:      []byte{},
+				Headers:  map[string][]string{"tenant": {"acme"}},
+				Subject:  "orders.created",
+				Cause:    decodeErr,
+				Reason:   event.ReasonDecodeMalformed,
+				Delivery: event.Delivery{Count: 1, Max: 1, Subject: "orders.created"},
+			},
+			subject: "dlq.orders.created",
+			want: map[string]string{
+				event.HeaderDLQReason: event.ReasonDecodeMalformed,
+				"tenant":              "acme",
+			},
+			absent: []string{event.HeaderDLQOriginalSequence},
+		},
+		{
+			name:     "bare record with registry",
+			rec:      event.DLQRecord{Subject: "orders.created", Reason: event.ReasonDecodeMalformed},
+			registry: newMdRegistry("orders.created"),
+			subject:  "dlq.orders.created",
+			want:     map[string]string{event.HeaderDLQReason: event.ReasonDecodeMalformed},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			js := &dlqtJS{}
+			var opts []DLQOption
+			if tc.registry != nil {
+				opts = append(opts, WithDLQRegistry(tc.registry))
+			}
+			d := NewDLQ(js, nil, "", opts...)
+
+			err := d.Publish(context.Background(), tc.rec)
+			if errors.Is(err, ErrNoEnvelope) {
+				t.Fatalf("Publish = %v, a record without an event must not get ErrNoEnvelope", err)
+			}
+			if err != nil {
+				t.Fatalf("Publish: %v", err)
+			}
+			if js.calls() != 1 {
+				t.Fatalf("publish calls = %d, want 1", js.calls())
+			}
+			m := js.msg(0)
+			if m.Subject != tc.subject {
+				t.Errorf("subject = %q, want %q", m.Subject, tc.subject)
+			}
+			if len(m.Data) != 0 {
+				t.Errorf("data = %q, want a zero-length body", m.Data)
+			}
+			for k, v := range tc.want {
+				if got := m.Header.Get(k); got != v {
+					t.Errorf("header %s = %q, want %q", k, got, v)
+				}
+			}
+			for _, k := range tc.absent {
+				if _, ok := m.Header[k]; ok {
+					t.Errorf("header %s must be absent", k)
+				}
+			}
+		})
 	}
 }
 
