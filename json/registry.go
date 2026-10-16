@@ -72,11 +72,19 @@ func NewRegistry(opts ...Option) *Registry {
 	return r
 }
 
+// Register stores factory for name at version. A version <= 0 is registered as
+// version 1, the same normalization Decode applies to the wire version (D-18),
+// so latest is never 0 for a registered name. Versions 0 and 1 of one name are
+// therefore one registration, and the last call wins.
 func (r *Registry) Register(
 	name string,
 	factory event.Factory,
 	version int,
 ) {
+	if version <= 0 {
+		version = 1
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -122,6 +130,8 @@ func (r *Registry) EncodeWith(ctx context.Context, evt event.Event, md event.Met
 		return nil, err
 	}
 
+	// The wire carries Version() unchanged, so consumers still on v0.3.0 keep
+	// reading it; Decode reads a version 0 as 1.
 	v := 1
 	if withVersion, hasVersion := evt.(event.WithVersion); hasVersion {
 		v = withVersion.Version()
@@ -218,6 +228,8 @@ func (r *Registry) Decode(ctx context.Context, data []byte) (context.Context, ev
 	latest := r.latest[env.Name]
 	r.mu.RUnlock()
 
+	// Register normalizes a version <= 0 to 1, so latest is 0 only for a name
+	// that was never registered.
 	if latest == 0 {
 		return ctx, nil, &event.DecodeError{Name: env.Name, Version: version, Err: event.ErrUnknownEvent}
 	}
