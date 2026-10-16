@@ -37,6 +37,27 @@ type jsBackend interface {
 	CreateOrUpdateConsumer(ctx context.Context, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error)
 }
 
+// PublishRetryPolicy bounds the internal retry of transient publish failures
+// (see BusOptions.PublishRetry). The zero value means the defaults noted on
+// each field.
+type PublishRetryPolicy struct {
+	// MaxAttempts is the total number of publish attempts, the first one
+	// included. Values at or below 0 mean 3; 1 disables the retry.
+	MaxAttempts int
+
+	// BaseDelay is the backoff before the second attempt; it doubles per
+	// attempt up to MaxDelay and carries equal jitter. 0 means 100 ms.
+	BaseDelay time.Duration
+
+	// MaxDelay caps the backoff between attempts. 0 means 1 s.
+	MaxDelay time.Duration
+
+	// AttemptTimeout bounds each attempt, so a lost acknowledgement cannot
+	// consume the whole caller deadline. 0 means 2 s; a negative value means no
+	// per-attempt bound beyond the caller ctx and the nats.go default.
+	AttemptTimeout time.Duration
+}
+
 type BusOptions struct {
 	// Invoker wraps every handler call. Nil means no invokers: the handler is
 	// called directly (invoker.NewChain()).
@@ -66,6 +87,12 @@ type BusOptions struct {
 	// invoker.NewDLQ. Nil means such messages are terminated with
 	// TermWithReason and reported as dropped.
 	DLQPublisher event.DLQPublisher
+
+	// PublishRetry retries transient publish failures with the same
+	// Nats-Msg-Id, so the stream deduplicates a retry whose first attempt was
+	// stored but whose acknowledgement was lost. The zero value is 3 attempts
+	// with a 100 ms to 1 s jittered backoff and a 2 s per-attempt timeout.
+	PublishRetry PublishRetryPolicy
 }
 
 type Bus struct {
