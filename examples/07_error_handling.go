@@ -195,7 +195,9 @@ type EnhancedDLQPublisher struct {
 	// Your DLQ backend (NATS, Kafka, database, etc.)
 }
 
-func (p *EnhancedDLQPublisher) Publish(ctx context.Context, evt event.Event, cause error) error {
+func (p *EnhancedDLQPublisher) Publish(ctx context.Context, rec event.DLQRecord) error {
+	cause := rec.Cause
+
 	// Extract error details for debugging
 	errorType := "unknown"
 	isRetryable := true
@@ -217,7 +219,9 @@ func (p *EnhancedDLQPublisher) Publish(ctx context.Context, evt event.Event, cau
 	}
 
 	slog.Warn("publishing to DLQ",
-		"event", evt.Name(),
+		"event", rec.EventName,
+		"reason", rec.Reason,
+		"attempts", rec.Attempts,
 		"error_type", errorType,
 		"retryable", isRetryable,
 		"cause", cause.Error(),
@@ -237,6 +241,9 @@ func ExampleErrorHandling() {
 	chain := invoker.NewChain(
 		invoker.NewMetrics(nil),
 
+		// DLQ sits outside Retry: it dead-letters the final outcome once.
+		invoker.NewDLQ(dlq, nil),
+
 		invoker.NewRetry(invoker.RetryPolicy{
 			MaxAttempts: 3,
 			BaseDelay:   100 * time.Millisecond,
@@ -248,8 +255,6 @@ func ExampleErrorHandling() {
 			SuccessThreshold: 2,
 			OpenTimeout:      30 * time.Second,
 		}, nil),
-
-		invoker.NewDLQ(dlq, nil),
 	)
 
 	bus := event.NewLocalBus(event.LocalBusOptions{
@@ -314,22 +319,34 @@ func ExampleErrorHandling() {
 // =============================================================================
 
 /*
-+------------------------+-------------+--------+-----+
-| Error Type             | Retried?    | DLQ?   | CB? |
-+------------------------+-------------+--------+-----+
-| Default (unknown)      | Yes         | After  | Yes |
-| RetryableError         | Yes         | After  | Yes |
-| PermanentError         | No          | Yes    | No  |
-| Terminal interface     | No          | Yes    | No  |
-| Retryable interface    | Depends     | After  | Yes |
-| ErrDuplicate           | No          | No     | No  |
-| ErrRateLimited         | No          | No     | No  |
-| ErrCircuitOpen         | No          | No     | N/A |
-| context.Canceled       | No          | No     | No  |
-| context.DeadlineExc.   | No          | No     | No  |
-| ErrSendToDLQ           | No          | N/A    | No  |
-+------------------------+-------------+--------+-----+
++------------------------+-------------+-----------------------+-----+
+| Error Type             | Retried?    | DLQ?                  | CB? |
++------------------------+-------------+-----------------------+-----+
+| Default (unknown)      | Yes         | After exhaustion      | Yes |
+| RetryableError         | Yes         | After exhaustion      | Yes |
+| PermanentError         | No          | Immediately           | No  |
+| Terminal interface     | No          | Immediately           | No  |
+| Retryable interface    | Depends     | After exhaustion      | Yes |
+| ErrDuplicate           | No          | No (Acked)            | No  |
+| ErrDeadLettered        | No          | No (Acked, OnErr)     | No  |
+| ErrRateLimited         | No (delay)  | Final delivery only   | No  |
+| ErrCircuitOpen         | No (delay)  | Final delivery only   | N/A |
+| ErrInProgress          | No (delay)  | Final delivery only   | No  |
+| context.Canceled       | No          | Never                 | No  |
+| context.DeadlineExc.   | No          | Never                 | No  |
+| ErrSendToDLQ           | No          | N/A                   | No  |
++------------------------+-------------+-----------------------+-----+
 
 CB? = Counts as failure for Circuit Breaker
-After = Sent to DLQ only after retry exhaustion
+After exhaustion = retried in-process, dead-lettered when retries run out on
+  the final delivery.
+Immediately = dead-lettered on the first failure, no further attempts.
+Acked = the message is acknowledged and not reported as a failure; only
+  ErrDeadLettered is reported through OnErr.
+No (delay) = not retried in-process; the broker redelivers the message after a
+  delay and it is dead-lettered only on the final delivery.
+Never = a cancelled subscription context is never dead-lettered (the handler
+  was interrupted, not the message found bad).
+LocalBus and NATS Core deliveries are always final, so a "final delivery
+only" failure is dead-lettered on its first and only delivery.
 */

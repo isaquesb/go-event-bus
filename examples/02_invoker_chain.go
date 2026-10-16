@@ -52,10 +52,13 @@ func (e PaymentProcessed) RateLimitKey() string {
 // mockDLQPublisher simulates DLQ publishing
 type mockDLQPublisher struct{}
 
-func (m *mockDLQPublisher) Publish(ctx context.Context, evt event.Event, cause error) error {
+func (m *mockDLQPublisher) Publish(ctx context.Context, rec event.DLQRecord) error {
 	slog.Warn("event sent to DLQ",
-		"event", evt.Name(),
-		"cause", cause.Error(),
+		"event", rec.EventName,
+		"reason", rec.Reason,
+		"attempts", rec.Attempts,
+		"delivery_count", rec.Delivery.Count,
+		"cause", rec.Cause.Error(),
 	)
 	return nil
 }
@@ -99,8 +102,9 @@ func ExampleFullInvokerChain() {
 	// Build the chain in recommended order:
 	// 1. Observability (tracing, metrics) - wrap everything
 	// 2. Cheap rejections (rate limit, idempotency) - fail fast
-	// 3. Resilience (retry, circuit breaker) - handle failures
-	// 4. Terminal (DLQ) - last resort
+	// 3. DLQ - outside Retry, so it dead-letters the final outcome once
+	// 4. Resilience (retry, circuit breaker) - handle failures
+	dlq := &mockDLQPublisher{}
 	chain := invoker.NewChain(
 		// 1. Tracing - creates spans for each handler
 		telemetry.NewTracerInvoker(tracer),
@@ -132,7 +136,10 @@ func ExampleFullInvokerChain() {
 			metrics,
 		),
 
-		// 5. Retry - handles transient failures
+		// 5. DLQ - outside Retry: dead-letters the final outcome once
+		invoker.NewDLQ(dlq, metrics),
+
+		// 6. Retry - handles transient failures
 		invoker.NewRetry(
 			invoker.RetryPolicy{
 				MaxAttempts: 3,
@@ -142,7 +149,7 @@ func ExampleFullInvokerChain() {
 			metrics,
 		),
 
-		// 6. Circuit Breaker - prevents cascade failures
+		// 7. Circuit Breaker - prevents cascade failures
 		invoker.NewCircuitBreaker(
 			invoker.CircuitBreakerConfig{
 				FailureThreshold: 5,
@@ -151,14 +158,13 @@ func ExampleFullInvokerChain() {
 			},
 			metrics,
 		),
-
-		// 7. DLQ - handles terminal failures
-		invoker.NewDLQ(&mockDLQPublisher{}, metrics),
 	)
 
-	// Create the bus with the chain
+	// Create the bus with the chain. The same publisher is the bus backstop
+	// for failures the chain DLQ did not dead-letter.
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:       chain,
+		DLQPublisher:  dlq,
 		MaxConcurrent: 16,
 	})
 
