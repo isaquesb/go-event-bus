@@ -132,6 +132,25 @@ func NewCircuitBreaker(cfg CircuitBreakerConfig, metrics MetricProvider) *Circui
 	}
 }
 
+// CircuitBreaker is a per-handler circuit breaker.
+//
+// Counted failures open it after FailureThreshold of them: unclassified and
+// retryable errors, errors with Retryable() false that are not terminal, and
+// handler timeouts (a context error while the context cause is
+// event.ErrHandlerTimeout). Neutral outcomes never open, close or reset it:
+// terminal errors (PermanentError, ErrSendToDLQ, a panic), context
+// cancellation, a bare context.DeadlineExceeded on a live context, and the
+// flow-control errors ErrDuplicate, ErrDeadLettered, ErrInProgress,
+// ErrRateLimited, ErrCircuitOpen and ErrDeadLetterFailed. The rule is the same
+// in every state and the classifier is not configurable.
+//
+// After OpenTimeout the breaker turns half-open and admits exactly one probe
+// at a time; concurrent callers get ErrCircuitOpen. A successful probe frees
+// the slot for the next caller until SuccessThreshold successes close the
+// breaker. A counted probe failure reopens it; a neutral probe outcome keeps
+// it half-open and frees the slot. The probe holds a lease of OpenTimeout: a
+// probe still running after that is superseded by the next arrival and its
+// late completion is ignored. A zero OpenTimeout never expires the lease.
 type CircuitBreaker struct {
 	cfg     CircuitBreakerConfig
 	metrics MetricProvider
@@ -259,15 +278,50 @@ func (c *CircuitBreaker) record(b *handlerBreaker, tok token, out outcome) *tran
 	return nil
 }
 
-// classify decides how the result of next counts toward the breaker.
-func (c *CircuitBreaker) classify(_ context.Context, err error) outcome {
+// classify decides how the result of next counts toward the breaker (D-12).
+// The rule is the same in the closed and half-open states, evaluated in order:
+//
+//   - nil is a success.
+//   - A panic (event.ErrHandlerPanic) is neutral, even when the panicked value
+//     was a context error.
+//   - A handler timeout is counted: an error matching event.ErrHandlerTimeout,
+//     or a context error while the context cause is event.ErrHandlerTimeout.
+//   - Any other context.Canceled or context.DeadlineExceeded is neutral. A bare
+//     DeadlineExceeded on a live context (a downstream client timeout) is
+//     therefore neutral too: only a transport-set handler timeout counts.
+//   - Otherwise event.Dispose with a non-final Delivery decides: Ack and
+//     Terminal are neutral; a delayed retry is counted, except for the
+//     flow-control signals ErrCircuitOpen, ErrRateLimited, ErrInProgress,
+//     ErrDeadLetterFailed and ErrUnknownVersion, which are neutral.
+func (c *CircuitBreaker) classify(ctx context.Context, err error) outcome {
 	if err == nil {
 		return outcomeSuccess
 	}
-	// Interim rule: the legacy DLQ exception stays until the D-12 table
-	// replaces this function.
-	if errors.Is(err, ErrSendToDLQ) {
+	if errors.Is(err, event.ErrHandlerPanic) {
 		return outcomeNeutral
+	}
+
+	ctxErr := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	if errors.Is(err, event.ErrHandlerTimeout) ||
+		(ctxErr && errors.Is(context.Cause(ctx), event.ErrHandlerTimeout)) {
+		return outcomeFailure
+	}
+	if ctxErr {
+		return outcomeNeutral
+	}
+
+	switch event.Dispose(err, event.Delivery{}) {
+	case event.DispositionAck, event.DispositionTerminal:
+		return outcomeNeutral
+	case event.DispositionRetryDelayed:
+		if errors.Is(err, ErrCircuitOpen) ||
+			errors.Is(err, event.ErrRateLimited) ||
+			errors.Is(err, event.ErrInProgress) ||
+			errors.Is(err, event.ErrDeadLetterFailed) ||
+			errors.Is(err, event.ErrUnknownVersion) {
+			return outcomeNeutral
+		}
+		return outcomeFailure
 	}
 	return outcomeFailure
 }
