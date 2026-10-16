@@ -237,6 +237,47 @@ func rpReplay(t *testing.T, cons *rpConsumer, opts ReplayOptions) (*rpJS, Replay
 	return js, res, err
 }
 
+// TestReplayer_EmptyBodyRecordRepublishedVerbatim pins PD-2: the dead letter of
+// an undecodable empty message is republished empty, like any other record, so
+// the original consumer dead-letters it again and nothing is lost.
+func TestReplayer_EmptyBodyRecordRepublishedVerbatim(t *testing.T) {
+	rec := rpRecord(9, "orders.created", "", nil)
+	rec.headers.Set("Eventbus-Dlq-Reason", "decode_malformed")
+	cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}, {}}}
+
+	js, res, err := rpReplay(t, cons, ReplayOptions{})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if res != (ReplayResult{Replayed: 1, Failed: 0}) {
+		t.Fatalf("result = %+v, want {Replayed:1 Failed:0}", res)
+	}
+	if len(js.published) != 1 {
+		t.Fatalf("published %d messages, want 1", len(js.published))
+	}
+	got := js.published[0]
+	if got.Subject != "orders.created" {
+		t.Errorf("subject = %q, want orders.created", got.Subject)
+	}
+	if len(got.Data) != 0 {
+		t.Errorf("data = %q, want a zero-length body", got.Data)
+	}
+	if v := got.Header.Get("tenant"); v != "acme" {
+		t.Errorf("tenant header = %q, want acme (user headers are kept)", v)
+	}
+	for k := range got.Header {
+		if strings.HasPrefix(strings.ToLower(k), "eventbus-dlq-") {
+			t.Errorf("header %q leaked into the replay", k)
+		}
+	}
+	if v := got.Header.Get("Nats-Msg-Id"); v != "replay:DLQ:9" {
+		t.Errorf("Nats-Msg-Id = %q, want replay:DLQ:9", v)
+	}
+	if rec.acks != 1 || rec.naks != 0 {
+		t.Errorf("record acks=%d naks=%d, want 1 and 0", rec.acks, rec.naks)
+	}
+}
+
 func TestReplayer_DrainedReturnsPromptly(t *testing.T) {
 	cases := map[string]*rpConsumer{
 		"empty first batch":          {batches: []rpBatch{{}}},

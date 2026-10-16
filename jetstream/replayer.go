@@ -72,6 +72,12 @@ type ReplayResult struct {
 // to opts.ToSubject when set. The envelope is never decoded. The original user
 // headers are kept; every Eventbus-Dlq-* and Nats-* header is dropped.
 //
+// A record with an empty body, the dead letter of an undecodable empty
+// message, is republished empty like any other record. The original consumer
+// then dead-letters it again, so a replay never drops it and never stalls the
+// cursor. Pass Limit when the consumer is still failing, so a run does not
+// chase its own new dead letters.
+//
 // Each replay carries Nats-Msg-Id EVENT_ID:replay:DLQ_STREAM_SEQ, so the
 // original message id cannot be swallowed by the stream duplicate window, while
 // repeated replays of one record within that window dedup against each other. A
