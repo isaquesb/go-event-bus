@@ -3,8 +3,12 @@ package event
 import (
 	"context"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // DLQPublisher publishes a failed message to a dead-letter queue.
@@ -201,8 +205,76 @@ const DLQHeaderValueLimit = 1024
 // TruncationMarker ends a header value that TruncateHeader shortened.
 const TruncationMarker = "…[truncated]"
 
-// TruncateHeader is a stub filled in by the next commit.
-func TruncateHeader(s string, max int) string { return s }
+// TruncateHeader makes s safe to use as a header value of at most max bytes:
+// invalid UTF-8 is replaced with U+FFFD, every control character (CR, LF, tab
+// and the rest) becomes a space, and a longer result is cut at a rune boundary
+// and ends with TruncationMarker. When max is not larger than the marker the
+// cut has no marker.
+func TruncateHeader(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+	if len(s) <= max {
+		return s
+	}
+	if max <= len(TruncationMarker) {
+		return s[:runeBoundary(s, max)]
+	}
+	return s[:runeBoundary(s, max-len(TruncationMarker))] + TruncationMarker
+}
 
-// FailureHeaders is a stub filled in by the next commit.
-func (r DLQRecord) FailureHeaders() map[string]string { return nil }
+// runeBoundary returns the largest index at or below n that does not fall in
+// the middle of a rune of s.
+func runeBoundary(s string, n int) int {
+	for n > 0 && n < len(s) && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return n
+}
+
+// FailureHeaders returns the Eventbus-Dlq-* headers that describe the failure.
+// Every value goes through TruncateHeader at DLQHeaderValueLimit; the envelope
+// itself is never truncated. Headers whose value is unknown (empty text, zero
+// time, zero sequence) are omitted. Attempts is always present: 0 means the
+// handler never ran. HeaderDLQOriginalMsgID is not set here, a broker adapter
+// adds it from the stripped broker message id.
+func (r DLQRecord) FailureHeaders() map[string]string {
+	h := make(map[string]string, 13)
+	set := func(key, value string) {
+		if value != "" {
+			h[key] = TruncateHeader(value, DLQHeaderValueLimit)
+		}
+	}
+	setTime := func(key string, t time.Time) {
+		if !t.IsZero() {
+			set(key, t.UTC().Format(time.RFC3339Nano))
+		}
+	}
+	if r.Cause != nil {
+		set(HeaderDLQCause, r.Cause.Error())
+	}
+	set(HeaderDLQReason, r.Reason)
+	h[HeaderDLQAttempts] = strconv.Itoa(r.Attempts)
+	if r.Delivery.Count > 0 {
+		set(HeaderDLQDeliveryCount, strconv.Itoa(r.Delivery.Count))
+	}
+	set(HeaderDLQHandler, r.Handler)
+	set(HeaderDLQOriginalSubject, r.Subject)
+	setTime(HeaderDLQFailedAt, r.FailedAt)
+	setTime(HeaderDLQFirstAttemptAt, r.Execution.StartedAt)
+	set(HeaderDLQEventID, r.EventID)
+	set(HeaderDLQEventName, r.EventName)
+	set(HeaderDLQOriginalStream, r.Delivery.Stream)
+	if r.Delivery.StreamSeq > 0 {
+		set(HeaderDLQOriginalSequence, strconv.FormatUint(r.Delivery.StreamSeq, 10))
+	}
+	setTime(HeaderDLQPublishedAt, r.Delivery.PublishedAt)
+	return h
+}
