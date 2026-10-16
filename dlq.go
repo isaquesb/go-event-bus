@@ -26,7 +26,9 @@ type DLQPublisher interface {
 // original bytes and headers plus the failure context.
 type DLQRecord struct {
 	// Raw is the original envelope bytes. It is empty for LocalBus, where the
-	// publisher encodes Evt instead.
+	// publisher encodes Evt instead. When Evt is nil the record is a decode
+	// failure and Raw is the complete wire form, possibly empty: a publisher
+	// stores it as it is, never encoding or rejecting it.
 	Raw []byte
 	// Headers are the transport headers of the original message.
 	Headers map[string][]string

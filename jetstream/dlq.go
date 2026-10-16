@@ -68,8 +68,10 @@ func WithDLQRegistry(reg event.Registry) DLQOption {
 	return func(d *DLQ) { d.registry = reg }
 }
 
-// ErrNoEnvelope is returned by Publish for a record with no envelope bytes
-// when the DLQ has no registry or the record has no event to encode.
+// ErrNoEnvelope is returned by Publish for a record that has an event but no
+// envelope bytes, when the DLQ has no registry to encode the event. A record
+// without an event never gets it: it is a decode failure and its Raw is
+// published as it is.
 var ErrNoEnvelope = errors.New("jetstream: DLQ record has no envelope bytes and no registry to encode its event")
 
 // natsHeaderPrefix marks broker system headers (Nats-Msg-Id, Nats-Expected-*,
@@ -79,19 +81,22 @@ const natsHeaderPrefix = "Nats-"
 // dlqMinimalCauseLimit bounds the cause in the minimal max-payload retry.
 const dlqMinimalCauseLimit = 128
 
-// Publish publishes rec to the prefix plus the original subject. When rec.Raw
-// is present it is the message data, unchanged. A record without Raw (LocalBus
-// and NATS Core records) is encoded from rec.Evt through the registry given
-// with WithDLQRegistry; without a registry or an event Publish returns
-// ErrNoEnvelope and publishes nothing.
+// Publish publishes rec to the prefix plus the original subject.
+//
+// A record with a nil Evt is a decode failure: its Raw is the complete wire
+// form and is published unchanged even when empty, so an undecodable empty
+// message is still dead-lettered. A record with an event publishes rec.Raw when
+// present. Without Raw (LocalBus and NATS Core records) the event is encoded
+// through the registry given with WithDLQRegistry; without a registry Publish
+// returns ErrNoEnvelope and publishes nothing.
 //
 // When the broker rejects the message for exceeding its max payload, Publish
 // retries once with only the minimal failure headers, because the failure
 // headers add to the envelope size.
 func (d *DLQ) Publish(ctx context.Context, rec event.DLQRecord) error {
 	data := rec.Raw
-	if len(data) == 0 {
-		if d.registry == nil || rec.Evt == nil {
+	if rec.Evt != nil && len(data) == 0 {
+		if d.registry == nil {
 			return ErrNoEnvelope
 		}
 		md, ok := event.MetadataFromContext(ctx)
