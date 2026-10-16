@@ -59,6 +59,8 @@ const (
 	ReasonDuplicate             = "duplicate"
 	ReasonInterrupted           = "interrupted"
 	ReasonPanic                 = "panic"
+	ReasonBusClosed             = "bus_closed"
+	ReasonQueueFull             = "queue_full"
 )
 
 // terminalError marks a permanent error. It has the same shape as
@@ -189,8 +191,9 @@ func causeText(err error) string {
 // ReasonOf returns the stable reason for err, one of the Reason constants, or
 // "" for nil. Precedence: panic (an error matching ErrHandlerPanic, even when
 // wrapped); the Reason carried by DeadLetteredError,
-// DeadLetterFailedError or FailureError; duplicate; terminal (ErrSendToDLQ or
-// an error with Terminal() true); unknown_version; circuit_open; rate_limited;
+// DeadLetterFailedError or FailureError; duplicate; bus_closed (ErrBusClosed);
+// queue_full (ErrQueueFull); interrupted (ErrShutdownInterrupted); terminal
+// (ErrSendToDLQ or an error with Terminal() true); unknown_version; circuit_open; rate_limited;
 // in_progress; the decode reasons; retries_exhausted; and delivery_exhausted
 // for everything else.
 func ReasonOf(err error) string {
@@ -215,6 +218,12 @@ func ReasonOf(err error) string {
 	switch {
 	case errors.Is(err, ErrDuplicate):
 		return ReasonDuplicate
+	case errors.Is(err, ErrBusClosed):
+		return ReasonBusClosed
+	case errors.Is(err, ErrQueueFull):
+		return ReasonQueueFull
+	case errors.Is(err, ErrShutdownInterrupted):
+		return ReasonInterrupted
 	case isTerminal(err):
 		return ReasonTerminal
 	case errors.Is(err, ErrUnknownVersion):
