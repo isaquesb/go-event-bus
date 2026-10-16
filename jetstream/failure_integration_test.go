@@ -15,6 +15,7 @@ import (
 
 	event "github.com/isaquesb/go-event-bus"
 	"github.com/isaquesb/go-event-bus/invoker"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -513,5 +514,169 @@ func TestIntegration_InProgressRecordNotAcked(t *testing.T) {
 	}
 	if n := itStreamMsgs(t, js, dlqStream); n != 1 {
 		t.Errorf("DLQ stream holds %d messages, want exactly 1", n)
+	}
+}
+
+// itEmptyBodyReport is one OnErr report of the empty-body test.
+type itEmptyBodyReport struct {
+	evt event.Event
+	err error
+}
+
+// TestIntegration_EmptyBodyDecodeFailureDeadLettered proves on the real server
+// that an undecodable message with an empty body is dead-lettered with an empty
+// body instead of being lost at MaxDeliver (08-REVIEW CR-02): the DLQ record is
+// stored first, TermWithReason follows after one delivery, and a Replay sends
+// the record back so the consumer dead-letters it a second time (FAIL-05,
+// FAIL-08, D-14, D-18, D-20, PD-2).
+func TestIntegration_EmptyBodyDecodeFailureDeadLettered(t *testing.T) {
+	nc, js := connect(t)
+
+	base := uniqueName(t, "it")
+	subject := base + ".order"
+	stream := newStream(t, js, base+".>")
+	prefix, dlqStream := itNewDLQStream(t, js)
+	consumer := uniqueName(t, "C")
+
+	reports := make(chan itEmptyBodyReport, 8)
+	bus := NewBus(js, itRegistry(), BusOptions{
+		Invoker:          invoker.NewChain(),
+		CircuitOpenDelay: time.Second,
+		RateLimitDelay:   time.Second,
+		DLQPublisher:     NewDLQ(js, nil, prefix),
+		OnErr: func(_ context.Context, evt event.Event, err error, _ string) {
+			reports <- itEmptyBodyReport{evt: evt, err: err}
+		},
+	})
+	t.Cleanup(func() { _ = bus.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	terminated := itAdvisories(t, nc, termAdvisorySubject(stream, consumer))
+
+	var handled atomic.Int64
+	handler := func(context.Context, event.Event) error {
+		handled.Add(1)
+		return nil
+	}
+	if err := bus.Subscribe(ctx, subject, handler,
+		event.WithStream(stream),
+		event.WithConsumer(consumer),
+		event.WithMaxDeliver(3),
+		event.WithBackOff([]time.Duration{100 * time.Millisecond, 100 * time.Millisecond}),
+	); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	nextReport := func() itEmptyBodyReport {
+		t.Helper()
+		select {
+		case r := <-reports:
+			if r.evt != nil {
+				t.Errorf("OnErr event = %v, want nil", r.evt)
+			}
+			if !errors.Is(r.err, event.ErrDeadLettered) || !errors.Is(r.err, event.ErrMalformedEnvelope) {
+				t.Errorf("OnErr error = %v, want ErrDeadLettered and ErrMalformedEnvelope", r.err)
+			}
+			return r
+		case <-time.After(5 * time.Second):
+			t.Fatal("OnErr was not called within 5s")
+			return itEmptyBodyReport{}
+		}
+	}
+
+	// The poison message is published directly: a zero-length body, user header.
+	if _, err := js.PublishMsg(ctx, &nats.Msg{
+		Subject: subject,
+		Header:  nats.Header{"tenant": []string{"acme"}},
+	}, jetstream.WithMsgID("empty-1")); err != nil {
+		t.Fatalf("publish empty message: %v", err)
+	}
+
+	// First dead letter: D-14 dead-letters a malformed message at once.
+	adv := itNextAdvisory(t, terminated, 5*time.Second)
+	if !strings.Contains(adv.Reason, "dead_lettered: decode_malformed") {
+		t.Errorf("MSG_TERMINATED reason = %q, want it to contain %q", adv.Reason, "dead_lettered: decode_malformed")
+	}
+	if adv.Deliveries != 1 {
+		t.Errorf("MSG_TERMINATED deliveries = %d, want 1", adv.Deliveries)
+	}
+	// The advisory is raised by the Term, which only follows a stored record.
+	itWaitStreamMsgs(t, js, dlqStream, 1)
+	orig := itStreamMsg(t, js, stream, 1)
+	rec := itStreamMsg(t, js, dlqStream, 1)
+	if len(orig.Data) != 0 || len(rec.Data) != 0 {
+		t.Errorf("data lengths orig=%d dlq=%d, want 0 and 0", len(orig.Data), len(rec.Data))
+	}
+	for k, want := range map[string]string{
+		event.HeaderDLQReason:           event.ReasonDecodeMalformed,
+		event.HeaderDLQOriginalSubject:  subject,
+		event.HeaderDLQOriginalStream:   stream,
+		event.HeaderDLQOriginalSequence: "1",
+		event.HeaderDLQOriginalMsgID:    "empty-1",
+		"tenant":                        "acme",
+	} {
+		if got := rec.Header.Get(k); got != want {
+			t.Errorf("DLQ header %s = %q, want %q", k, got, want)
+		}
+	}
+	if rec.Header.Get(event.HeaderDLQCause) == "" {
+		t.Errorf("DLQ header %s is empty, want the decode cause", event.HeaderDLQCause)
+	}
+	if got := rec.Header.Get("Nats-Msg-Id"); got != "" {
+		t.Errorf("DLQ record Nats-Msg-Id = %q, want it stripped", got)
+	}
+	nextReport()
+
+	// Replay (PD-2). Limit 1 keeps the run from chasing the second dead letter
+	// that the still-subscribed consumer is about to write.
+	res, err := NewReplayer(js).Replay(ctx, ReplayOptions{FromStream: dlqStream, Limit: 1})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if res != (ReplayResult{Replayed: 1, Failed: 0}) {
+		t.Fatalf("Replay result = %+v, want {Replayed:1 Failed:0}", res)
+	}
+	itWaitStreamMsgs(t, js, stream, 2)
+	again := itStreamMsg(t, js, stream, 2)
+	if len(again.Data) != 0 {
+		t.Errorf("replayed data = %q, want a zero-length body", again.Data)
+	}
+	if got := again.Header.Get("tenant"); got != "acme" {
+		t.Errorf("replayed tenant header = %q, want acme", got)
+	}
+	if got, want := again.Header.Get("Nats-Msg-Id"), "replay:"+dlqStream+":1"; got != want {
+		t.Errorf("replayed Nats-Msg-Id = %q, want %q", got, want)
+	}
+	for k := range again.Header {
+		if strings.HasPrefix(strings.ToLower(k), "eventbus-dlq-") {
+			t.Errorf("header %q leaked into the replay", k)
+		}
+	}
+
+	// Second dead letter: the replay did not drop the record.
+	adv = itNextAdvisory(t, terminated, 5*time.Second)
+	if !strings.Contains(adv.Reason, "dead_lettered: decode_malformed") {
+		t.Errorf("second MSG_TERMINATED reason = %q, want it to contain %q", adv.Reason, "dead_lettered: decode_malformed")
+	}
+	itWaitStreamMsgs(t, js, dlqStream, 2)
+	rec2 := itStreamMsg(t, js, dlqStream, 2)
+	if len(rec2.Data) != 0 {
+		t.Errorf("second DLQ data = %q, want a zero-length body", rec2.Data)
+	}
+	if got := rec2.Header.Get(event.HeaderDLQOriginalSequence); got != "2" {
+		t.Errorf("second DLQ %s = %q, want 2", event.HeaderDLQOriginalSequence, got)
+	}
+	if got, want := rec2.Header.Get(event.HeaderDLQOriginalMsgID), "replay:"+dlqStream+":1"; got != want {
+		t.Errorf("second DLQ %s = %q, want %q", event.HeaderDLQOriginalMsgID, got, want)
+	}
+	nextReport()
+
+	if n := itStreamMsgs(t, js, dlqStream); n != 2 {
+		t.Errorf("DLQ stream holds %d messages, want exactly 2", n)
+	}
+	if n := handled.Load(); n != 0 {
+		t.Errorf("handler ran %d times for an undecodable message, want 0", n)
 	}
 }
