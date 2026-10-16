@@ -2,6 +2,7 @@ package invoker
 
 import (
 	"context"
+	"errors"
 	"github.com/isaquesb/go-event-bus"
 	"sync"
 	"time"
@@ -21,6 +22,9 @@ const (
 	StatusProcessing IdempotencyStatus = "processing"
 	StatusCompleted  IdempotencyStatus = "completed"
 	StatusFailed     IdempotencyStatus = "failed"
+	// StatusDeadLettered records that the message was published to the DLQ. It
+	// is not a duplicate: a replay with the same key executes again.
+	StatusDeadLettered IdempotencyStatus = "dead_lettered"
 )
 
 // ErrDuplicate is the root sentinel event.ErrDuplicate, kept here for source
@@ -112,12 +116,14 @@ func (i *Idempotency) Invoke(
 
 		case StatusProcessing:
 			if time.Since(rec.StartedAt) < i.cfg.ProcessingTTL {
+				// Not a duplicate: another instance may have crashed mid-run.
+				// ErrInProgress is retried later, never Acked as done.
 				i.metrics.IncCounter(
-					"eventbus_idempotency_duplicate_total",
+					"eventbus_idempotency_in_progress_total",
 					1,
-					Labels{"handler": handlerName, "reason": "processing"},
+					Labels{"handler": handlerName},
 				)
-				return ErrDuplicate
+				return event.ErrInProgress
 			}
 
 			i.metrics.IncCounter(
@@ -126,6 +132,10 @@ func (i *Idempotency) Invoke(
 				Labels{"handler": handlerName},
 			)
 			// stale lock → continuar
+
+		case StatusDeadLettered, StatusFailed:
+			// dead_lettered and failed records are not completions: fall
+			// through and execute again.
 		}
 	}
 
@@ -159,7 +169,12 @@ func (i *Idempotency) Invoke(
 	status := StatusCompleted
 	stage := "put_completed"
 
-	if err != nil {
+	switch {
+	case err == nil:
+	case errors.Is(err, event.ErrDeadLettered):
+		status = StatusDeadLettered
+		stage = "put_dead_lettered"
+	default:
 		status = StatusFailed
 		stage = "put_failed"
 	}
