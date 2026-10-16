@@ -160,3 +160,118 @@ func TestChainOrder_LegacyOrderDeadLettersPrematurely(t *testing.T) {
 		t.Errorf("expected ErrDeadLettered, got %v", err)
 	}
 }
+
+// coStub is an invoker that returns err without calling next, the way a rate
+// limiter or an open circuit breaker does.
+type coStub struct{ err error }
+
+func (s coStub) Invoke(context.Context, event.Event, string, func(context.Context) error) error {
+	return s.err
+}
+
+func TestChainOrder_FlowControlDeadLetteredOnlyOnFinal(t *testing.T) {
+	pub := &dqPublisher{}
+	chain := invoker.NewChain(
+		invoker.NewDLQ(pub, nil),
+		invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}, nil),
+		coStub{err: event.ErrCircuitOpen},
+	)
+	evt := &testEvent{name: "test.event"}
+
+	err := chain.Invoke(dqDelivery(1, 3), evt, "handler", func(context.Context) error { return nil })
+	if err != event.ErrCircuitOpen {
+		t.Errorf("non-final delivery: expected the raw ErrCircuitOpen, got %v", err)
+	}
+	if n := len(pub.records()); n != 0 {
+		t.Fatalf("non-final delivery: expected no DLQ record, got %d", n)
+	}
+
+	err = chain.Invoke(dqDelivery(3, 3), evt, "handler", func(context.Context) error { return nil })
+	if !errors.Is(err, event.ErrDeadLettered) {
+		t.Errorf("final delivery: expected ErrDeadLettered, got %v", err)
+	}
+	recs := pub.records()
+	if len(recs) != 1 {
+		t.Fatalf("final delivery: expected 1 DLQ record, got %d", len(recs))
+	}
+	if recs[0].Reason != event.ReasonCircuitOpen || recs[0].Attempts != 0 {
+		t.Errorf("record reason=%q attempts=%d, want circuit_open and 0", recs[0].Reason, recs[0].Attempts)
+	}
+}
+
+// Idempotency sits outside DLQ, so its ErrInProgress never reaches the DLQ
+// invoker. The transport backstop (event.Settle) must dead-letter it on the
+// final delivery.
+func TestChainOrder_InProgressBypassesChainDLQ(t *testing.T) {
+	pub := &dqPublisher{}
+	store := invoker.NewMemoryIdempotencyStore()
+	_ = store.Put(context.Background(), "evt-1:handler", invoker.IdempotencyRecord{
+		Status:    invoker.StatusProcessing,
+		StartedAt: time.Now(),
+	})
+	chain := invoker.NewChain(
+		invoker.NewIdempotency(store, invoker.IdempotencyConfig{ProcessingTTL: time.Hour}, nil),
+		invoker.NewDLQ(pub, nil),
+		invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}, nil),
+	)
+
+	called := false
+	err := chain.Invoke(dqDelivery(3, 3), &eventWithId{id: "evt-1", name: "test"}, "handler", func(context.Context) error {
+		called = true
+		return nil
+	})
+
+	if called {
+		t.Error("the handler must not run while another execution is in progress")
+	}
+	if !errors.Is(err, event.ErrInProgress) {
+		t.Errorf("expected ErrInProgress, got %v", err)
+	}
+	if n := len(pub.records()); n != 0 {
+		t.Errorf("the chain DLQ must not see ErrInProgress, got %d records: the transport backstop is required", n)
+	}
+}
+
+func TestChainOrder_DeadLetteredThenReplayExecutes(t *testing.T) {
+	pub := &dqPublisher{}
+	store := invoker.NewMemoryIdempotencyStore()
+	chain := invoker.NewChain(
+		invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil),
+		invoker.NewDLQ(pub, nil),
+		invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}, nil),
+	)
+	evt := &eventWithId{id: "evt-1", name: "test"}
+
+	err := chain.Invoke(dqDelivery(1, 3), evt, "handler", func(context.Context) error {
+		return invoker.PermanentError{Err: errors.New("bad input")}
+	})
+	if !errors.Is(err, event.ErrDeadLettered) {
+		t.Fatalf("first run: expected ErrDeadLettered, got %v", err)
+	}
+	if n := len(pub.records()); n != 1 {
+		t.Fatalf("first run: expected 1 DLQ record, got %d", n)
+	}
+	rec, _, _ := store.Get(context.Background(), "evt-1:handler")
+	if rec.Status != invoker.StatusDeadLettered {
+		t.Fatalf("first run: stored status = %q, want dead_lettered", rec.Status)
+	}
+
+	called := false
+	err = chain.Invoke(dqDelivery(1, 3), evt, "handler", func(context.Context) error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Errorf("replay: unexpected error %v", err)
+	}
+	if !called {
+		t.Error("replay: a dead-lettered event must execute again")
+	}
+	rec, _, _ = store.Get(context.Background(), "evt-1:handler")
+	if rec.Status != invoker.StatusCompleted {
+		t.Errorf("replay: stored status = %q, want completed", rec.Status)
+	}
+	if n := len(pub.records()); n != 1 {
+		t.Errorf("replay: expected still 1 DLQ record, got %d", n)
+	}
+}

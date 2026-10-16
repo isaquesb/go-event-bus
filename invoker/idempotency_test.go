@@ -228,11 +228,112 @@ func TestIdempotency_ActiveLockBlocks(t *testing.T) {
 		return nil
 	})
 
-	if !errors.Is(err, invoker.ErrDuplicate) {
-		t.Errorf("expected ErrDuplicate for active lock, got '%v'", err)
+	if !errors.Is(err, event.ErrInProgress) {
+		t.Errorf("expected ErrInProgress for active lock, got '%v'", err)
 	}
 	if called {
 		t.Error("active processing lock should block execution")
+	}
+}
+
+func TestIdempotency_InProgressIsNotDuplicate(t *testing.T) {
+	store := invoker.NewMemoryIdempotencyStore()
+	metrics := &testMetricProvider{}
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{ProcessingTTL: time.Hour}, metrics)
+
+	_ = store.Put(context.Background(), "evt-1:handler", invoker.IdempotencyRecord{
+		Status:    invoker.StatusProcessing,
+		StartedAt: time.Now(),
+	})
+
+	called := false
+	err := idempotency.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", func(context.Context) error {
+		called = true
+		return nil
+	})
+
+	if called {
+		t.Error("the handler must not run while another execution is in progress")
+	}
+	if !errors.Is(err, event.ErrInProgress) {
+		t.Errorf("expected ErrInProgress, got '%v'", err)
+	}
+	if errors.Is(err, event.ErrDuplicate) {
+		t.Errorf("an in-progress record must not look like a duplicate (the transport would Ack it): %v", err)
+	}
+	if metrics.counters["eventbus_idempotency_in_progress_total"] != 1 {
+		t.Errorf("expected 1 in_progress_total, got %d", metrics.counters["eventbus_idempotency_in_progress_total"])
+	}
+	if metrics.counters["eventbus_idempotency_duplicate_total"] != 0 {
+		t.Errorf("an in-progress record must not count as a duplicate, got %d", metrics.counters["eventbus_idempotency_duplicate_total"])
+	}
+}
+
+func TestIdempotency_DeadLetteredRecorded(t *testing.T) {
+	store := invoker.NewMemoryIdempotencyStore()
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+
+	dead := &event.DeadLetteredError{Cause: errors.New("bad"), Reason: event.ReasonTerminal}
+	err := idempotency.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", func(context.Context) error {
+		return dead
+	})
+
+	if !errors.Is(err, event.ErrDeadLettered) {
+		t.Errorf("expected the dead-lettered error to pass through, got '%v'", err)
+	}
+	rec, ok, _ := store.Get(context.Background(), "evt-1:handler")
+	if !ok || rec.Status != invoker.StatusDeadLettered {
+		t.Errorf("stored status = %q (found %v), want %q", rec.Status, ok, invoker.StatusDeadLettered)
+	}
+}
+
+func TestIdempotency_DeadLetteredReplayExecutes(t *testing.T) {
+	store := invoker.NewMemoryIdempotencyStore()
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+
+	_ = store.Put(context.Background(), "evt-1:handler", invoker.IdempotencyRecord{
+		Status:    invoker.StatusDeadLettered,
+		StartedAt: time.Now(),
+	})
+
+	called := false
+	err := idempotency.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", func(context.Context) error {
+		called = true
+		return nil
+	})
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Error("a dead_lettered record must re-execute on replay")
+	}
+	rec, _, _ := store.Get(context.Background(), "evt-1:handler")
+	if rec.Status != invoker.StatusCompleted {
+		t.Errorf("stored status = %q, want completed", rec.Status)
+	}
+}
+
+func TestIdempotency_CompletedIsDuplicate(t *testing.T) {
+	store := invoker.NewMemoryIdempotencyStore()
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+
+	_ = store.Put(context.Background(), "evt-1:handler", invoker.IdempotencyRecord{
+		Status:    invoker.StatusCompleted,
+		StartedAt: time.Now(),
+	})
+
+	called := false
+	err := idempotency.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", func(context.Context) error {
+		called = true
+		return nil
+	})
+
+	if called {
+		t.Error("a completed record must not re-execute")
+	}
+	if !errors.Is(err, event.ErrDuplicate) {
+		t.Errorf("expected ErrDuplicate, got '%v'", err)
 	}
 }
 
