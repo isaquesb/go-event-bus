@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/isaquesb/go-event-bus"
+	"github.com/isaquesb/go-event-bus/invoker"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -27,12 +29,17 @@ var ErrInvalidConfig = errors.New("eventbus: invalid consumer configuration")
 var tracer = otel.Tracer("go-event-bus")
 
 // jsBackend is an internal interface over jetstream.JetStream to allow testing.
+// Publishing goes through PublishMsg, not Publish, so a mock can read the
+// Nats-Msg-Id header Emit sets: jetstream.WithMsgID only sets the same header,
+// so the wire result is identical.
 type jsBackend interface {
-	Publish(ctx context.Context, subject string, payload []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error)
+	PublishMsg(ctx context.Context, m *nats.Msg, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error)
 	CreateOrUpdateConsumer(ctx context.Context, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error)
 }
 
 type BusOptions struct {
+	// Invoker wraps every handler call. Nil means no invokers: the handler is
+	// called directly (invoker.NewChain()).
 	Invoker event.Invoker
 
 	OnErr func(ctx context.Context, evt event.Event, err error, handler string)
@@ -96,6 +103,9 @@ func NewBus(
 			"hint", "set BusOptions.RateLimitDelay to a value appropriate for your rate limit window",
 		)
 	}
+	if opts.Invoker == nil {
+		opts.Invoker = invoker.NewChain()
+	}
 	if opts.DLQPublisher == nil {
 		slog.Warn("eventbus: BusOptions.DLQPublisher not configured, failures the chain did not dead-letter and undecodable messages are terminated and reported as dropped",
 			"hint", "set BusOptions.DLQPublisher to the jetstream.NewDLQ value given to invoker.NewDLQ",
@@ -122,6 +132,14 @@ func (b *Bus) resolve(ctx context.Context, e event.Event, cfg event.EmitOptions)
 	return event.ResolveOutbound(ctx, e, cfg)
 }
 
+// Emit encodes evt and publishes it to the stream that covers the subject.
+//
+// The message carries the resolved Metadata.ID as its Nats-Msg-Id header, so
+// the id precedence WithID, then Event.Id(), then a generated id decides the
+// broker dedup key. The stream deduplicates within its Duplicates window (2
+// minutes by default); an app-level re-Emit is deduplicated only when it
+// carries the same id (WithID or Event.Id()), because generated ids differ per
+// call. A publish acknowledged as a duplicate is not an error.
 func (b *Bus) Emit(
 	ctx context.Context,
 	evt event.Event,
@@ -147,12 +165,23 @@ func (b *Bus) Emit(
 		return err
 	}
 
-	_, err = b.js.Publish(ctx, cfg.Subject, data)
+	msg := &nats.Msg{Subject: cfg.Subject, Data: data, Header: nats.Header{}}
+	msg.Header.Set(jetstream.MsgIDHeader, md.ID)
+	span.SetAttributes(attribute.String("messaging.message.id", md.ID))
+
+	ack, err := b.js.PublishMsg(ctx, msg)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
-	return err
+	if ack != nil && ack.Duplicate {
+		slog.DebugContext(ctx, "eventbus: publish acknowledged as duplicate",
+			"subject", cfg.Subject,
+			"msg_id", md.ID,
+		)
+	}
+	return nil
 }
 
 // defaultBackOff is used when no BackOff is configured for a consumer.

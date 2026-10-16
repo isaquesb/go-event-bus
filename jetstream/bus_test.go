@@ -9,6 +9,7 @@ import (
 
 	"github.com/isaquesb/go-event-bus"
 	"github.com/isaquesb/go-event-bus/invoker"
+	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -36,8 +37,8 @@ type mockJS struct {
 	consumerFactory func() jetstream.Consumer
 }
 
-func (m *mockJS) Publish(_ context.Context, _ string, _ []byte, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
-	return nil, nil
+func (m *mockJS) PublishMsg(_ context.Context, _ *natsgo.Msg, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	return &jetstream.PubAck{}, nil
 }
 
 func (m *mockJS) CreateOrUpdateConsumer(
@@ -83,9 +84,9 @@ func (c *mockConsumer) Consume(jetstream.MessageHandler, ...jetstream.PullConsum
 // mockConsumeCtx implements jetstream.ConsumeContext.
 type mockConsumeCtx struct{}
 
-func (c *mockConsumeCtx) Stop()                    {}
-func (c *mockConsumeCtx) Drain()                   {}
-func (c *mockConsumeCtx) Closed() <-chan struct{}   { return make(chan struct{}) }
+func (c *mockConsumeCtx) Stop()                   {}
+func (c *mockConsumeCtx) Drain()                  {}
+func (c *mockConsumeCtx) Closed() <-chan struct{} { return make(chan struct{}) }
 
 // subscriberWithOpts implements event.SubscribeOptionsProvider.
 type subscriberWithOpts struct {
@@ -94,8 +95,8 @@ type subscriberWithOpts struct {
 	opts   []event.SubscribeOption
 }
 
-func (s *subscriberWithOpts) Name() string                      { return s.name }
-func (s *subscriberWithOpts) Events() map[string]event.HandleFn { return s.events }
+func (s *subscriberWithOpts) Name() string                              { return s.name }
+func (s *subscriberWithOpts) Events() map[string]event.HandleFn         { return s.events }
 func (s *subscriberWithOpts) SubscribeOptions() []event.SubscribeOption { return s.opts }
 
 func noopHandler(_ context.Context, _ event.Event) error { return nil }

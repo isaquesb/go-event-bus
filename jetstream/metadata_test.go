@@ -110,18 +110,19 @@ func (r *mdRegistry) Decode(ctx context.Context, data []byte) (context.Context, 
 type mdPublished struct {
 	subject string
 	data    []byte
+	header  natsgo.Header
 	opts    int
 }
 
-// mdJS is a jsBackend that records every Publish.
+// mdJS is a jsBackend that records every PublishMsg.
 type mdJS struct {
 	mu        sync.Mutex
 	published []mdPublished
 }
 
-func (m *mdJS) Publish(_ context.Context, subject string, payload []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+func (m *mdJS) PublishMsg(_ context.Context, msg *natsgo.Msg, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
 	m.mu.Lock()
-	m.published = append(m.published, mdPublished{subject: subject, data: payload, opts: len(opts)})
+	m.published = append(m.published, mdPublished{subject: msg.Subject, data: msg.Data, header: maps.Clone(msg.Header), opts: len(opts)})
 	m.mu.Unlock()
 	return &jetstream.PubAck{}, nil
 }
@@ -280,7 +281,7 @@ func TestJetStreamBus_Metadata_EmitToHandler(t *testing.T) {
 		t.Errorf("subject = %q, want order.created", pub.subject)
 	}
 	if pub.opts != 0 {
-		t.Errorf("Publish got %d options, want 0 (publish dedup is Phase 9)", pub.opts)
+		t.Errorf("PublishMsg got %d options, want 0 (the Nats-Msg-Id travels as a header)", pub.opts)
 	}
 
 	var (
