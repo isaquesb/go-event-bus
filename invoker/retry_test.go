@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/isaquesb/go-event-bus"
 	"github.com/isaquesb/go-event-bus/invoker"
 )
 
@@ -69,8 +70,18 @@ func TestRetry_ExhaustedRetries(t *testing.T) {
 		return persistentErr
 	})
 
+	if !errors.Is(err, event.ErrRetriesExhausted) {
+		t.Errorf("expected ErrRetriesExhausted, got '%v'", err)
+	}
 	if !errors.Is(err, persistentErr) {
-		t.Errorf("expected error '%v', got '%v'", persistentErr, err)
+		t.Errorf("expected the last error to be preserved, got '%v'", err)
+	}
+	var fe *invoker.FailureError
+	if !errors.As(err, &fe) {
+		t.Fatalf("expected *FailureError, got %T", err)
+	}
+	if fe.Reason != event.ReasonRetriesExhausted || fe.Attempts != 3 {
+		t.Errorf("reason=%q attempts=%d, want retries_exhausted and 3", fe.Reason, fe.Attempts)
 	}
 	if called != 3 {
 		t.Errorf("expected 3 calls, got %d", called)
@@ -85,13 +96,24 @@ func TestRetry_PermanentErrorSendsToDLQ(t *testing.T) {
 	}, nil)
 
 	called := 0
+	inner := errors.New("permanent failure")
 	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
 		called++
-		return invoker.PermanentError{Err: errors.New("permanent failure")}
+		return invoker.PermanentError{Err: inner}
 	})
 
 	if !errors.Is(err, invoker.ErrSendToDLQ) {
 		t.Errorf("expected ErrSendToDLQ, got '%v'", err)
+	}
+	if !errors.Is(err, inner) {
+		t.Errorf("expected the permanent error to be preserved, got '%v'", err)
+	}
+	var fe *invoker.FailureError
+	if !errors.As(err, &fe) {
+		t.Fatalf("expected *FailureError, got %T", err)
+	}
+	if fe.Reason != event.ReasonTerminal || fe.Attempts != 1 {
+		t.Errorf("reason=%q attempts=%d, want terminal and 1", fe.Reason, fe.Attempts)
 	}
 	if called != 1 {
 		t.Errorf("expected 1 call (no retries for terminal errors), got %d", called)
@@ -284,6 +306,77 @@ func TestRetry_MetricsTracked(t *testing.T) {
 
 	if metrics.counters["eventbus_retry_success_total"] != 1 {
 		t.Errorf("expected 1 retry success, got %d", metrics.counters["eventbus_retry_success_total"])
+	}
+}
+
+func retryNoRetryFor(t *testing.T, sentinel error) {
+	t.Helper()
+	retry := invoker.NewRetry(invoker.RetryPolicy{
+		MaxAttempts: 5,
+		BaseDelay:   time.Millisecond,
+		MaxDelay:    10 * time.Millisecond,
+	}, nil)
+
+	called := 0
+	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
+		called++
+		return sentinel
+	})
+
+	if err != sentinel {
+		t.Errorf("expected %v returned unwrapped, got '%v'", sentinel, err)
+	}
+	if called != 1 {
+		t.Errorf("expected 1 call, got %d", called)
+	}
+}
+
+func TestRetry_NoRetryForInProgress(t *testing.T) {
+	retryNoRetryFor(t, event.ErrInProgress)
+}
+
+func TestRetry_NoRetryForDeadLettered(t *testing.T) {
+	retryNoRetryFor(t, event.ErrDeadLettered)
+}
+
+func TestRetry_NoRetryForDeadLetterFailed(t *testing.T) {
+	retryNoRetryFor(t, event.ErrDeadLetterFailed)
+}
+
+func TestRetry_ZeroMaxAttemptsRunsOnce(t *testing.T) {
+	retry := invoker.NewRetry(invoker.RetryPolicy{}, nil)
+
+	called := 0
+	cause := errors.New("fails")
+	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
+		called++
+		return cause
+	})
+
+	if called != 1 {
+		t.Errorf("expected the handler to run once, got %d", called)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("expected the cause to be preserved, got '%v'", err)
+	}
+	var fe *invoker.FailureError
+	if !errors.As(err, &fe) || fe.Cause == nil || fe.Attempts != 1 {
+		t.Errorf("expected a FailureError with a cause and 1 attempt, got %#v", err)
+	}
+}
+
+func TestSentinelAliases_Identity(t *testing.T) {
+	if invoker.ErrDuplicate != event.ErrDuplicate {
+		t.Error("invoker.ErrDuplicate must be event.ErrDuplicate")
+	}
+	if invoker.ErrCircuitOpen != event.ErrCircuitOpen {
+		t.Error("invoker.ErrCircuitOpen must be event.ErrCircuitOpen")
+	}
+	if invoker.ErrRateLimited != event.ErrRateLimited {
+		t.Error("invoker.ErrRateLimited must be event.ErrRateLimited")
+	}
+	if invoker.ErrSendToDLQ != event.ErrSendToDLQ {
+		t.Error("invoker.ErrSendToDLQ must be event.ErrSendToDLQ")
 	}
 }
 
