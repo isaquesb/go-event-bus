@@ -36,7 +36,7 @@ registry.RegisterUpcaster(&UserCreatedV1ToV2{})
 registry.Register(name string, factory event.Factory, version int)
 ```
 
-Registers an event factory for a given name and version. The registry tracks the latest version for each event name.
+Registers an event factory for a given name and version. The registry tracks the latest version for each event name. A version <= 0 is registered as version 1, matching `Decode`, which reads version 0 as version 1.
 
 ## Options
 
