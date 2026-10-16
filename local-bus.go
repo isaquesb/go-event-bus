@@ -2,13 +2,60 @@ package event
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
 )
 
 const DefaultMaxConcurrent = 16
+
+// DefaultQueueSize is the number of tasks LocalBusOptions.QueueSize parks when
+// it is not set.
+const DefaultQueueSize = 1024
+
+// ErrQueueFull is reported, never returned, when an external emit finds no free
+// execution slot and no queue room (OverflowDrop), or when the emitter context
+// expired while it waited for queue room (OverflowBlock). The event is dropped
+// for that handler and the drop is reported once through the bus OnErr, the
+// event's own OnErr and an Error-level slog record.
+var ErrQueueFull = errors.New("event: queue full")
+
+// OverflowPolicy selects what LocalBus does with an external emit when every
+// execution slot is busy and the queue is full. An emit made from inside a
+// handler of the same bus is never subject to it: it runs inline.
+type OverflowPolicy int
+
+const (
+	// OverflowBlock is the default. The emit parks up to QueueSize tasks and,
+	// beyond that, waits for queue room for as long as the emitter ctx is alive.
+	// When the emitter ctx ends first the event is dropped with ErrQueueFull.
+	// Under sustained overload the emitter pays, with its latency.
+	OverflowBlock OverflowPolicy = iota
+	// OverflowUnbounded never blocks and never drops: every task is parked,
+	// whatever the count. Under sustained overload memory pays, and parked
+	// tasks are lost if the process dies.
+	OverflowUnbounded
+	// OverflowDrop reports ErrQueueFull immediately when the queue is full.
+	// Under sustained overload the event pays.
+	OverflowDrop
+)
+
+// String returns block, unbounded, drop or unknown.
+func (p OverflowPolicy) String() string {
+	switch p {
+	case OverflowBlock:
+		return "block"
+	case OverflowUnbounded:
+		return "unbounded"
+	case OverflowDrop:
+		return "drop"
+	}
+	return "unknown"
+}
 
 // passthroughInvoker is a no-op Invoker that calls the handler directly.
 // Used as default when no Invoker chain is configured.
@@ -24,9 +71,35 @@ func (p *passthroughInvoker) Invoke(
 }
 
 type LocalBusOptions struct {
-	Invoker       Invoker
-	OnErr         func(ctx context.Context, evt Event, err error, handler string)
+	Invoker Invoker
+	OnErr   func(ctx context.Context, evt Event, err error, handler string)
+
+	// MaxConcurrent is the number of async handlers that run at once. Values at
+	// or below 0 mean DefaultMaxConcurrent.
+	//
+	// Throughput is MaxConcurrent divided by handler latency. The queue only
+	// absorbs bursts; under sustained overload Overflow decides who pays
+	// (OverflowBlock the emitter's latency, OverflowUnbounded memory and
+	// durability, OverflowDrop the event). An emit made from inside a handler
+	// of this bus never waits and runs inline when no slot is free, provided it
+	// passes the handler ctx; the inline depth equals the self-emit chain depth.
 	MaxConcurrent int
+
+	// QueueSize is the number of tasks parked while they wait for an execution
+	// slot. Values at or below 0 mean DefaultQueueSize. It is ignored by
+	// OverflowUnbounded. See MaxConcurrent for what the queue does and does not
+	// do for throughput.
+	QueueSize int
+
+	// Overflow selects the policy for an external emit that finds no free slot
+	// and no queue room. The zero value is OverflowBlock. Tasks have no
+	// ordering guarantee under any policy. See MaxConcurrent for the cost of
+	// each policy.
+	Overflow OverflowPolicy
+
+	// ShutdownTimeout is the bound Close applies to Shutdown. Values at or
+	// below 0 mean DefaultShutdownTimeout.
+	ShutdownTimeout time.Duration
 
 	// IDGenerator mints ids for events that carry no id of their own.
 	// Nil means NewID.
@@ -50,41 +123,63 @@ func NewLocalBus(opts LocalBusOptions) *LocalBus {
 	if opts.MaxConcurrent <= 0 {
 		opts.MaxConcurrent = DefaultMaxConcurrent
 	}
+	if opts.QueueSize <= 0 {
+		opts.QueueSize = DefaultQueueSize
+	}
+	if opts.ShutdownTimeout <= 0 {
+		opts.ShutdownTimeout = DefaultShutdownTimeout
+	}
 	if opts.Invoker == nil {
 		opts.Invoker = &passthroughInvoker{}
 	}
 	return &LocalBus{
-		handlers: make(map[string][]*namedHandle),
-		onErr:    opts.OnErr,
-		dlq:      opts.DLQPublisher,
-		invoker:  opts.Invoker,
-		sem:      make(chan struct{}, opts.MaxConcurrent),
-		idGen:    opts.IDGenerator,
-		inherit:  slices.Clone(opts.InheritHeaders),
+		handlers:        make(map[string][]*namedHandle),
+		onErr:           opts.OnErr,
+		dlq:             opts.DLQPublisher,
+		invoker:         opts.Invoker,
+		exec:            make(chan struct{}, opts.MaxConcurrent),
+		pending:         make(chan struct{}, opts.QueueSize),
+		overflow:        opts.Overflow,
+		shutdownTimeout: opts.ShutdownTimeout,
+		idGen:           opts.IDGenerator,
+		inherit:         slices.Clone(opts.InheritHeaders),
 	}
 }
 
-// LocalBus implements an in-process async event dispatcher.
-// Events are fire-and-forget, without delivery guarantees.
+// LocalBus is an in-process event dispatcher. Emit runs handlers
+// asynchronously, detached from the emitter ctx (see Emit); EmitSync runs them
+// on the caller goroutine. Shutdown and Close drain in-flight handlers within a
+// bound. There is no ordering guarantee between tasks.
 type LocalBus struct {
-	mu       sync.RWMutex
-	handlers map[string][]*namedHandle
-	onErr    func(ctx context.Context, evt Event, err error, handler string)
-	dlq      DLQPublisher
-	invoker  Invoker
-	sem      chan struct{}
-	idGen    func() string
-	inherit  []string
+	mu              sync.RWMutex
+	handlers        map[string][]*namedHandle
+	onErr           func(ctx context.Context, evt Event, err error, handler string)
+	dlq             DLQPublisher
+	invoker         Invoker
+	exec            chan struct{}
+	pending         chan struct{}
+	overflow        OverflowPolicy
+	shutdownTimeout time.Duration
+	idGen           func() string
+	inherit         []string
+	life            Lifecycle
 }
+
+var _ Shutdowner = (*LocalBus)(nil)
 
 // Subscribe registers a handler for events on the given subject.
 // Options can be used to configure the subscription (e.g., WithHandlerName).
+// It returns ErrBusClosed once Shutdown or Close began.
 func (b *LocalBus) Subscribe(
 	ctx context.Context,
 	subject string,
 	handler HandleFn,
 	opts ...SubscribeOption,
 ) error {
+	if b.life.Closing() {
+		return ErrBusClosed
+	}
+
 	cfg := ApplyOptions(opts...)
 
 	handlerName := cfg.HandlerName
@@ -120,98 +215,281 @@ func (b *LocalBus) RegisterSubscribers(ctx context.Context, subs ...Subscriber) 
 	return nil
 }
 
-// Close gracefully shuts down the bus.
-// For LocalBus, this is a no-op since there are no external connections.
+// Shutdown stops accepting emits and waits for the in-flight handlers and the
+// tasks parked for a slot, bounded by ctx.
+//
+// A handler of this bus may keep emitting while the bus drains (a nested emit,
+// made with the handler ctx); those children are drained too, which ends when
+// the causal chain ends or ctx expires. When ctx expires first, every handler
+// ctx is cancelled with cause ErrShutdownInterrupted, parked tasks are handed
+// back as interrupted, new emits are refused, and Shutdown returns ctx.Err()
+// without waiting further. Interrupted tasks are reported once through the
+// single report sink and are never dead-lettered. Shutdown is safe to call more
+// than once and concurrently.
+func (b *LocalBus) Shutdown(ctx context.Context) error {
+	return b.life.Shutdown(ctx)
+}
+
+// Close shuts the bus down, bounded by LocalBusOptions.ShutdownTimeout (default
+// DefaultShutdownTimeout). It calls Shutdown and returns its error.
 func (b *LocalBus) Close() error {
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), b.shutdownTimeout)
+	defer cancel()
+	return b.Shutdown(ctx)
 }
 
-func (b *LocalBus) dispatch(
-	ctx context.Context,
-	subject string,
-	e Event,
-	async bool,
-) {
-	b.mu.RLock()
-	hList := b.handlers[subject]
-	b.mu.RUnlock()
-
-	if len(hList) == 0 {
-		return
-	}
-
-	for _, h := range hList {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		handler := h
-
-		exec := func() {
-			// LocalBus never redelivers, so every delivery is the final one.
-			hctx := WithDelivery(ctx, Delivery{Count: 1, Max: 1, Subject: subject})
-			hctx = WithExecution(hctx, Execution{Handler: handler.Name, StartedAt: time.Now()})
-			if err := b.runHandler(hctx, e, handler); err != nil {
-				// Settle is the single place that dead-letters and reports; a
-				// local bus has no broker action to take on the Settlement.
-				_ = Settle(hctx, SettleInput{
-					SubscriptionCtx: ctx,
-					Evt:             e,
-					Handler:         handler.Name,
-					Err:             err,
-					Publisher:       b.dlq,
-					OnErr:           b.onErr,
-				})
-			}
-		}
-
-		if async {
-			select {
-			case b.sem <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-
-			go func() {
-				defer func() { <-b.sem }()
-				exec()
-			}()
-		} else {
-			exec()
-		}
-	}
-}
-
+// Emit dispatches e to every handler subscribed to its subject and returns
+// without waiting for them. It has no error return: a drop or a rejection is
+// reported through the bus OnErr, the event's OnErr and slog, never lost.
+//
+// Async handlers run under a handler ctx that:
+//
+//   - keeps the values of the emitter ctx (Metadata, trace span, baggage);
+//   - is not cancelled when the emitter ctx is done, and carries none of its
+//     deadline, so a handler outlives the request that emitted it;
+//   - is cancelled when the Shutdown deadline expires, with cause
+//     ErrShutdownInterrupted.
+//
+// The OTel span of the emitter may already have ended when the handler runs;
+// child spans still parent to it. The emitter ctx only bounds how long Emit
+// waits for queue room under OverflowBlock. An emit made with a handler ctx of
+// this bus never waits for a slot: it runs inline when none is free. Tasks have
+// no ordering guarantee. EmitSync handlers keep the caller's ctx instead. After
+// Shutdown the event is dropped and reported with ErrBusClosed.
 func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 	cfg := ApplyEmitOptions(e, opts...)
 	cfg.IDGenerator = b.idGen
 	cfg.InheritHeaders = b.inherit
 	md := ResolveOutbound(ctx, e, cfg)
-	b.dispatch(WithMetadata(ctx, md), cfg.Subject, e, true)
+	ctx = WithMetadata(ctx, md)
+
+	hList := b.snapshot(cfg.Subject)
+	if len(hList) == 0 {
+		return
+	}
+
+	release, err := b.life.Admit(ctx)
+	if err != nil {
+		b.reject(ctx, cfg.Subject, e, err)
+		return
+	}
+	defer release()
+
+	for _, h := range hList {
+		b.dispatchAsync(ctx, cfg.Subject, e, h)
+	}
 }
 
+// EmitSync runs every handler subscribed to the event's subject on the caller
+// goroutine, under the caller's ctx. It returns ErrBusClosed after Shutdown.
 func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) (Event, error) {
 	cfg := ApplyEmitOptions(e, opts...)
 	cfg.IDGenerator = b.idGen
 	cfg.InheritHeaders = b.inherit
 	md := ResolveOutbound(ctx, e, cfg)
-	b.dispatch(WithMetadata(ctx, md), cfg.Subject, e, false)
+	ctx = WithMetadata(ctx, md)
+
+	hList := b.snapshot(cfg.Subject)
+	if len(hList) == 0 {
+		return e, nil
+	}
+
+	release, err := b.life.Admit(ctx)
+	if err != nil {
+		return e, err
+	}
+	defer release()
+
+	for _, h := range hList {
+		_ = b.execute(ctx, cfg.Subject, e, h, false)
+	}
 	return e, nil
 }
 
-func (b *LocalBus) runHandler(
+// snapshot returns the handlers of subject. The slice is append-only, so the
+// returned header is safe to read after the lock is released.
+func (b *LocalBus) snapshot(subject string) []*namedHandle {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.handlers[subject]
+}
+
+// dispatchAsync schedules one handler. The order is fixed: a free execution
+// slot, then an inline run for a nested emit, then the overflow policy.
+func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h *namedHandle) {
+	release, ok := b.life.Track()
+	if !ok {
+		b.interrupted(ctx, subject, e, h.Name)
+		return
+	}
+
+	select {
+	case b.exec <- struct{}{}:
+		go b.runTask(ctx, subject, e, h, release, true)
+		return
+	default:
+	}
+
+	// An emit from inside a handler of this bus never waits: that is what
+	// removes the self-emit deadlock by construction.
+	if b.life.Nested(ctx) {
+		b.runTask(ctx, subject, e, h, release, false)
+		return
+	}
+
+	parked := false
+	switch b.overflow {
+	case OverflowDrop:
+		select {
+		case b.pending <- struct{}{}:
+			parked = true
+		default:
+			b.dropQueueFull(ctx, subject, e, h.Name)
+			release()
+			return
+		}
+	case OverflowBlock:
+		// Try without waiting first, so a done emitter ctx never wins a random
+		// select when there is room.
+		select {
+		case b.pending <- struct{}{}:
+			parked = true
+		default:
+			select {
+			case b.pending <- struct{}{}:
+				parked = true
+			case <-ctx.Done():
+				b.dropQueueFull(ctx, subject, e, h.Name)
+				release()
+				return
+			case <-b.life.Context().Done():
+				b.interrupted(ctx, subject, e, h.Name)
+				release()
+				return
+			}
+		}
+	case OverflowUnbounded:
+		// No budget: every task is parked.
+	}
+
+	go func() {
+		select {
+		case b.exec <- struct{}{}:
+			if parked {
+				<-b.pending
+			}
+			if b.life.Context().Err() != nil {
+				<-b.exec
+				b.interrupted(ctx, subject, e, h.Name)
+				release()
+				return
+			}
+			b.runTask(ctx, subject, e, h, release, true)
+		case <-b.life.Context().Done():
+			if parked {
+				<-b.pending
+			}
+			b.interrupted(ctx, subject, e, h.Name)
+			release()
+		}
+	}()
+}
+
+// runTask runs one handler and releases its accounting. The recover guards the
+// code InvokeHandler does not (OnErr, Settle, DLQ publishers); handler and
+// invoker panics are already converted to errors by InvokeHandler.
+func (b *LocalBus) runTask(
 	ctx context.Context,
-	evt Event,
+	subject string,
+	e Event,
 	h *namedHandle,
+	release func(),
+	slot bool,
+) {
+	defer release()
+	if slot {
+		defer func() { <-b.exec }()
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "event: panic in LocalBus task",
+				"handler", h.Name,
+				"event", safeEventName(e),
+				"panic", fmt.Sprint(r),
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	_ = b.execute(ctx, subject, e, h, true)
+}
+
+// execute runs one handler through the invoker chain and settles a failure.
+func (b *LocalBus) execute(
+	ctx context.Context,
+	subject string,
+	e Event,
+	h *namedHandle,
+	async bool,
 ) error {
-	return b.invoker.Invoke(
-		ctx,
-		evt,
-		h.Name,
-		func(ctx context.Context) error {
-			return h.Fn(ctx, evt)
-		},
-	)
+	hctx, stop := b.life.HandlerContext(ctx, async)
+	defer stop()
+	subCtx := hctx
+
+	// LocalBus never redelivers, so every delivery is the final one.
+	hctx = WithDelivery(hctx, Delivery{Count: 1, Max: 1, Subject: subject})
+	hctx = WithExecution(hctx, Execution{Handler: h.Name, StartedAt: time.Now()})
+
+	err := InvokeHandler(hctx, b.invoker, e, h.Name, func(c context.Context) error {
+		return h.Fn(c, e)
+	})
+	if err == nil {
+		return nil
+	}
+	err = WrapInterrupted(subCtx, err)
+
+	// Settle is the single place that dead-letters and reports; a local bus has
+	// no broker action to take on the Settlement.
+	s := Settle(hctx, SettleInput{
+		SubscriptionCtx: subCtx,
+		Evt:             e,
+		Handler:         h.Name,
+		Err:             err,
+		Publisher:       b.dlq,
+		OnErr:           b.onErr,
+	})
+	if s.Err != nil {
+		return s.Err
+	}
+	return err
+}
+
+// reject reports an emit refused before any handler ran.
+func (b *LocalBus) reject(ctx context.Context, subject string, e Event, err error) {
+	reportUnsettled(WithDelivery(ctx, Delivery{Count: 1, Max: 1, Subject: subject}),
+		SettleInput{Evt: e, OnErr: b.onErr}, OutcomeRejected, err)
+}
+
+// dropQueueFull reports a task dropped for lack of a slot and queue room.
+func (b *LocalBus) dropQueueFull(ctx context.Context, subject string, e Event, handler string) {
+	reportUnsettled(WithDelivery(ctx, Delivery{Count: 1, Max: 1, Subject: subject}),
+		SettleInput{Evt: e, Handler: handler, OnErr: b.onErr}, OutcomeDropped, ErrQueueFull)
+}
+
+// interrupted reports a task that never ran because the bus was shut down. When
+// the bus ctx is cancelled the report goes through Settle, which sees an
+// interruption and never dead-letters; otherwise the bus is merely closed.
+func (b *LocalBus) interrupted(ctx context.Context, subject string, e Event, handler string) {
+	bus := b.life.Context()
+	if bus.Err() == nil {
+		b.reject(ctx, subject, e, ErrBusClosed)
+		return
+	}
+	_ = Settle(WithDelivery(ctx, Delivery{Count: 1, Max: 1, Subject: subject}), SettleInput{
+		SubscriptionCtx: bus,
+		Evt:             e,
+		Handler:         handler,
+		Err:             WrapInterrupted(bus, context.Canceled),
+		Publisher:       b.dlq,
+		OnErr:           b.onErr,
+	})
 }

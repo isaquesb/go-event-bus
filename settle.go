@@ -103,6 +103,9 @@ const (
 	// OutcomeInterrupted means the subscription context ended on the final
 	// delivery, so the server will not redeliver the message.
 	OutcomeInterrupted Outcome = "interrupted"
+	// OutcomeRejected means the event was refused before any handler ran, for
+	// example an emit after Shutdown.
+	OutcomeRejected Outcome = "rejected"
 )
 
 // SettleInput is what Settle needs to decide the fate of one handled message.
@@ -220,7 +223,7 @@ func Settle(ctx context.Context, in SettleInput) Settlement {
 // record, then the bus OnErr callback, then the event's own OnErr method.
 func reportTerminal(ctx context.Context, in SettleInput, d Delivery, outcome Outcome, reason string, err error) {
 	level := slog.LevelError
-	if outcome == OutcomeDeadLettered {
+	if outcome == OutcomeDeadLettered || outcome == OutcomeRejected {
 		level = slog.LevelWarn
 	}
 	logSettle(ctx, level, "event: terminal outcome", in, d, reason, err, slog.String("outcome", string(outcome)))
@@ -232,6 +235,17 @@ func reportTerminal(ctx context.Context, in SettleInput, d Delivery, outcome Out
 			h.OnErr(ctx, err, in.Handler)
 		}
 	}
+}
+
+// reportUnsettled reports a drop or a rejection that never reached a handler,
+// so it shares the single report sink with Settle. The delivery is read from
+// ctx and defaults to a final first delivery. The reason is derived from err.
+func reportUnsettled(ctx context.Context, in SettleInput, outcome Outcome, err error) {
+	d, ok := DeliveryFromContext(ctx)
+	if !ok {
+		d = Delivery{Count: 1, Max: 1}
+	}
+	reportTerminal(ctx, in, d, outcome, ReasonOf(err), err)
 }
 
 // logSettle writes one structured record. It never includes the payload.

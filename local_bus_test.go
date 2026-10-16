@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/isaquesb/go-event-bus"
@@ -221,38 +222,45 @@ func TestLocalBus_NoHandlers(t *testing.T) {
 	_, _ = bus.EmitSync(context.Background(), evt)
 }
 
+// TestLocalBus_ContextCancellation pins CORE-03 (D-09): async handlers are
+// detached from the emitter ctx, so a ctx that is already cancelled when Emit is
+// called neither skips nor cancels any handler. Shutdown waits for all of them.
 func TestLocalBus_ContextCancellation(t *testing.T) {
-	ctx := context.Background()
-	bus := event.NewLocalBus(event.LocalBusOptions{
-		Invoker:       &passthroughInvoker{},
-		MaxConcurrent: 1,
-	})
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		bus := event.NewLocalBus(event.LocalBusOptions{
+			Invoker:       &passthroughInvoker{},
+			MaxConcurrent: 1,
+		})
 
-	var count atomic.Int32
+		var count atomic.Int32
 
-	// Register multiple handlers
-	for i := 0; i < 5; i++ {
-		if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
-			time.Sleep(50 * time.Millisecond)
-			count.Add(1)
-			return nil
-		}, event.WithHandlerName("handler")); err != nil {
-			t.Fatalf("subscribe: %v", err)
+		// Register multiple handlers
+		for i := 0; i < 5; i++ {
+			if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+				time.Sleep(50 * time.Millisecond)
+				count.Add(1)
+				return nil
+			}, event.WithHandlerName("handler")); err != nil {
+				t.Fatalf("subscribe: %v", err)
+			}
 		}
-	}
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
 
-	evt := &testEvent{name: "user.created"}
-	bus.Emit(cancelCtx, evt)
+		evt := &testEvent{name: "user.created"}
+		bus.Emit(cancelCtx, evt)
 
-	time.Sleep(100 * time.Millisecond)
+		if err := bus.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
 
-	// With context already cancelled, handlers should not execute
-	if count.Load() > 0 {
-		t.Errorf("expected no handlers to be called with cancelled context, got %d", count.Load())
-	}
+		// The emitter ctx no longer bounds the handlers: all of them ran.
+		if got := count.Load(); got != 5 {
+			t.Errorf("expected all 5 handlers to run with a cancelled emitter ctx, got %d", got)
+		}
+	})
 }
 
 func TestLocalBus_ConcurrencyLimit(t *testing.T) {
