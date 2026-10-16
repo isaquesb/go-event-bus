@@ -61,6 +61,16 @@ func NewDLQ(js dlqBackend, metrics invoker.MetricProvider, prefix string, opts .
 	return d
 }
 
+// WithDLQRegistry sets the registry the DLQ uses to encode a record that has
+// no envelope bytes, which is the case for records from LocalBus or NATS Core.
+func WithDLQRegistry(reg event.Registry) DLQOption {
+	return func(d *DLQ) { d.registry = reg }
+}
+
+// ErrNoEnvelope is returned by Publish for a record with no envelope bytes
+// when the DLQ has no registry or the record has no event to encode.
+var ErrNoEnvelope = errors.New("jetstream: DLQ record has no envelope bytes and no registry to encode its event")
+
 // natsHeaderPrefix marks broker system headers (Nats-Msg-Id, Nats-Expected-*,
 // ...) that must not follow a message into the DLQ stream.
 const natsHeaderPrefix = "Nats-"
