@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"time"
 )
 
 const DefaultMaxConcurrent = 16
@@ -35,6 +36,14 @@ type LocalBusOptions struct {
 	// Metadata to events emitted from its handlers. Empty by default: no
 	// header crosses a causal hop unless listed here.
 	InheritHeaders []string
+
+	// DLQPublisher is the per-bus dead-letter backstop. A handler failure that
+	// a chain DLQ invoker did not already dead-letter (an error raised outside
+	// it, or no DLQ invoker at all) is published here. Users usually pass the
+	// same publisher they gave invoker.NewDLQ. The record carries Evt and an
+	// empty Raw, so a broker-backed publisher needs a registry to encode the
+	// event. Nil means terminal failures are reported as dropped.
+	DLQPublisher DLQPublisher
 }
 
 func NewLocalBus(opts LocalBusOptions) *LocalBus {
@@ -47,6 +56,7 @@ func NewLocalBus(opts LocalBusOptions) *LocalBus {
 	return &LocalBus{
 		handlers: make(map[string][]*namedHandle),
 		onErr:    opts.OnErr,
+		dlq:      opts.DLQPublisher,
 		invoker:  opts.Invoker,
 		sem:      make(chan struct{}, opts.MaxConcurrent),
 		idGen:    opts.IDGenerator,
@@ -60,6 +70,7 @@ type LocalBus struct {
 	mu       sync.RWMutex
 	handlers map[string][]*namedHandle
 	onErr    func(ctx context.Context, evt Event, err error, handler string)
+	dlq      DLQPublisher
 	invoker  Invoker
 	sem      chan struct{}
 	idGen    func() string
@@ -139,14 +150,20 @@ func (b *LocalBus) dispatch(
 		handler := h
 
 		exec := func() {
-			if err := b.runHandler(ctx, e, handler); err != nil {
-				if b.onErr != nil {
-					b.onErr(ctx, e, err, handler.Name)
-				}
-
-				if withOnErr, ok := e.(OnErr); ok {
-					withOnErr.OnErr(ctx, err, handler.Name)
-				}
+			// LocalBus never redelivers, so every delivery is the final one.
+			hctx := WithDelivery(ctx, Delivery{Count: 1, Max: 1, Subject: subject})
+			hctx = WithExecution(hctx, Execution{Handler: handler.Name, StartedAt: time.Now()})
+			if err := b.runHandler(hctx, e, handler); err != nil {
+				// Settle is the single place that dead-letters and reports; a
+				// local bus has no broker action to take on the Settlement.
+				_ = Settle(hctx, SettleInput{
+					SubscriptionCtx: ctx,
+					Evt:             e,
+					Handler:         handler.Name,
+					Err:             err,
+					Publisher:       b.dlq,
+					OnErr:           b.onErr,
+				})
 			}
 		}
 
