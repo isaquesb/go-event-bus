@@ -1,6 +1,7 @@
 package json_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -257,6 +258,120 @@ func TestVersion0_LegacyEnvelope(t *testing.T) {
 			}
 			if want, _ := time.Parse(time.RFC3339Nano, compatTS); !md.Timestamp.Equal(want) {
 				t.Errorf("Metadata.Timestamp = %s, want %s", md.Timestamp, compatTS)
+			}
+		})
+	}
+}
+
+// v0EventV2 is version 2 of v0.evt: Value plus Extra.
+type v0EventV2 struct {
+	Value string `json:"value"`
+	Extra string `json:"extra"`
+}
+
+func (e *v0EventV2) Name() string { return "v0.evt" }
+func (e *v0EventV2) Version() int { return 2 }
+
+// v0To2Upcaster is declared from version 0 and adds Extra.
+type v0To2Upcaster struct{}
+
+func (u *v0To2Upcaster) EventName() string { return "v0.evt" }
+func (u *v0To2Upcaster) FromVersion() int  { return 0 }
+func (u *v0To2Upcaster) ToVersion() int    { return 2 }
+func (u *v0To2Upcaster) Upcast(_ context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	m["extra"] = "upcast"
+	return json.Marshal(m)
+}
+
+// v0To1Upcaster is declared from version 0 to version 1: a no-op upcaster that
+// errors if it ever runs, so any call is visible.
+type v0To1Upcaster struct{}
+
+func (u *v0To1Upcaster) EventName() string { return "user.created" }
+func (u *v0To1Upcaster) FromVersion() int  { return 0 }
+func (u *v0To1Upcaster) ToVersion() int    { return 1 }
+func (u *v0To1Upcaster) Upcast(context.Context, json.RawMessage) (json.RawMessage, error) {
+	return nil, errors.New("v0To1Upcaster must never run")
+}
+
+// TestVersion0_UpcasterFromVersion0: an upcaster declared from version 0 counts
+// as an upcaster from version 1, for legacy envelopes and for new Version()==0
+// emissions alike (PD-3, D-18).
+func TestVersion0_UpcasterFromVersion0(t *testing.T) {
+	newReg := func() *eventjson.Registry {
+		reg := eventjson.NewRegistry()
+		reg.Register("v0.evt", v0Factory, 0)
+		reg.Register("v0.evt", func() event.Event { return &v0EventV2{} }, 2)
+		reg.RegisterUpcaster(&v0To2Upcaster{})
+		return reg
+	}
+
+	check := func(t *testing.T, reg *eventjson.Registry, data []byte, wantValue string) {
+		t.Helper()
+
+		res := deDecode(t, reg, data)
+		if res.err != nil {
+			t.Fatalf("Decode: %v", res.err)
+		}
+		got, ok := res.evt.(*v0EventV2)
+		if !ok {
+			t.Fatalf("Decode returned %T, want *v0EventV2", res.evt)
+		}
+		if got.Value != wantValue || got.Extra != "upcast" {
+			t.Errorf("got Value %q Extra %q, want %q and %q", got.Value, got.Extra, wantValue, "upcast")
+		}
+	}
+
+	t.Run("legacy_envelope", func(t *testing.T) {
+		check(t, newReg(), v0Legacy("0"), "old")
+	})
+
+	t.Run("new_emission", func(t *testing.T) {
+		reg := newReg()
+		data, err := reg.Encode(t.Context(), &v0Event{Value: "new"})
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		check(t, reg, data, "new")
+	})
+}
+
+// TestVersion0_UpcasterFrom0To1IsIgnored: an upcaster from version 0 that only
+// reaches version 1 is not stored, so it never replaces the real 1 -> 2
+// upcaster and never runs, whatever the registration order (PD-3, T-07-26).
+func TestVersion0_UpcasterFrom0To1IsIgnored(t *testing.T) {
+	for _, before := range []bool{false, true} {
+		name := "registered_after"
+		if before {
+			name = "registered_before"
+		}
+		t.Run(name, func(t *testing.T) {
+			reg := eventjson.NewRegistry()
+			reg.Register("user.created", func() event.Event { return &UserCreatedV1{} }, 1)
+			reg.Register("user.created", func() event.Event { return &UserCreatedV2{} }, 2)
+			if before {
+				reg.RegisterUpcaster(&v0To1Upcaster{})
+			}
+			reg.RegisterUpcaster(&userCreatedV1ToV2Upcaster{})
+			if !before {
+				reg.RegisterUpcaster(&v0To1Upcaster{})
+			}
+
+			data := []byte(fmt.Sprintf(`{"name":"user.created","version":1,"ts":%q,"payload":{"user_id":"u1","name":"N"}}`, compatTS))
+			res := deDecode(t, reg, data)
+			if res.err != nil {
+				t.Fatalf("Decode: %v", res.err)
+			}
+			got, ok := res.evt.(*UserCreatedV2)
+			if !ok {
+				t.Fatalf("Decode returned %T, want *UserCreatedV2", res.evt)
+			}
+			if got.Email != "unknown@example.com" {
+				t.Errorf("Email = %q, want %q", got.Email, "unknown@example.com")
 			}
 		})
 	}
