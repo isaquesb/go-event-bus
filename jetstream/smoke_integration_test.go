@@ -29,7 +29,7 @@ func TestIntegration_Smoke_EmitSubscribeAck(t *testing.T) {
 	reg := newTestRegistry()
 	reg.Register("smoke.created", func() event.Event { return &smokeEvent{} }, 1)
 
-	// Explicit Invoker: NewBus does not default a nil one yet (CORE-05).
+	// The explicit Invoker is kept for clarity although NewBus defaults a nil one (CORE-05).
 	// Explicit delays silence the default-value warnings.
 	bus := NewBus(js, reg, BusOptions{
 		Invoker:          invoker.NewChain(),
