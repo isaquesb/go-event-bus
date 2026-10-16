@@ -231,13 +231,11 @@ func (b *Bus) Subscribe(
 	_, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
 		msgCtx, evt, err := b.reg.Decode(ctx, msg.Data)
 		if err != nil {
-			slog.Error(
-				"failed to decode event",
-				"subject", subject,
-				"err", err,
-			)
+			b.settleDecode(ctx, msg, handlerName, err)
 			return
 		}
+
+		msgCtx = b.handlerCtx(msgCtx, msg, handlerName)
 
 		// Use Invoker if available
 		var handleErr error
@@ -250,13 +248,7 @@ func (b *Bus) Subscribe(
 		}
 
 		if handleErr != nil {
-			if b.onErr != nil {
-				b.onErr(msgCtx, evt, handleErr, handlerName)
-			}
-
-			if withOnErr, ok := evt.(event.OnErr); ok {
-				withOnErr.OnErr(msgCtx, handleErr, handlerName)
-			}
+			b.settle(ctx, msgCtx, evt, handlerName, handleErr)
 		}
 	})
 
@@ -281,11 +273,12 @@ func (b *Bus) SubscribeSync(
 	_, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
 		msgCtx, evt, err := b.reg.Decode(ctx, msg.Data)
 		if err != nil {
+			s, derr := b.settleDecode(ctx, msg, handlerName, err)
+			b.replyError(ctx, msg, settleReason(s, derr), derr)
 			return
 		}
 
-		msgCtx = event.WithDelivery(msgCtx, deliveryOf(msg))
-		msgCtx = event.WithExecution(msgCtx, event.Execution{Handler: handlerName, StartedAt: time.Now()})
+		msgCtx = b.handlerCtx(msgCtx, msg, handlerName)
 
 		// Use Invoker if available
 		var handleErr error
@@ -298,19 +291,8 @@ func (b *Bus) SubscribeSync(
 		}
 
 		if handleErr != nil {
-			s := event.Settle(msgCtx, event.SettleInput{
-				SubscriptionCtx: ctx,
-				Evt:             evt,
-				Handler:         handlerName,
-				Err:             handleErr,
-				Publisher:       b.dlq,
-				OnErr:           b.onErr,
-			})
-			reason := s.Reason
-			if reason == "" {
-				reason = event.ReasonOf(handleErr)
-			}
-			b.replyError(msgCtx, msg, reason, handleErr)
+			s := b.settle(ctx, msgCtx, evt, handlerName, handleErr)
+			b.replyError(msgCtx, msg, settleReason(s, handleErr), handleErr)
 			return
 		}
 
@@ -334,6 +316,45 @@ func (b *Bus) SubscribeSync(
 	})
 
 	return err
+}
+
+// handlerCtx adds the Delivery and Execution of msg to the decoded message
+// context.
+func (b *Bus) handlerCtx(msgCtx context.Context, msg *nats.Msg, handlerName string) context.Context {
+	msgCtx = event.WithDelivery(msgCtx, deliveryOf(msg))
+	return event.WithExecution(msgCtx, event.Execution{Handler: handlerName, StartedAt: time.Now()})
+}
+
+// settle runs the shared post-chain policy for a failed handler: dead-letter
+// through the bus publisher or report, exactly once. ctx is the subscription
+// context, msgCtx the message context.
+func (b *Bus) settle(ctx, msgCtx context.Context, evt event.Event, handlerName string, err error) event.Settlement {
+	return event.Settle(msgCtx, event.SettleInput{
+		SubscriptionCtx: ctx,
+		Evt:             evt,
+		Handler:         handlerName,
+		Err:             err,
+		Publisher:       b.dlq,
+		OnErr:           b.onErr,
+	})
+}
+
+// settleDecode settles a decode failure, which has no event and no handler run.
+// It returns the settlement and the error as classified (always a
+// *event.DecodeError).
+func (b *Bus) settleDecode(ctx context.Context, msg *nats.Msg, handlerName string, err error) (event.Settlement, error) {
+	err = event.WrapDecodeError(err)
+	dctx := event.WithDelivery(ctx, deliveryOf(msg))
+	return b.settle(ctx, dctx, nil, handlerName, err), err
+}
+
+// settleReason is the reason code of a settlement, falling back to the reason of
+// err when Settle left it empty.
+func settleReason(s event.Settlement, err error) string {
+	if s.Reason != "" {
+		return s.Reason
+	}
+	return event.ReasonOf(err)
 }
 
 // deliveryOf describes msg as a delivery. NATS Core never redelivers, so every
