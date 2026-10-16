@@ -88,6 +88,8 @@ type Bus struct {
 	// life is the shutdown state machine. Its zero value is ready to use, so a
 	// struct-literal Bus works. A Bus must not be copied after first use.
 	life event.Lifecycle
+
+	shutdownTimeout time.Duration
 }
 
 // reply sends data and h to the reply subject of msg through the natsConn seam.
@@ -430,3 +432,6 @@ func (b *Bus) Close() error {
 	b.nc.Close()
 	return nil
 }
+
+// Shutdown is a RED-phase stub.
+func (b *Bus) Shutdown(ctx context.Context) error { return nil }
