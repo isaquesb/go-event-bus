@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"time"
@@ -103,6 +104,7 @@ type Bus struct {
 	idGen    func() string
 	inherit  []string
 	dlq      event.DLQPublisher
+	pubRetry PublishRetryPolicy
 
 	circuitOpenDelay time.Duration
 	rateLimitDelay   time.Duration
@@ -139,6 +141,7 @@ func NewBus(
 		)
 	}
 	return &Bus{
+		pubRetry:         opts.PublishRetry.normalized(),
 		js:               js,
 		registry:         registry,
 		onErr:            opts.OnErr,
@@ -196,7 +199,8 @@ func (b *Bus) Emit(
 	msg.Header.Set(jetstream.MsgIDHeader, md.ID)
 	span.SetAttributes(attribute.String("messaging.message.id", md.ID))
 
-	ack, err := b.js.PublishMsg(ctx, msg)
+	ack, attempts, err := b.publish(ctx, msg)
+	span.SetAttributes(attribute.Int("eventbus.publish.attempts", attempts))
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -209,6 +213,103 @@ func (b *Bus) Emit(
 		)
 	}
 	return nil
+}
+
+// Defaults of PublishRetryPolicy.
+const (
+	defaultPublishAttempts       = 3
+	defaultPublishBaseDelay      = 100 * time.Millisecond
+	defaultPublishMaxDelay       = time.Second
+	defaultPublishAttemptTimeout = 2 * time.Second
+)
+
+// normalized replaces each zero field with its default. A negative
+// AttemptTimeout is kept: it disables the per-attempt bound.
+func (p PublishRetryPolicy) normalized() PublishRetryPolicy {
+	if p.MaxAttempts <= 0 {
+		p.MaxAttempts = defaultPublishAttempts
+	}
+	if p.BaseDelay <= 0 {
+		p.BaseDelay = defaultPublishBaseDelay
+	}
+	if p.MaxDelay <= 0 {
+		p.MaxDelay = defaultPublishMaxDelay
+	}
+	if p.AttemptTimeout == 0 {
+		p.AttemptTimeout = defaultPublishAttemptTimeout
+	}
+	return p
+}
+
+// backoff is the wait after the given failed attempt (1-based): BaseDelay
+// doubled per attempt, capped at MaxDelay, with equal jitter (a random value
+// between half the delay and the full delay).
+func (p PublishRetryPolicy) backoff(attempt int) time.Duration {
+	delay := p.MaxDelay
+	if shift := attempt - 1; shift < 32 && p.BaseDelay <= p.MaxDelay>>shift {
+		delay = p.BaseDelay << shift
+	}
+	half := delay / 2
+	return half + time.Duration(rand.Int64N(int64(delay-half)+1))
+}
+
+// retryablePublish reports whether err is a transient publish failure worth
+// another attempt with the same message id: a per-attempt timeout or lost
+// acknowledgement while the caller ctx is still alive, no responders, or no
+// stream response. Server API errors, a closed connection and everything else
+// are permanent.
+func retryablePublish(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, nats.ErrTimeout) ||
+		errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, jetstream.ErrNoStreamResponse)
+}
+
+// publish sends msg, retrying transient failures with the same msg (and so the
+// same Nats-Msg-Id, which the stream deduplicates). It returns the ack, the
+// number of attempts made and the last error. No attempt starts once ctx is
+// done, and the wait before an attempt is skipped when the caller deadline
+// would pass first.
+func (b *Bus) publish(ctx context.Context, msg *nats.Msg) (*jetstream.PubAck, int, error) {
+	policy := b.pubRetry
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				lastErr = err
+			}
+			return nil, attempt - 1, lastErr
+		}
+
+		actx, cancel := ctx, context.CancelFunc(func() {})
+		if policy.AttemptTimeout > 0 {
+			actx, cancel = context.WithTimeout(ctx, policy.AttemptTimeout)
+		}
+		ack, err := b.js.PublishMsg(actx, msg)
+		cancel()
+		if err == nil {
+			return ack, attempt, nil
+		}
+		lastErr = err
+		if attempt >= policy.MaxAttempts || !retryablePublish(ctx, err) {
+			return nil, attempt, err
+		}
+
+		delay := policy.backoff(attempt)
+		if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= delay {
+			return nil, attempt, err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, attempt, err
+		case <-timer.C:
+		}
+	}
 }
 
 // defaultBackOff is used when no BackOff is configured for a consumer.
