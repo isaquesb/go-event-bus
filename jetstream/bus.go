@@ -343,7 +343,19 @@ func (b *Bus) msgHandler(
 
 		msgCtx, evt, err := b.registry.Decode(ctx, msg.Data())
 		if err != nil {
-			_ = msg.Term() // malformed forever
+			// A decode failure has no event and no handler run. Settle
+			// dead-letters the raw bytes (permanent failures) or retries until
+			// the final delivery (ErrUnknownVersion), never a silent Term.
+			err = event.WrapDecodeError(err)
+			s := event.Settle(event.WithDelivery(ctx, d), event.SettleInput{
+				SubscriptionCtx: ctx,
+				Evt:             nil,
+				Handler:         handlerName,
+				Err:             err,
+				Publisher:       b.dlq,
+				OnErr:           b.onErr,
+			})
+			b.apply(msg, handlerName, s, err, d, policy)
 			return
 		}
 
