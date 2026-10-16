@@ -262,32 +262,39 @@ func TestCircuitBreaker_PerHandlerState(t *testing.T) {
 	}
 }
 
-func TestCircuitBreaker_DLQErrorNotCountedAsFailure(t *testing.T) {
-	cb := invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
-		FailureThreshold: 2,
-		SuccessThreshold: 1,
-		OpenTimeout:      time.Second,
-	}, nil)
+func TestCircuitBreaker_TerminalErrorsNotCounted(t *testing.T) {
+	// Terminal errors are neutral: they never open the breaker.
+	for name, terminal := range map[string]error{
+		"PermanentError": invoker.PermanentError{Err: errors.New("bad")},
+		"ErrSendToDLQ":   invoker.ErrSendToDLQ,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cb := invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
+				FailureThreshold: 2,
+				SuccessThreshold: 1,
+				OpenTimeout:      time.Second,
+			}, nil)
 
-	// ErrSendToDLQ should not count as failure
-	for i := 0; i < 5; i++ {
-		_ = cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-			return invoker.ErrSendToDLQ
+			for i := 0; i < 5; i++ {
+				_ = cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
+					return terminal
+				})
+			}
+
+			// Circuit should still be closed
+			called := false
+			err := cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
+				called = true
+				return nil
+			})
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if !called {
+				t.Errorf("handler should be called, %s should not trip the circuit", name)
+			}
 		})
-	}
-
-	// Circuit should still be closed
-	called := false
-	err := cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-		called = true
-		return nil
-	})
-
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if !called {
-		t.Error("handler should be called, ErrSendToDLQ should not trip circuit")
 	}
 }
 
