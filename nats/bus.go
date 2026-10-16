@@ -84,6 +84,10 @@ type Bus struct {
 
 	dlq         event.DLQPublisher
 	replyErrMsg bool
+
+	// life is the shutdown state machine. Its zero value is ready to use, so a
+	// struct-literal Bus works. A Bus must not be copied after first use.
+	life event.Lifecycle
 }
 
 // reply sends data and h to the reply subject of msg through the natsConn seam.
@@ -229,26 +233,33 @@ func (b *Bus) Subscribe(
 	}
 
 	_, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
-		msgCtx, evt, err := b.reg.Decode(ctx, msg.Data)
+		release, ok := b.life.Track()
+		if !ok {
+			b.rejectInbound(ctx, msg, handlerName, false)
+			return
+		}
+		defer release()
+
+		// hctx keeps the Subscribe ctx values and cancellation and is also
+		// cancelled, with cause ErrShutdownInterrupted, when Shutdown gives up.
+		hctx, stop := b.life.HandlerContext(ctx, false)
+		defer stop()
+
+		msgCtx, evt, err := b.reg.Decode(hctx, msg.Data)
 		if err != nil {
-			b.settleDecode(ctx, msg, handlerName, err)
+			b.settleDecode(hctx, msg, handlerName, err)
 			return
 		}
 
 		msgCtx = b.handlerCtx(msgCtx, msg, handlerName)
 
-		// Use Invoker if available
-		var handleErr error
-		if b.invoker != nil {
-			handleErr = b.invoker.Invoke(msgCtx, evt, handlerName, func(ctx context.Context) error {
-				return handler(ctx, evt)
-			})
-		} else {
-			handleErr = handler(msgCtx, evt)
-		}
+		handleErr := event.InvokeHandler(msgCtx, b.invoker, evt, handlerName, func(c context.Context) error {
+			return handler(c, evt)
+		})
+		handleErr = event.WrapInterrupted(hctx, handleErr)
 
 		if handleErr != nil {
-			b.settle(ctx, msgCtx, evt, handlerName, handleErr)
+			b.settle(hctx, msgCtx, evt, handlerName, handleErr)
 		}
 	})
 
@@ -271,27 +282,32 @@ func (b *Bus) SubscribeSync(
 	}
 
 	_, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
-		msgCtx, evt, err := b.reg.Decode(ctx, msg.Data)
+		release, ok := b.life.Track()
+		if !ok {
+			b.rejectInbound(ctx, msg, handlerName, true)
+			return
+		}
+		defer release()
+
+		hctx, stop := b.life.HandlerContext(ctx, false)
+		defer stop()
+
+		msgCtx, evt, err := b.reg.Decode(hctx, msg.Data)
 		if err != nil {
-			s, derr := b.settleDecode(ctx, msg, handlerName, err)
-			b.replyError(ctx, msg, settleReason(s, derr), derr)
+			s, derr := b.settleDecode(hctx, msg, handlerName, err)
+			b.replyError(hctx, msg, settleReason(s, derr), derr)
 			return
 		}
 
 		msgCtx = b.handlerCtx(msgCtx, msg, handlerName)
 
-		// Use Invoker if available
-		var handleErr error
-		if b.invoker != nil {
-			handleErr = b.invoker.Invoke(msgCtx, evt, handlerName, func(ctx context.Context) error {
-				return handler(ctx, evt)
-			})
-		} else {
-			handleErr = handler(msgCtx, evt)
-		}
+		handleErr := event.InvokeHandler(msgCtx, b.invoker, evt, handlerName, func(c context.Context) error {
+			return handler(c, evt)
+		})
+		handleErr = event.WrapInterrupted(hctx, handleErr)
 
 		if handleErr != nil {
-			s := b.settle(ctx, msgCtx, evt, handlerName, handleErr)
+			s := b.settle(hctx, msgCtx, evt, handlerName, handleErr)
 			b.replyError(msgCtx, msg, settleReason(s, handleErr), handleErr)
 			return
 		}
@@ -316,6 +332,30 @@ func (b *Bus) SubscribeSync(
 	})
 
 	return err
+}
+
+// rejectInbound handles a message delivered after the forced cancel, when Track
+// refuses it: the handler does not run. The message is reported once as
+// interrupted (bus OnErr with a nil event) and, for a SubscribeSync request,
+// answered with an Eventbus-Error reply carrying reason interrupted, so nothing
+// is lost silently (D-04, D-07). It is never dead-lettered.
+func (b *Bus) rejectInbound(ctx context.Context, msg *nats.Msg, handlerName string, sync bool) {
+	// Track also refuses once a graceful Wait finished, when the bus context is
+	// not cancelled; a local cancelled context makes Settle see an interruption
+	// in both cases.
+	ictx, cancel := context.WithCancelCause(ctx)
+	cancel(event.ErrShutdownInterrupted)
+
+	s := event.Settle(event.WithDelivery(ictx, deliveryOf(msg)), event.SettleInput{
+		SubscriptionCtx: ictx,
+		Handler:         handlerName,
+		Err:             event.WrapInterrupted(ictx, context.Canceled),
+		Publisher:       b.dlq,
+		OnErr:           b.onErr,
+	})
+	if sync {
+		b.replyError(ictx, msg, s.Reason, event.ErrShutdownInterrupted)
+	}
 }
 
 // handlerCtx adds the Delivery and Execution of msg to the decoded message

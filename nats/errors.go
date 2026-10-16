@@ -90,6 +90,8 @@ var reasonSentinels = map[string]error{
 	event.ReasonDecodeUnknownEvent:    event.ErrUnknownEvent,
 	event.ReasonDecodeMissingUpcaster: event.ErrMissingUpcaster,
 	event.ReasonDuplicate:             event.ErrDuplicate,
+	event.ReasonPanic:                 event.ErrHandlerPanic,
+	event.ReasonInterrupted:           event.ErrShutdownInterrupted,
 }
 
 // errorHeaderValue builds the HeaderError value: the reason alone, or the reason
