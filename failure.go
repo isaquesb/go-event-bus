@@ -43,7 +43,7 @@ var (
 )
 
 // Stable reason vocabulary. These strings are wire values (DLQ headers) and log
-// values, so they never change once released. Phase 9 adds panic.
+// values, so they never change once released.
 const (
 	ReasonTerminal              = "terminal"
 	ReasonRetriesExhausted      = "retries_exhausted"
@@ -58,6 +58,7 @@ const (
 	ReasonDecodeFailed          = "decode_failed"
 	ReasonDuplicate             = "duplicate"
 	ReasonInterrupted           = "interrupted"
+	ReasonPanic                 = "panic"
 )
 
 // terminalError marks a permanent error. It has the same shape as
@@ -186,7 +187,8 @@ func causeText(err error) string {
 }
 
 // ReasonOf returns the stable reason for err, one of the Reason constants, or
-// "" for nil. Precedence: the Reason carried by DeadLetteredError,
+// "" for nil. Precedence: panic (an error matching ErrHandlerPanic, even when
+// wrapped); the Reason carried by DeadLetteredError,
 // DeadLetterFailedError or FailureError; duplicate; terminal (ErrSendToDLQ or
 // an error with Terminal() true); unknown_version; circuit_open; rate_limited;
 // in_progress; the decode reasons; retries_exhausted; and delivery_exhausted
@@ -194,6 +196,9 @@ func causeText(err error) string {
 func ReasonOf(err error) string {
 	if err == nil {
 		return ""
+	}
+	if errors.Is(err, ErrHandlerPanic) {
+		return ReasonPanic
 	}
 	var dl *DeadLetteredError
 	if errors.As(err, &dl) && dl.Reason != "" {

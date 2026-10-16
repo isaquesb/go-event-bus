@@ -46,6 +46,7 @@ func (d Disposition) String() string {
 //
 //	nil, ErrDuplicate, ErrDeadLettered            Ack
 //	ErrDeadLetterFailed                           RetryDelayed
+//	ErrHandlerPanic                               Terminal
 //	ErrSendToDLQ or a Terminal() true error       Terminal
 //	ErrUnknownVersion, ErrCircuitOpen,
 //	ErrRateLimited, ErrInProgress                 RetryDelayed, Terminal when final
@@ -65,6 +66,8 @@ func Dispose(err error, d Delivery) Disposition {
 		return DispositionAck
 	case errors.Is(err, ErrDeadLetterFailed):
 		return DispositionRetryDelayed
+	case errors.Is(err, ErrHandlerPanic):
+		return DispositionTerminal
 	case isTerminal(err):
 		return DispositionTerminal
 	case errors.Is(err, ErrUnknownVersion),

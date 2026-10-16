@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strconv"
 	"strings"
@@ -199,6 +200,7 @@ const (
 	HeaderDLQOriginalStream   = "Eventbus-Dlq-Original-Stream"
 	HeaderDLQOriginalSequence = "Eventbus-Dlq-Original-Sequence"
 	HeaderDLQPublishedAt      = "Eventbus-Dlq-Published-At"
+	HeaderDLQPanicStack       = "Eventbus-Dlq-Panic-Stack"
 )
 
 // DLQHeaderValueLimit is the maximum byte length of one DLQ failure header.
@@ -245,8 +247,9 @@ func runeBoundary(s string, n int) int {
 // Every value goes through TruncateHeader at DLQHeaderValueLimit; the envelope
 // itself is never truncated. Headers whose value is unknown (empty text, zero
 // time, zero sequence) are omitted. Attempts is always present: 0 means the
-// handler never ran. HeaderDLQOriginalMsgID is not set here, a broker adapter
-// adds it from the stripped broker message id.
+// handler never ran. HeaderDLQPanicStack is set only when the cause holds a
+// *PanicError, bounded like every other value. HeaderDLQOriginalMsgID is not
+// set here, a broker adapter adds it from the stripped broker message id.
 func (r DLQRecord) FailureHeaders() map[string]string {
 	h := make(map[string]string, 13)
 	set := func(key, value string) {
@@ -278,5 +281,9 @@ func (r DLQRecord) FailureHeaders() map[string]string {
 		set(HeaderDLQOriginalSequence, strconv.FormatUint(r.Delivery.StreamSeq, 10))
 	}
 	setTime(HeaderDLQPublishedAt, r.Delivery.PublishedAt)
+	var pe *PanicError
+	if errors.As(r.Cause, &pe) && len(pe.Stack) > 0 {
+		set(HeaderDLQPanicStack, string(pe.Stack))
+	}
 	return h
 }
