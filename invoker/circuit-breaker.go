@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/isaquesb/go-event-bus"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -24,16 +25,93 @@ const (
 	stateHalfOpen
 )
 
+// String returns closed, open or half_open.
+func (s circuitState) String() string {
+	switch s {
+	case stateClosed:
+		return "closed"
+	case stateOpen:
+		return "open"
+	case stateHalfOpen:
+		return "half_open"
+	}
+	return "unknown"
+}
+
+// Transition reasons. They are the Phase 10 vocabulary for state changes.
+const (
+	reasonFailureThreshold   = "failure_threshold"
+	reasonOpenTimeoutElapsed = "open_timeout_elapsed"
+	reasonProbeSucceeded     = "probe_succeeded"
+	reasonProbeFailed        = "probe_failed"
+)
+
 // ErrCircuitOpen is the root sentinel event.ErrCircuitOpen, kept here for
 // source compatibility.
 var ErrCircuitOpen = event.ErrCircuitOpen
+
+// token is what admit hands to record. gen is the breaker generation at
+// admission: every state transition (and every probe lease supersede)
+// increments the breaker generation, so a completion carrying an older gen is
+// stale and is ignored. probe marks the single half-open probe.
+type token struct {
+	gen   uint64
+	probe bool
+}
+
+// outcome is how a finished call counts toward the breaker.
+type outcome int
+
+const (
+	outcomeSuccess outcome = iota
+	outcomeFailure
+	// outcomeNeutral neither opens, closes nor resets anything. In half-open
+	// it releases the probe slot.
+	outcomeNeutral
+)
+
+// transition describes one state change. It is built under the breaker lock
+// and consumed after the lock is released.
+type transition struct {
+	from, to circuitState
+	reason   string
+	failures int
+	at       time.Time
+	seq      uint64
+}
 
 type handlerBreaker struct {
 	state     circuitState
 	failures  int
 	successes int
 	openedAt  time.Time
-	mu        sync.Mutex
+
+	// gen is incremented on every state transition and on a probe lease
+	// supersede; seq only on state transitions.
+	gen uint64
+	seq uint64
+	// probing is true while the single half-open probe is in flight; probeAt
+	// is when it was admitted (the lease start).
+	probing bool
+	probeAt time.Time
+
+	mu sync.Mutex
+}
+
+// move changes the state and describes the change. The caller holds b.mu.
+func (b *handlerBreaker) move(to circuitState, reason string, now time.Time) *transition {
+	tr := &transition{
+		from:     b.state,
+		to:       to,
+		reason:   reason,
+		failures: b.failures,
+		at:       now,
+	}
+	b.state = to
+	b.gen++
+	b.seq++
+	tr.seq = b.seq
+	return tr
 }
 
 type CircuitBreakerConfig struct {
@@ -70,78 +148,161 @@ func (c *CircuitBreaker) Invoke(
 ) error {
 	b := c.breaker(handler)
 
+	tok, tr, ok := c.admit(b)
+	c.emitTransition(ctx, handler, tr)
+	if !ok {
+		c.metrics.IncCounter(
+			"eventbus_circuit_blocked_total",
+			1,
+			Labels{"handler": handler},
+		)
+		return ErrCircuitOpen
+	}
+
+	// If next panics or exits through runtime.Goexit, release the probe slot
+	// with a neutral outcome; the panic keeps propagating.
+	done := false
+	defer func() {
+		if !done {
+			c.emitTransition(ctx, handler, c.record(b, tok, outcomeNeutral))
+		}
+	}()
+
+	err := next(ctx)
+	done = true
+
+	c.emitTransition(ctx, handler, c.record(b, tok, c.classify(ctx, err)))
+	return err
+}
+
+// admit decides under the breaker lock whether a call may run. The lock is
+// never held while next runs.
+func (c *CircuitBreaker) admit(b *handlerBreaker) (token, *transition, bool) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := time.Now()
 	switch b.state {
 	case stateOpen:
-		if time.Since(b.openedAt) < c.cfg.OpenTimeout {
-			c.metrics.IncCounter(
-				"eventbus_circuit_blocked_total",
-				1,
-				Labels{"handler": handler},
-			)
-			b.mu.Unlock()
-			return ErrCircuitOpen
+		if now.Sub(b.openedAt) < c.cfg.OpenTimeout {
+			return token{}, nil, false
 		}
-		b.state = stateHalfOpen
 		b.successes = 0
+		tr := b.move(stateHalfOpen, reasonOpenTimeoutElapsed, now)
+		b.probing = true
+		b.probeAt = now
+		return token{gen: b.gen, probe: true}, tr, true
 
+	case stateHalfOpen:
+		if b.probing {
+			// Lease (D-28): a probe that outlived OpenTimeout is superseded.
+			// A zero OpenTimeout never expires the lease.
+			if c.cfg.OpenTimeout > 0 && now.Sub(b.probeAt) >= c.cfg.OpenTimeout {
+				b.gen++
+				b.probeAt = now
+				return token{gen: b.gen, probe: true}, nil, true
+			}
+			return token{}, nil, false
+		}
+		b.probing = true
+		b.probeAt = now
+		return token{gen: b.gen, probe: true}, nil, true
+	}
+
+	return token{gen: b.gen}, nil, true
+}
+
+// record applies the outcome of a finished call under the breaker lock. A
+// completion from an older generation is ignored and never touches the probe
+// slot.
+func (c *CircuitBreaker) record(b *handlerBreaker, tok token, out outcome) *transition {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if tok.gen != b.gen {
+		return nil
+	}
+
+	now := time.Now()
+	switch b.state {
+	case stateClosed:
+		switch out {
+		case outcomeFailure:
+			b.failures++
+			if b.failures >= c.cfg.FailureThreshold {
+				b.openedAt = now
+				return b.move(stateOpen, reasonFailureThreshold, now)
+			}
+		case outcomeSuccess:
+			b.failures = 0
+		}
+
+	case stateHalfOpen:
+		if !tok.probe {
+			return nil
+		}
+		b.probing = false
+		switch out {
+		case outcomeFailure:
+			b.openedAt = now
+			return b.move(stateOpen, reasonProbeFailed, now)
+		case outcomeSuccess:
+			b.successes++
+			if b.successes >= c.cfg.SuccessThreshold {
+				b.failures = 0
+				b.successes = 0
+				return b.move(stateClosed, reasonProbeSucceeded, now)
+			}
+		}
+	}
+
+	return nil
+}
+
+// classify decides how the result of next counts toward the breaker.
+func (c *CircuitBreaker) classify(_ context.Context, err error) outcome {
+	if err == nil {
+		return outcomeSuccess
+	}
+	// Interim rule: the legacy DLQ exception stays until the D-12 table
+	// replaces this function.
+	if errors.Is(err, ErrSendToDLQ) {
+		return outcomeNeutral
+	}
+	return outcomeFailure
+}
+
+// emitTransition reports a state change after the lock was released. It does
+// nothing for nil.
+func (c *CircuitBreaker) emitTransition(ctx context.Context, handler string, tr *transition) {
+	if tr == nil {
+		return
+	}
+
+	switch tr.to {
+	case stateHalfOpen:
 		c.metrics.IncCounter(
 			"eventbus_circuit_half_open_total",
 			1,
 			Labels{"handler": handler},
 		)
-		c.emitState(handler, b.state)
-
-	case stateHalfOpen, stateClosed:
+	case stateOpen:
+		c.metrics.IncCounter(
+			"eventbus_circuit_open_total",
+			1,
+			Labels{"handler": handler},
+		)
 	}
-	b.mu.Unlock()
+	c.emitState(handler, tr.to)
 
-	err := next(ctx)
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	switch b.state {
-	case stateClosed:
-		if err != nil {
-			if !errors.Is(err, ErrSendToDLQ) { // não conta como falha
-				b.failures++
-			}
-			if b.failures >= c.cfg.FailureThreshold {
-				b.state = stateOpen
-				b.openedAt = time.Now()
-
-				c.metrics.IncCounter(
-					"eventbus_circuit_open_total",
-					1,
-					Labels{"handler": handler},
-				)
-			}
-		} else {
-			b.failures = 0
-		}
-
-	case stateHalfOpen:
-		if err != nil {
-			b.state = stateOpen
-			b.openedAt = time.Now()
-
-			c.metrics.IncCounter(
-				"eventbus_circuit_open_total",
-				1,
-				Labels{"handler": handler},
-			)
-		} else {
-			b.successes++
-			if b.successes >= c.cfg.SuccessThreshold {
-				b.state = stateClosed
-				b.failures = 0
-			}
-		}
-	}
-
-	c.emitState(handler, b.state)
-	return err
+	slog.DebugContext(ctx, "eventbus: circuit breaker transition",
+		"handler", handler,
+		"from", tr.from.String(),
+		"to", tr.to.String(),
+		"reason", tr.reason,
+		"failures", tr.failures,
+		"seq", tr.seq,
+	)
 }
 
 func (c *CircuitBreaker) emitState(handler string, state circuitState) {
@@ -163,11 +324,7 @@ func (c *CircuitBreaker) breaker(handler string) *handlerBreaker {
 	b := &handlerBreaker{state: stateClosed}
 	c.breakers[handler] = b
 
-	c.metrics.SetGauge(
-		"eventbus_circuit_state",
-		float64(stateClosed),
-		Labels{"handler": handler},
-	)
+	c.emitState(handler, stateClosed)
 
 	return b
 }
