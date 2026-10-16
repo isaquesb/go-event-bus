@@ -174,3 +174,35 @@ func cloneRecord(r DLQRecord) DLQRecord {
 	}
 	return r
 }
+
+// Wire names of the headers a DLQ publisher writes. They are wire format once
+// released, so they never change.
+const (
+	HeaderDLQPrefix           = "Eventbus-Dlq-"
+	HeaderDLQCause            = "Eventbus-Dlq-Cause"
+	HeaderDLQReason           = "Eventbus-Dlq-Reason"
+	HeaderDLQAttempts         = "Eventbus-Dlq-Attempts"
+	HeaderDLQDeliveryCount    = "Eventbus-Dlq-Delivery-Count"
+	HeaderDLQHandler          = "Eventbus-Dlq-Handler"
+	HeaderDLQOriginalSubject  = "Eventbus-Dlq-Original-Subject"
+	HeaderDLQFailedAt         = "Eventbus-Dlq-Failed-At"
+	HeaderDLQFirstAttemptAt   = "Eventbus-Dlq-First-Attempt-At"
+	HeaderDLQEventID          = "Eventbus-Dlq-Event-Id"
+	HeaderDLQEventName        = "Eventbus-Dlq-Event-Name"
+	HeaderDLQOriginalMsgID    = "Eventbus-Dlq-Original-Msg-Id"
+	HeaderDLQOriginalStream   = "Eventbus-Dlq-Original-Stream"
+	HeaderDLQOriginalSequence = "Eventbus-Dlq-Original-Sequence"
+	HeaderDLQPublishedAt      = "Eventbus-Dlq-Published-At"
+)
+
+// DLQHeaderValueLimit is the maximum byte length of one DLQ failure header.
+const DLQHeaderValueLimit = 1024
+
+// TruncationMarker ends a header value that TruncateHeader shortened.
+const TruncationMarker = "…[truncated]"
+
+// TruncateHeader is a stub filled in by the next commit.
+func TruncateHeader(s string, max int) string { return s }
+
+// FailureHeaders is a stub filled in by the next commit.
+func (r DLQRecord) FailureHeaders() map[string]string { return nil }
