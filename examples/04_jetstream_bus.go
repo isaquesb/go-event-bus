@@ -189,18 +189,18 @@ func ExampleJetStreamReplay() {
 	// Create replayer
 	replayer := jetstream.NewReplayer(js)
 
-	// Replay failed events from DLQ to original topic
-	err = replayer.Replay(ctx, jetstream.ReplayOptions{
+	// Replay failed events from the DLQ back to their original subjects.
+	// ToSubject is an optional override that sends every record to one subject.
+	res, err := replayer.Replay(ctx, jetstream.ReplayOptions{
 		FromStream: "CHAT_EVENTS_DLQ", // Source: DLQ stream
-		ToSubject:  "chat.message",    // Destination: retry processing
 		Limit:      100,               // Replay up to 100 events
 	})
 	if err != nil {
-		slog.Error("replay failed", "error", err)
+		slog.Error("replay failed", "error", err, "replayed", res.Replayed, "failed", res.Failed)
 		return
 	}
 
-	slog.Info("replay completed")
+	slog.Info("replay completed", "replayed", res.Replayed, "failed", res.Failed)
 }
 
 // =============================================================================
@@ -222,17 +222,28 @@ func ExampleJetStreamDLQ() {
 		MaxAge:   30 * 24 * time.Hour, // Keep 30 days for investigation
 	})
 
-	// Create DLQ publisher
-	dlq := jetstream.NewDQL(js, nil, "")
+	// Create DLQ publisher. The empty prefix means the default "dlq.", which
+	// matches the "dlq.>" stream above.
+	dlq := jetstream.NewDLQ(js, nil, "")
 
-	// In your invoker chain, use:
+	// In your invoker chain, DLQ sits outside Retry so it dead-letters the
+	// final outcome once:
 	chain := invoker.NewChain(
+		invoker.NewDLQ(dlq, nil), // Final failures go to DLQ
 		invoker.NewRetry(
 			invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Second, MaxDelay: 30 * time.Second},
 			nil,
 		),
-		invoker.NewDLQ(dlq, nil), // Terminal errors go to DLQ
 	)
 
-	_ = chain // Use in your bus
+	// Pass opts to jetstream.NewBus. The same publisher is the bus backstop for
+	// undecodable messages and flow-control failures the chain did not dead-letter.
+	opts := jetstream.BusOptions{
+		Invoker:          chain,
+		DLQPublisher:     dlq,
+		CircuitOpenDelay: 30 * time.Second,
+		RateLimitDelay:   5 * time.Second,
+	}
+
+	_ = opts // Use in jetstream.NewBus
 }
