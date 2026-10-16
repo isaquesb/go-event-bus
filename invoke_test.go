@@ -3,6 +3,8 @@ package event_test
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -118,5 +120,167 @@ func TestInvokeHandler_RecoversInvokerPanic(t *testing.T) {
 	}
 	if called {
 		t.Error("fn was called although the invoker panicked before next")
+	}
+}
+
+// ihPermanent is a permanent error: Terminal() reports true, like the invoker
+// module's PermanentError, which root tests cannot import.
+type ihPermanent struct{}
+
+func (ihPermanent) Error() string  { return "ih permanent" }
+func (ihPermanent) Terminal() bool { return true }
+
+// ihRecordingInvoker calls next and stores the error it returned.
+type ihRecordingInvoker struct {
+	mu  sync.Mutex
+	got error
+}
+
+func (r *ihRecordingInvoker) Invoke(ctx context.Context, _ event.Event, _ string, next func(context.Context) error) error {
+	err := next(ctx)
+	r.mu.Lock()
+	r.got = err
+	r.mu.Unlock()
+	return err
+}
+
+func (r *ihRecordingInvoker) seen() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.got
+}
+
+func TestInvokeHandler_PanicValueNeverUnwrapped(t *testing.T) {
+	values := []struct {
+		name string
+		v    any
+	}{
+		{"context canceled", context.Canceled},
+		{"duplicate", event.ErrDuplicate},
+		{"circuit open", event.ErrCircuitOpen},
+		{"dead lettered", event.ErrDeadLettered},
+		{"failure error", &event.FailureError{Cause: errors.New("x"), Reason: event.ReasonRetriesExhausted}},
+		{"permanent", ihPermanent{}},
+		{"string", "s"},
+		{"int", 42},
+	}
+	for _, tc := range values {
+		t.Run(tc.name, func(t *testing.T) {
+			err := event.InvokeHandler(context.Background(), nil, &ihEvent{}, "h", func(context.Context) error {
+				panic(tc.v)
+			})
+			if !errors.Is(err, event.ErrHandlerPanic) {
+				t.Fatalf("err = %v, want it to match ErrHandlerPanic", err)
+			}
+			if verr, ok := tc.v.(error); ok && errors.Is(err, verr) {
+				t.Errorf("err matches the panicked value %v with errors.Is", verr)
+			}
+			if d := event.Dispose(err, event.Delivery{Count: 1, Max: 3}); d != event.DispositionTerminal {
+				t.Errorf("Dispose = %v, want terminal", d)
+			}
+			if r := event.ReasonOf(err); r != event.ReasonPanic {
+				t.Errorf("ReasonOf = %q, want panic", r)
+			}
+		})
+	}
+}
+
+func TestInvokeHandler_PanicNil(t *testing.T) {
+	err := event.InvokeHandler(context.Background(), nil, &ihEvent{}, "h", func(context.Context) error {
+		panic(nil)
+	})
+	if err == nil || !errors.Is(err, event.ErrHandlerPanic) {
+		t.Fatalf("err = %v, want a non-nil error matching ErrHandlerPanic", err)
+	}
+	var pe *event.PanicError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v, want a *PanicError", err)
+	}
+	if v, ok := pe.Value.(*runtime.PanicNilError); !ok || v == nil {
+		t.Errorf("Value = %T, want *runtime.PanicNilError", pe.Value)
+	}
+}
+
+func TestInvokeHandler_ChainSeesPanicAsError(t *testing.T) {
+	rec := &ihRecordingInvoker{}
+	err := event.InvokeHandler(context.Background(), rec, &ihEvent{}, "h", func(context.Context) error {
+		panic("boom")
+	})
+	var pe *event.PanicError
+	if !errors.As(rec.seen(), &pe) {
+		t.Fatalf("invoker saw %v, want a *PanicError", rec.seen())
+	}
+	if !errors.Is(err, event.ErrHandlerPanic) {
+		t.Errorf("returned err = %v, want it to match ErrHandlerPanic", err)
+	}
+}
+
+func TestInvokeHandler_NilInvokerPassthrough(t *testing.T) {
+	type ctxKey struct{}
+	ctx := context.WithValue(context.Background(), ctxKey{}, "marker")
+	want := errors.New("handler failed")
+	var got context.Context
+	err := event.InvokeHandler(ctx, nil, &ihEvent{}, "h", func(c context.Context) error {
+		got = c
+		return want
+	})
+	if err != want {
+		t.Errorf("err = %v, want the handler error unchanged", err)
+	}
+	if got == nil || got.Value(ctxKey{}) != "marker" {
+		t.Errorf("fn did not receive the caller ctx value")
+	}
+}
+
+func TestInvokeHandler_LogsFullStack(t *testing.T) {
+	logs := fsCaptureLogs(t)
+	const name = "ih-log-handler"
+	_ = event.InvokeHandler(context.Background(), nil, &ihEvent{}, name, func(context.Context) error {
+		panic("logged")
+	})
+	recs := logs.forHandler(name)
+	if len(recs) != 1 {
+		t.Fatalf("log records = %d, want 1", len(recs))
+	}
+	if recs[0].level != slog.LevelError {
+		t.Errorf("level = %v, want error", recs[0].level)
+	}
+	if recs[0].attrs["stack"] == "" {
+		t.Error("stack attribute is empty")
+	}
+	if recs[0].attrs["panic"] != "logged" {
+		t.Errorf("panic attribute = %q, want logged", recs[0].attrs["panic"])
+	}
+}
+
+func TestPanicError_ErrorNilSafe(t *testing.T) {
+	var nilPE *event.PanicError
+	if nilPE.Error() == "" {
+		t.Error("nil receiver Error() is empty")
+	}
+	if (&event.PanicError{}).Error() == "" {
+		t.Error("zero PanicError Error() is empty")
+	}
+}
+
+func TestReasonOf_PanicWrapped(t *testing.T) {
+	pe := &event.PanicError{Value: "x"}
+	if r := event.ReasonOf(&event.FailureError{Cause: pe, Reason: event.ReasonTerminal}); r != event.ReasonPanic {
+		t.Errorf("FailureError: ReasonOf = %q, want panic", r)
+	}
+	final := event.Delivery{Count: 3, Max: 3}
+	dl := &event.DeadLetteredError{Cause: pe, Reason: event.ReasonPanic}
+	if r := event.ReasonOf(dl); r != event.ReasonPanic {
+		t.Errorf("DeadLetteredError: ReasonOf = %q, want panic", r)
+	}
+	if d := event.Dispose(dl, final); d != event.DispositionAck {
+		t.Errorf("Dispose(dead-lettered panic) = %v, want ack", d)
+	}
+	failed := &event.DeadLetterFailedError{Cause: pe, Reason: event.ReasonPanic, PublishErr: errors.New("down")}
+	if r := event.ReasonOf(failed); r != event.ReasonPanic {
+		t.Errorf("DeadLetterFailedError: ReasonOf = %q, want panic", r)
+	}
+	if d := event.Dispose(failed, final); d != event.DispositionRetryDelayed {
+		t.Errorf("Dispose(dead-letter failed panic) = %v, want retry_delayed", d)
 	}
 }

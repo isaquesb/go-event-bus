@@ -223,3 +223,35 @@ func TestMemoryDLQ_Concurrent(t *testing.T) {
 		t.Errorf("zero value MemoryDLQ not usable: err %v, len %d", err, zero.Len())
 	}
 }
+
+func TestFailureHeaders_PanicStack(t *testing.T) {
+	stack := []byte(strings.Repeat("goroutine 1 [running]:\n\tmain.f()\n", 200))
+	if len(stack) < 5000 {
+		t.Fatalf("test stack is %d bytes, want at least 5000", len(stack))
+	}
+	rec := event.DLQRecord{
+		Cause: &event.FailureError{
+			Cause:  &event.PanicError{Value: "x", Stack: stack},
+			Reason: event.ReasonTerminal,
+		},
+		Reason: event.ReasonPanic,
+	}
+	got, ok := rec.FailureHeaders()[event.HeaderDLQPanicStack]
+	if !ok {
+		t.Fatal("Eventbus-Dlq-Panic-Stack header missing")
+	}
+	if len(got) > 1024 {
+		t.Errorf("header is %d bytes, want at most 1024", len(got))
+	}
+	if strings.ContainsAny(got, "\r\n") {
+		t.Error("header holds CR or LF")
+	}
+	if !strings.HasSuffix(got, event.TruncationMarker) {
+		t.Errorf("header does not end with the truncation marker: %q", got[len(got)-20:])
+	}
+
+	plain := event.DLQRecord{Cause: errors.New("plain"), Reason: event.ReasonTerminal}
+	if _, ok := plain.FailureHeaders()[event.HeaderDLQPanicStack]; ok {
+		t.Error("a non-panic cause produced an Eventbus-Dlq-Panic-Stack header")
+	}
+}
