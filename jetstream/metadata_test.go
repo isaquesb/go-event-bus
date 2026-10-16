@@ -362,23 +362,37 @@ func TestJetStreamBus_OnErrReceivesMessageContext(t *testing.T) {
 	}
 }
 
-func TestJetStreamBus_DecodeFailureTerms(t *testing.T) {
-	var onErrCalled, fnCalled bool
+func TestJetStreamBus_DecodeFailureDroppedWithoutDLQ(t *testing.T) {
+	var (
+		onErrCalls int
+		onErrEvt   event.Event = &mdEvent{}
+		fnCalled   bool
+	)
 	bus := newMdBus(&mdJS{}, newMdRegistry("order.created"), BusOptions{
-		OnErr: func(context.Context, event.Event, error, string) { onErrCalled = true },
+		OnErr: func(_ context.Context, evt event.Event, _ error, _ string) {
+			onErrCalls++
+			onErrEvt = evt
+		},
 	})
 
-	msg := &mdMsg{data: []byte("not json")}
+	msg := &mdMsg{data: []byte("not json"), numDelivered: 1}
 	bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
 		fnCalled = true
 		return nil
-	}, deliveryPolicy{})(msg)
+	}, deliveryPolicy{maxDeliver: 3})(msg)
 
-	if acks, naks, terms := msg.counts(); terms != 1 || acks != 0 || naks != 0 {
-		t.Errorf("acks=%d naks=%d terms=%d, want 0/0/1", acks, naks, terms)
+	got := msg.snapshot()
+	if want := []string{"dropped: decode_failed"}; !slices.Equal(got.termReasons, want) {
+		t.Errorf("termReasons = %q, want %q", got.termReasons, want)
 	}
-	if onErrCalled || fnCalled {
-		t.Errorf("onErr called=%v, handler called=%v; want neither", onErrCalled, fnCalled)
+	if got.acks != 0 || got.naks != 0 || got.plainTerms != 0 || len(got.nakDelays) != 0 {
+		t.Errorf("snapshot = %+v, want only a TermWithReason", got)
+	}
+	if onErrCalls != 1 || onErrEvt != nil {
+		t.Errorf("OnErr calls=%d evt=%v, want one call with a nil event (the silent Term is gone)", onErrCalls, onErrEvt)
+	}
+	if fnCalled {
+		t.Error("handler was called for an undecodable message")
 	}
 }
 

@@ -404,3 +404,153 @@ func TestJetStreamBus_HandlerTimeoutIsTransient(t *testing.T) {
 	msg := dispRun(t, context.Background(), bus, js, 2, policy, context.DeadlineExceeded)
 	dispWantDelay(t, msg, 20*time.Millisecond)
 }
+
+// --- decode failures ---
+
+// dispDecodeRegistry is an event.Registry whose Decode always fails with err.
+type dispDecodeRegistry struct{ err *event.DecodeError }
+
+func (dispDecodeRegistry) Register(string, event.Factory, int) {}
+func (dispDecodeRegistry) Encode(context.Context, event.Event) ([]byte, error) {
+	return []byte("{}"), nil
+}
+func (r dispDecodeRegistry) Decode(ctx context.Context, _ []byte) (context.Context, event.Event, error) {
+	return ctx, nil, r.err
+}
+
+// dispDecodeRun feeds the bytes "raw-bytes" to a bus whose registry fails with
+// cause, and reports whether the handler ran and what OnErr saw.
+type dispDecodeResult struct {
+	msg        *mdMsg
+	handlerRan bool
+	onErrCalls int64
+	onErrEvt   atomic.Value // holds *event.Event
+}
+
+func dispDecodeRun(t *testing.T, cause error, pub event.DLQPublisher, delivered uint64, policy deliveryPolicy) *dispDecodeResult {
+	t.Helper()
+	res := &dispDecodeResult{msg: &mdMsg{data: []byte("raw-bytes"), numDelivered: delivered, subject: "s.decode"}}
+	bus := newMdBus(&mdJS{}, dispDecodeRegistry{err: &event.DecodeError{Err: cause}}, BusOptions{
+		DLQPublisher: pub,
+		OnErr: func(_ context.Context, evt event.Event, _ error, _ string) {
+			atomic.AddInt64(&res.onErrCalls, 1)
+			res.onErrEvt.Store(&evt)
+		},
+	})
+	bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
+		res.handlerRan = true
+		return nil
+	}, policy)(res.msg)
+	if got := res.msg.snapshot(); got.plainTerms != 0 {
+		t.Fatalf("plain Term called %d times, the bus must only use TermWithReason", got.plainTerms)
+	}
+	return res
+}
+
+func (r *dispDecodeResult) onErrEvent() event.Event {
+	if p, ok := r.onErrEvt.Load().(*event.Event); ok {
+		return *p
+	}
+	return nil
+}
+
+func TestJetStreamBus_DecodeFailureDeadLetteredBeforeTerm(t *testing.T) {
+	for _, tc := range []struct {
+		cause  error
+		reason string
+	}{
+		{event.ErrMalformedEnvelope, event.ReasonDecodeMalformed},
+		{event.ErrUnknownEvent, event.ReasonDecodeUnknownEvent},
+		{event.ErrMissingUpcaster, event.ReasonDecodeMissingUpcaster},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			dlq := event.NewMemoryDLQ()
+			res := dispDecodeRun(t, tc.cause, dlq, 1, deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]})
+
+			recs := dlq.Records()
+			if len(recs) != 1 {
+				t.Fatalf("DLQ records = %d, want 1", len(recs))
+			}
+			if string(recs[0].Raw) != "raw-bytes" || recs[0].Evt != nil || recs[0].Reason != tc.reason {
+				t.Errorf("record = {Raw:%q Evt:%v Reason:%q}, want raw bytes, nil event, reason %s",
+					recs[0].Raw, recs[0].Evt, recs[0].Reason, tc.reason)
+			}
+			got := res.msg.snapshot()
+			if want := "dead_lettered: " + tc.reason; len(got.termReasons) != 1 || got.termReasons[0] != want {
+				t.Errorf("termReasons = %q, want [%s]", got.termReasons, want)
+			}
+			if got.acks != 0 || got.naks != 0 || len(got.nakDelays) != 0 {
+				t.Errorf("snapshot = %+v, want only a TermWithReason", got)
+			}
+			if n := atomic.LoadInt64(&res.onErrCalls); n != 1 || res.onErrEvent() != nil {
+				t.Errorf("OnErr calls=%d evt=%v, want one call with a nil event", n, res.onErrEvent())
+			}
+			if res.handlerRan {
+				t.Error("handler ran for an undecodable message")
+			}
+		})
+	}
+}
+
+func TestJetStreamBus_UnknownVersionWaitsForFinal(t *testing.T) {
+	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
+
+	t.Run("not final", func(t *testing.T) {
+		dlq := event.NewMemoryDLQ()
+		res := dispDecodeRun(t, event.ErrUnknownVersion, dlq, 1, policy)
+		dispWantDelay(t, res.msg, 10*time.Millisecond)
+		if dlq.Len() != 0 || atomic.LoadInt64(&res.onErrCalls) != 0 {
+			t.Errorf("records=%d OnErr=%d, want 0 and 0 while a redelivery follows", dlq.Len(), atomic.LoadInt64(&res.onErrCalls))
+		}
+	})
+
+	t.Run("final", func(t *testing.T) {
+		dlq := event.NewMemoryDLQ()
+		res := dispDecodeRun(t, event.ErrUnknownVersion, dlq, 3, policy)
+		recs := dlq.Records()
+		if len(recs) != 1 || recs[0].Reason != event.ReasonUnknownVersion {
+			t.Fatalf("records = %+v, want one with reason unknown_version", recs)
+		}
+		got := res.msg.snapshot()
+		if len(got.termReasons) != 1 || got.termReasons[0] != "dead_lettered: unknown_version" {
+			t.Errorf("termReasons = %q, want [dead_lettered: unknown_version]", got.termReasons)
+		}
+		if got.naks != 0 || len(got.nakDelays) != 0 {
+			t.Errorf("snapshot = %+v, want only a TermWithReason", got)
+		}
+	})
+}
+
+func TestJetStreamBus_DecodePublishFailureNeverTerms(t *testing.T) {
+	pub := &dispFailingPublisher{}
+	res := dispDecodeRun(t, event.ErrMalformedEnvelope, pub, 1, deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]})
+	dispWantDelay(t, res.msg, 10*time.Millisecond)
+	if n := pub.calls.Load(); n != 1 {
+		t.Errorf("Publish calls = %d, want 1", n)
+	}
+}
+
+func TestJetStreamBus_MetadataErrorTreatedAsFirstDelivery(t *testing.T) {
+	var (
+		got  event.Delivery
+		ok   bool
+		seen int
+	)
+	bus, js := dispBus(BusOptions{})
+	msg := &mdMsg{data: dispEmit(t, bus, js, dispEventName), metaErr: errors.New("no metadata"), subject: "s.meta"}
+	bus.msgHandler(context.Background(), "h", func(ctx context.Context, _ event.Event) error {
+		got, ok = event.DeliveryFromContext(ctx)
+		seen++
+		return nil
+	}, deliveryPolicy{maxDeliver: 3})(msg)
+
+	if seen != 1 || !ok {
+		t.Fatalf("handler runs=%d delivery ok=%v, want 1 and true", seen, ok)
+	}
+	if got.Count != 1 || got.Max != 3 || got.Subject != "s.meta" {
+		t.Errorf("Delivery = %+v, want Count 1, Max 3, Subject s.meta", got)
+	}
+	if snap := msg.snapshot(); snap.acks != 1 {
+		t.Errorf("snapshot = %+v, want a single Ack", snap)
+	}
+}
