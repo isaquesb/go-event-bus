@@ -96,11 +96,24 @@ func (r *Registry) Register(
 	}
 }
 
+// RegisterUpcaster stores u keyed by its event name and FromVersion. Version 0
+// and version 1 are the same version (D-18), so an upcaster whose FromVersion is
+// <= 0 is keyed as from version 1, and one that only reaches version 1 or lower
+// is not stored, because it has nothing to do and would otherwise replace the
+// real 1 -> 2 upcaster.
 func (r *Registry) RegisterUpcaster(u event.Upcaster) {
+	from := u.FromVersion()
+	if from <= 0 {
+		if u.ToVersion() <= 1 {
+			return
+		}
+		from = 1
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	key := eventKey{u.EventName(), u.FromVersion()}
+	key := eventKey{u.EventName(), from}
 	r.upcasters[key] = u
 }
 
