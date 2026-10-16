@@ -4,114 +4,231 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/isaquesb/go-event-bus"
 	"github.com/isaquesb/go-event-bus/invoker"
 )
 
-func TestDLQ_SuccessNoPublish(t *testing.T) {
-	publisher := &mockDLQPublisher{}
-	dlq := invoker.NewDLQ(publisher, nil)
+// dqPublisher records every event.DLQRecord it receives. When err is set it
+// fails every publish.
+type dqPublisher struct {
+	mu   sync.Mutex
+	recs []event.DLQRecord
+	err  error
+}
 
-	err := dlq.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-		return nil
+func (p *dqPublisher) Publish(_ context.Context, rec event.DLQRecord) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recs = append(p.recs, rec)
+	return p.err
+}
+
+func (p *dqPublisher) records() []event.DLQRecord {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]event.DLQRecord(nil), p.recs...)
+}
+
+func dqInvoke(ctx context.Context, p invoker.DLQPublisher, m invoker.MetricProvider, err error) error {
+	return invoker.NewDLQ(p, m).Invoke(ctx, &testEvent{name: "test.event"}, "handler", func(context.Context) error {
+		return err
 	})
+}
 
-	if err != nil {
+func dqDelivery(count, max int) context.Context {
+	return event.WithDelivery(context.Background(), event.Delivery{Count: count, Max: max})
+}
+
+func dqTerminal(cause error) error {
+	return &event.FailureError{Cause: invoker.PermanentError{Err: cause}, Reason: event.ReasonTerminal, Attempts: 1}
+}
+
+func TestDLQ_SuccessNoPublish(t *testing.T) {
+	pub := &dqPublisher{}
+
+	if err := dqInvoke(context.Background(), pub, nil, nil); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if publisher.published {
-		t.Error("DLQ should not publish on success")
+	if n := len(pub.records()); n != 0 {
+		t.Errorf("DLQ must not publish on success, got %d records", n)
 	}
 }
 
-func TestDLQ_NonDLQErrorPassesThrough(t *testing.T) {
-	publisher := &mockDLQPublisher{}
-	dlq := invoker.NewDLQ(publisher, nil)
+func TestDLQ_TerminalPublishesOnAnyDelivery(t *testing.T) {
+	pub := &dqPublisher{}
+	cause := errors.New("bad input")
 
-	handlerErr := errors.New("handler failed")
+	err := dqInvoke(dqDelivery(1, 3), pub, nil, dqTerminal(cause))
 
-	err := dlq.Invoke(context.Background(), &testEvent{name: "test.event"}, "handler", func(ctx context.Context) error {
-		return handlerErr
-	})
-
-	// Non-DLQ errors should pass through without publishing
-	if !errors.Is(err, handlerErr) {
-		t.Errorf("expected handler error to pass through, got '%v'", err)
+	if !errors.Is(err, event.ErrDeadLettered) {
+		t.Errorf("expected ErrDeadLettered, got %v", err)
 	}
-	if publisher.published {
-		t.Error("DLQ should NOT publish for non-DLQ errors")
+	if !errors.Is(err, cause) {
+		t.Errorf("expected the cause to be preserved, got %v", err)
 	}
-}
-
-func TestDLQ_ErrSendToDLQPublishes(t *testing.T) {
-	publisher := &mockDLQPublisher{}
-	dlq := invoker.NewDLQ(publisher, nil)
-
-	testEvt := &testEvent{name: "test.event"}
-	dlqErr := fmt.Errorf("terminal failure: %w", invoker.ErrSendToDLQ)
-
-	err := dlq.Invoke(context.Background(), testEvt, "handler", func(ctx context.Context) error {
-		return dlqErr
-	})
-
-	// Error should be swallowed after successful DLQ publish
-	if err != nil {
-		t.Errorf("expected nil error after DLQ publish, got '%v'", err)
+	recs := pub.records()
+	if len(recs) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(recs))
 	}
-	if !publisher.published {
-		t.Error("DLQ should publish on ErrSendToDLQ")
-	}
-	if publisher.evt != testEvt {
-		t.Error("DLQ should receive the event")
+	if recs[0].Reason != event.ReasonTerminal {
+		t.Errorf("expected reason terminal, got %q", recs[0].Reason)
 	}
 }
 
-func TestDLQ_PublishErrorReturned(t *testing.T) {
+func TestDLQ_TransientNotFinalPassesThrough(t *testing.T) {
+	pub := &dqPublisher{}
+	transient := errors.New("transient")
+
+	err := dqInvoke(dqDelivery(1, 3), pub, nil, transient)
+
+	if err != transient {
+		t.Errorf("expected the same error back, got %v", err)
+	}
+	if n := len(pub.records()); n != 0 {
+		t.Errorf("expected no publish before the final delivery, got %d", n)
+	}
+}
+
+func TestDLQ_TransientFinalPublishes(t *testing.T) {
+	pub := &dqPublisher{}
+	transient := errors.New("transient")
+
+	err := dqInvoke(dqDelivery(3, 3), pub, nil, transient)
+
+	if !errors.Is(err, event.ErrDeadLettered) || !errors.Is(err, transient) {
+		t.Errorf("expected ErrDeadLettered wrapping the cause, got %v", err)
+	}
+	recs := pub.records()
+	if len(recs) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(recs))
+	}
+	if recs[0].Reason != event.ReasonDeliveryExhausted {
+		t.Errorf("expected reason delivery_exhausted, got %q", recs[0].Reason)
+	}
+}
+
+func TestDLQ_NoDeliveryIsFinal(t *testing.T) {
+	pub := &dqPublisher{}
+
+	err := dqInvoke(context.Background(), pub, nil, errors.New("boom"))
+
+	if !errors.Is(err, event.ErrDeadLettered) {
+		t.Errorf("expected ErrDeadLettered, got %v", err)
+	}
+	if n := len(pub.records()); n != 1 {
+		t.Errorf("expected 1 record without a Delivery in ctx, got %d", n)
+	}
+}
+
+func TestDLQ_PublishErrorTyped(t *testing.T) {
 	publishErr := errors.New("publish failed")
-	publisher := &mockDLQPublisher{err: publishErr}
+	pub := &dqPublisher{err: publishErr}
 	metrics := &testMetricProvider{}
-	dlq := invoker.NewDLQ(publisher, metrics)
 
-	err := dlq.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-		return fmt.Errorf("terminal: %w", invoker.ErrSendToDLQ)
-	})
+	err := dqInvoke(dqDelivery(1, 3), pub, metrics, dqTerminal(errors.New("bad")))
 
-	if !errors.Is(err, publishErr) {
-		t.Errorf("expected publish error, got '%v'", err)
+	if !errors.Is(err, event.ErrDeadLetterFailed) {
+		t.Errorf("expected ErrDeadLetterFailed, got %v", err)
 	}
-
+	if errors.Is(err, event.ErrDeadLettered) {
+		t.Errorf("a failed publish must not match ErrDeadLettered: %v", err)
+	}
+	if !errors.Is(err, publishErr) {
+		t.Errorf("expected the publish error to be preserved, got %v", err)
+	}
 	if metrics.counters["eventbus_dlq_publish_error_total"] != 1 {
-		t.Error("expected DLQ error metric to be tracked")
+		t.Error("expected the DLQ publish error metric to be tracked")
 	}
 }
 
 func TestDLQ_MetricsOnSuccess(t *testing.T) {
-	publisher := &mockDLQPublisher{}
+	pub := &dqPublisher{}
 	metrics := &testMetricProvider{}
-	dlq := invoker.NewDLQ(publisher, metrics)
 
-	_ = dlq.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-		return fmt.Errorf("terminal: %w", invoker.ErrSendToDLQ)
-	})
+	_ = dqInvoke(context.Background(), pub, metrics, fmt.Errorf("terminal: %w", invoker.ErrSendToDLQ))
 
 	if metrics.counters["eventbus_dlq_published_total"] != 1 {
 		t.Errorf("expected 1 dlq_published_total, got %d", metrics.counters["eventbus_dlq_published_total"])
 	}
 }
 
-// mockDLQPublisher implements invoker.DLQPublisher for testing
-type mockDLQPublisher struct {
-	published bool
-	evt       event.Event
-	cause     error
-	err       error
+func TestDLQ_InterruptedNotPublished(t *testing.T) {
+	pub := &dqPublisher{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := dqInvoke(ctx, pub, nil, context.Canceled)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+	if n := len(pub.records()); n != 0 {
+		t.Errorf("a subscription cancellation must not be published, got %d", n)
+	}
 }
 
-func (m *mockDLQPublisher) Publish(ctx context.Context, evt event.Event, cause error) error {
-	m.published = true
-	m.evt = evt
-	m.cause = cause
-	return m.err
+func TestDLQ_NilPublisherPassesThrough(t *testing.T) {
+	boom := dqTerminal(errors.New("bad"))
+
+	err := dqInvoke(context.Background(), nil, nil, boom)
+
+	if err != boom {
+		t.Errorf("expected the error unchanged with a nil publisher, got %v", err)
+	}
+}
+
+func TestDLQ_AlreadyDeadLetteredNotRepublished(t *testing.T) {
+	pub := &dqPublisher{}
+	already := &event.DeadLetteredError{Cause: errors.New("bad"), Reason: event.ReasonTerminal}
+
+	err := dqInvoke(dqDelivery(3, 3), pub, nil, already)
+
+	if err != error(already) {
+		t.Errorf("expected the error unchanged, got %v", err)
+	}
+	if n := len(pub.records()); n != 0 {
+		t.Errorf("an already dead-lettered error must not be republished, got %d", n)
+	}
+}
+
+func TestDLQ_RecordFields(t *testing.T) {
+	pub := &dqPublisher{}
+	raw := []byte(`{"id":"e1"}`)
+	ctx := event.WithDelivery(context.Background(), event.Delivery{
+		Count: 2, Max: 5, Subject: "orders.created", Raw: raw,
+	})
+	ctx = event.WithExecution(ctx, event.Execution{Handler: "ctx-handler"})
+	ctx = event.WithMetadata(ctx, event.Metadata{ID: "e1", Name: "test.event"})
+
+	cause := errors.New("bad input")
+	_ = dqInvoke(ctx, pub, nil, &event.FailureError{
+		Cause: invoker.PermanentError{Err: cause}, Reason: event.ReasonTerminal, Attempts: 4,
+	})
+
+	recs := pub.records()
+	if len(recs) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(recs))
+	}
+	rec := recs[0]
+	if string(rec.Raw) != string(raw) {
+		t.Errorf("Raw = %q, want %q", rec.Raw, raw)
+	}
+	if rec.Subject != "orders.created" {
+		t.Errorf("Subject = %q", rec.Subject)
+	}
+	if rec.Handler != "handler" {
+		t.Errorf("Handler = %q, want the chain handler name", rec.Handler)
+	}
+	if rec.EventID != "e1" {
+		t.Errorf("EventID = %q", rec.EventID)
+	}
+	if rec.Attempts != 4 {
+		t.Errorf("Attempts = %d, want 4 from the FailureError", rec.Attempts)
+	}
+	if rec.Delivery.Count != 2 || rec.Delivery.Max != 5 {
+		t.Errorf("Delivery = %+v", rec.Delivery)
+	}
 }

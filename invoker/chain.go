@@ -5,42 +5,50 @@ import (
 	"github.com/isaquesb/go-event-bus"
 )
 
-/**
-// Example Usage
-invoker := NewChain(
-	// Observabilidade
-	telemetry.NewTracerInvoker(tracer),
-	NewMetrics(metrics),
+/*
+Example usage, in the documented order:
 
-	// Controle de execução
-	NewRateLimiter(limitConfig),
-	NewIdempotency(store, cfg),
+	chain := invoker.NewChain(
+		// Observability
+		telemetry.NewTracerInvoker(tracer),
+		invoker.NewMetrics(metrics),
 
-	// Resiliência
-	NewRetry(RetryPolicy{
-		MaxAttempts: 5,
-		BaseDelay:   100 * time.Millisecond,
-		MaxDelay:    5 * time.Second,
-	}, metrics),
+		// Execution control
+		invoker.NewRateLimiter(limitConfig),
+		invoker.NewIdempotency(store, cfg, metrics),
 
-	NewCircuitBreaker(CircuitBreakerConfig{
-		FailureThreshold: 5,
-		SuccessThreshold: 2,
-		OpenTimeout:      30 * time.Second,
-	}, metrics),
+		// Failure handling: DLQ outside Retry
+		invoker.NewDLQ(dlqPublisher, metrics),
 
-	// Terminal
-	NewDLQ(dlqPublisher),
-)
+		// Resilience
+		invoker.NewRetry(invoker.RetryPolicy{
+			MaxAttempts: 5,
+			BaseDelay:   100 * time.Millisecond,
+			MaxDelay:    5 * time.Second,
+		}, metrics),
 
-Tracer
- └─ Metrics
-     └─ RateLimiter (pode abortar cedo)
-         └─ Idempotency (pode pular execução)
-             └─ Retry (reexecuta handler)
-                 └─ CircuitBreaker (decide se o sistema está saudável)
-                     └─ DLQ (último recurso)
-                         └─ Handler
+		invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			OpenTimeout:      30 * time.Second,
+		}, metrics),
+	)
+
+	Tracer
+	 └─ Metrics
+	     └─ RateLimiter (may abort early)
+	         └─ Idempotency (may skip execution)
+	             └─ DLQ (dead-letters the final outcome)
+	                 └─ Retry (re-runs the handler)
+	                     └─ CircuitBreaker (is the system healthy?)
+	                         └─ Handler
+
+DLQ sits outside Retry so retries run first and only the final outcome is
+dead-lettered. Put inside Retry, it would dead-letter a recoverable transient
+error on its first failure.
+
+Flow-control errors from RateLimit and Idempotency never pass through DLQ, so
+the transport dead-letters them on the final delivery with its own publisher.
 */
 
 type Chain struct {

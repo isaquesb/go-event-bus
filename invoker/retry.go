@@ -39,6 +39,11 @@ func (e RetryableError) Retryable() bool {
 	return true
 }
 
+// FailureError is the root type event.FailureError: the failure of a handler
+// after the retry policy finished, with the cause, a stable reason and the
+// number of attempts.
+type FailureError = event.FailureError
+
 type RetryPolicy struct {
 	MaxAttempts int
 	BaseDelay   time.Duration
@@ -59,6 +64,12 @@ func classify(err error) (retry bool, terminal bool) {
 	}
 
 	if errors.Is(err, ErrCircuitOpen) {
+		return false, false
+	}
+
+	// A dead-lettered result is final and is never retried.
+	if errors.Is(err, event.ErrDeadLettered) ||
+		errors.Is(err, event.ErrDeadLetterFailed) {
 		return false, false
 	}
 
@@ -140,7 +151,7 @@ func (r *Retry) Invoke(
 				1,
 				Labels{"handler": handler},
 			)
-			return ErrSendToDLQ
+			return &event.FailureError{Cause: err, Reason: event.ReasonTerminal, Attempts: attempt}
 		}
 
 		if !retry {
@@ -174,7 +185,11 @@ func (r *Retry) Invoke(
 		Labels{"handler": handler},
 	)
 
-	return lastErr
+	return &event.FailureError{
+		Cause:    lastErr,
+		Reason:   event.ReasonRetriesExhausted,
+		Attempts: r.policy.MaxAttempts,
+	}
 }
 
 /*
