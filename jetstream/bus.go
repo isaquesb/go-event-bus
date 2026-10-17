@@ -123,6 +123,12 @@ type Bus struct {
 
 	mu        sync.Mutex
 	consumers []jetstream.ConsumeContext
+	// drained is nil until the first Shutdown, which owns the consumer drain and
+	// closes it when the drain step ends. draining is the consumers that drain
+	// owns, the ones force stops.
+	drained  chan struct{}
+	draining []jetstream.ConsumeContext
+	stopOnce sync.Once
 }
 
 func NewBus(
@@ -466,33 +472,76 @@ func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber)
 // emitting with its own ctx while its message is in flight. Every consumer is
 // drained: messages already buffered are handed back to the server with Nak
 // instead of running (D-27), and Shutdown waits for each consumer to report
-// Closed and for the in-flight handlers to return. When ctx expires first, the
-// consumers are stopped, the running handlers are cancelled with cause
+// Closed and for the in-flight handlers to return.
+//
+// Concurrent and repeated calls share one drain. The first caller owns it; a
+// later caller waits for it, bounded by its own ctx, and never reports a
+// completed drain while a consumer has not reported Closed. A caller whose ctx
+// expires first stops the consumers, interrupts the running handlers with cause
 // event.ErrShutdownInterrupted (their messages are Naked, never dead-lettered)
-// and Shutdown returns ctx.Err(). It is safe to call more than once.
+// and returns ctx.Err(); the other callers then stop waiting. Otherwise each
+// caller returns nil once no handler is in flight.
 func (b *Bus) Shutdown(ctx context.Context) error {
 	b.life.BeginShutdown()
 
 	b.mu.Lock()
-	consumers := b.consumers
+	if drained := b.drained; drained != nil {
+		b.mu.Unlock()
+		select {
+		case <-drained:
+		case <-ctx.Done():
+			b.force()
+			return ctx.Err()
+		}
+		return b.life.Wait(ctx)
+	}
+	drained := make(chan struct{})
+	b.drained = drained
+	b.draining = b.consumers
 	b.consumers = nil
+	consumers := b.draining
 	b.mu.Unlock()
 
+	if err := b.drain(ctx, consumers, drained); err != nil {
+		return err
+	}
+	return b.life.Wait(ctx)
+}
+
+// drain is the owner's drain step: it drains every consumer and waits for each
+// to report Closed, then closes drained. It stops waiting when a concurrent
+// caller forced the shutdown, and forces it itself, returning ctx.Err(), when
+// ctx expires first.
+func (b *Bus) drain(ctx context.Context, consumers []jetstream.ConsumeContext, drained chan struct{}) error {
+	defer close(drained)
 	for _, cc := range consumers {
 		cc.Drain()
 	}
 	for _, cc := range consumers {
 		select {
 		case <-cc.Closed():
+		case <-b.life.Context().Done():
+			return nil
 		case <-ctx.Done():
-			for _, c := range consumers {
-				c.Stop()
-			}
-			b.life.Interrupt()
+			b.force()
 			return ctx.Err()
 		}
 	}
-	return b.life.Wait(ctx)
+	return nil
+}
+
+// force stops the drained consumers, once however many callers reach their
+// deadline, and interrupts the handlers.
+func (b *Bus) force() {
+	b.stopOnce.Do(func() {
+		b.mu.Lock()
+		consumers := b.draining
+		b.mu.Unlock()
+		for _, cc := range consumers {
+			cc.Stop()
+		}
+	})
+	b.life.Interrupt()
 }
 
 // Close shuts the bus down with Shutdown, bounded by BusOptions.ShutdownTimeout

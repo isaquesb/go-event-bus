@@ -782,3 +782,91 @@ func TestJetStreamBus_HandBackOnErrPanicNakedOnce(t *testing.T) {
 		}
 	})
 }
+
+// --- concurrent Shutdown (WR-02) ---
+
+func TestJetStreamBus_ConcurrentShutdownWaitsForDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		bus, cons, _, _ := rbShutdownBus(t, BusOptions{}, noopHandler)
+		defer cons.cc.finish()
+
+		first := rbShutdown(bus, context.Background())
+		synctest.Wait()
+		second := rbShutdown(bus, context.Background())
+		synctest.Wait()
+
+		for i, res := range []<-chan error{first, second} {
+			select {
+			case err := <-res:
+				t.Fatalf("Shutdown #%d returned %v while a consumer was still draining", i+1, err)
+			default:
+			}
+		}
+		if drains, _ := cons.cc.counts(); drains != 1 {
+			t.Errorf("Drain calls = %d, want 1", drains)
+		}
+
+		cons.cc.finish()
+		for i, res := range []<-chan error{first, second} {
+			if err := <-res; err != nil {
+				t.Errorf("Shutdown #%d = %v, want nil", i+1, err)
+			}
+		}
+		if err := bus.Shutdown(context.Background()); err != nil {
+			t.Errorf("third Shutdown = %v, want nil", err)
+		}
+		if drains, stops := cons.cc.counts(); drains != 1 || stops != 0 {
+			t.Errorf("Drain/Stop calls = %d/%d, want 1/0", drains, stops)
+		}
+	})
+}
+
+func TestJetStreamBus_ConcurrentShutdownPeerDeadlineForces(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cause := make(chan error, 1)
+		started := make(chan struct{}, 1)
+		bus, cons, _, payload := rbShutdownBus(t, BusOptions{}, func(ctx context.Context, _ event.Event) error {
+			started <- struct{}{}
+			<-ctx.Done()
+			cause <- context.Cause(ctx)
+			return ctx.Err()
+		})
+		defer cons.cc.finish()
+
+		msg := &mdMsg{data: payload, numDelivered: 1}
+		done := rbDeliver(cons, msg)
+		synctest.Wait()
+		<-started
+
+		first := rbShutdown(bus, context.Background())
+		synctest.Wait()
+
+		sctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		start := time.Now()
+		err := bus.Shutdown(sctx)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("second Shutdown = %v, want DeadlineExceeded", err)
+		}
+		if elapsed := time.Since(start); elapsed != time.Second {
+			t.Errorf("second Shutdown took %v of fake time, want exactly 1s", elapsed)
+		}
+
+		<-done
+		if got := <-cause; !errors.Is(got, event.ErrShutdownInterrupted) {
+			t.Errorf("handler cause = %v, want ErrShutdownInterrupted", got)
+		}
+		if err := <-first; err != nil {
+			t.Errorf("first Shutdown = %v, want nil once no handler is in flight", err)
+		}
+		if got := msg.snapshot(); got.naks != 1 || got.acks != 0 || got.plainTerms != 0 || len(got.termReasons) != 0 || len(got.nakDelays) != 0 {
+			t.Errorf("snapshot = %+v, want a single plain Nak", got)
+		}
+		if err := bus.Shutdown(context.Background()); err != nil {
+			t.Errorf("later Shutdown = %v, want nil", err)
+		}
+		if drains, stops := cons.cc.counts(); drains != 1 || stops != 1 {
+			t.Errorf("Drain/Stop calls = %d/%d, want 1/1", drains, stops)
+		}
+	})
+}
