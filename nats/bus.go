@@ -342,15 +342,22 @@ func (b *Bus) SubscribeSync(
 
 	sub, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
 		var replied bool
-		defer b.recoverCallback(ctx, msg, handlerName, &replied)
 
+		// Track first, then the deferred release, then the deferred recover: on
+		// unwinding the recover runs first, while the request is still counted in
+		// flight, so its panic reply goes out before a Shutdown in progress can see
+		// it idle and close the connection. Track only takes the lifecycle mutex and
+		// never panics, and the recover also guards the refused branch.
 		release, ok := b.life.Track()
+		if ok {
+			defer release()
+		}
+		defer b.recoverCallback(ctx, msg, handlerName, &replied)
 		if !ok {
 			b.rejectInbound(ctx, msg, handlerName, true)
 			replied = true
 			return
 		}
-		defer release()
 
 		hctx, stop := b.life.HandlerContext(ctx, false)
 		defer stop()

@@ -866,3 +866,113 @@ func TestNatsBus_ConcurrentShutdownPeerDeadlineForces(t *testing.T) {
 		}
 	})
 }
+
+// --- recover before release (G-09-2) ---
+
+// wrGatedReplyConn holds the first reply published to rbInbox until gate opens.
+// entered is closed when that reply arrives; closesAtReply records how many times
+// the connection had been closed at that moment.
+type wrGatedReplyConn struct {
+	*rbConn
+	entered       chan struct{}
+	once          sync.Once
+	gate          *rbGate
+	closesAtReply atomic.Int32
+}
+
+func newWrGatedReplyConn() *wrGatedReplyConn {
+	return &wrGatedReplyConn{rbConn: newRbConn(), entered: make(chan struct{}), gate: newRbGate()}
+}
+
+func (c *wrGatedReplyConn) PublishMsg(m *natsgo.Msg) error {
+	if m.Subject == rbInbox {
+		c.once.Do(func() { close(c.entered) })
+		<-c.gate.ch
+		c.closesAtReply.Store(int32(c.rbConn.closeCount()))
+	}
+	return c.rbConn.PublishMsg(m)
+}
+
+func TestNatsSync_PanicReplyBeforeShutdownCloses(t *testing.T) {
+	logs := wrInstallLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		conn := newWrGatedReplyConn()
+		defer conn.gate.open()
+		reg := newMdRegistry("rb.order")
+		handlerGate := newRbGate()
+		defer handlerGate.open()
+		entered := make(chan struct{})
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+
+		err := bus.SubscribeSync(context.Background(), "rb.order", func(context.Context, event.Event) error {
+			close(entered)
+			<-handlerGate.ch
+			return errors.New("wr: failed")
+		}, event.WithHandlerName("h"))
+		if err != nil {
+			t.Fatalf("SubscribeSync: %v", err)
+		}
+
+		cbDone := rbDeliver(t, conn.rbConn, "rb.order", &natsgo.Msg{Subject: "rb.order", Data: rbPayload(t, reg, "wr-g1"), Reply: rbInbox})
+		<-entered
+
+		shutDone := make(chan error, 1)
+		go func() { shutDone <- bus.Shutdown(context.Background()) }()
+		synctest.Wait()
+		select {
+		case err := <-shutDone:
+			t.Fatalf("Shutdown returned %v while a handler was in flight", err)
+		default:
+		}
+		if n := conn.closeCount(); n != 0 {
+			t.Fatalf("conn closed %d times during the drain, want 0", n)
+		}
+
+		// The handler fails; the OnErr panic outside the handler is recovered and
+		// its panic reply blocks on the gate.
+		handlerGate.open()
+		<-conn.entered
+		synctest.Wait()
+		select {
+		case err := <-shutDone:
+			t.Fatalf("Shutdown returned %v before the panic reply went out", err)
+		default:
+		}
+		if n := conn.closeCount(); n != 0 {
+			t.Fatalf("conn closed %d times before the panic reply went out, want 0", n)
+		}
+
+		conn.gate.open()
+		if err := <-shutDone; err != nil {
+			t.Errorf("Shutdown = %v, want nil", err)
+		}
+		rbWait(t, cbDone)
+
+		if n := conn.closesAtReply.Load(); n != 0 {
+			t.Errorf("conn had been closed %d times when the reply went out, want 0", n)
+		}
+		if n := conn.closeCount(); n != 1 {
+			t.Errorf("conn closed %d times, want 1", n)
+		}
+		conn.mu.Lock()
+		var inbox []*natsgo.Msg
+		for _, m := range conn.replies {
+			if m.Subject == rbInbox {
+				inbox = append(inbox, m)
+			}
+		}
+		conn.mu.Unlock()
+		if len(inbox) != 1 {
+			t.Fatalf("messages published to %s = %d, want 1", rbInbox, len(inbox))
+		}
+		if v := inbox[0].Header.Get(HeaderError); v != event.ReasonPanic {
+			t.Errorf("reply %s = %q, want %q", HeaderError, v, event.ReasonPanic)
+		}
+		if len(inbox[0].Data) != 0 {
+			t.Errorf("reply data = %q, want empty", inbox[0].Data)
+		}
+		if !logs.errorWithPanic("wr: onerr boom") {
+			t.Error("no Error record with panic \"wr: onerr boom\"")
+		}
+	})
+}
