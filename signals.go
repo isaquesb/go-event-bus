@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -340,18 +341,53 @@ func redactDelivery(d Delivery) Delivery {
 	return d
 }
 
-// RED stubs: behavior arrives in the GREEN commit.
-
 // AttemptErrLimit is the byte budget of Attempt.Err.
 const AttemptErrLimit = 256
 
-// FailingInvokerOf names the failing part of the pipeline for err.
-func FailingInvokerOf(err error) FailingInvoker { return "" }
+// FailingInvokerOf names the part of the pipeline that produced err:
+// circuit_breaker for ErrCircuitOpen (also when dead-lettered), dlq for a
+// DeadLetteredError or DeadLetterFailedError over any other cause, retry for a
+// FailureError, and transport for everything else, nil included.
+func FailingInvokerOf(err error) FailingInvoker {
+	var dl *DeadLetteredError
+	var df *DeadLetterFailedError
+	var fe *FailureError
+	switch {
+	case errors.Is(err, ErrCircuitOpen):
+		return InvokerCircuitBreaker
+	case errors.As(err, &dl), errors.As(err, &df):
+		return InvokerDLQ
+	case errors.As(err, &fe):
+		return InvokerRetry
+	}
+	return InvokerTransport
+}
 
-// AttemptClassOf classifies the error of one attempt.
-func AttemptClassOf(ctx context.Context, err error) AttemptClass { return "" }
+// AttemptClassOf classifies the error of one attempt: panic for ErrHandlerPanic
+// (checked first), timeout for ErrHandlerTimeout, context.DeadlineExceeded, or
+// context.Canceled on a context whose cause is ErrHandlerTimeout, terminal for
+// ErrSendToDLQ or an error with Terminal() true, and transient otherwise.
+func AttemptClassOf(ctx context.Context, err error) AttemptClass {
+	switch {
+	case errors.Is(err, ErrHandlerPanic):
+		return AttemptPanic
+	case errors.Is(err, ErrHandlerTimeout), errors.Is(err, context.DeadlineExceeded):
+		return AttemptTimeout
+	case errors.Is(err, context.Canceled) && ctx != nil && errors.Is(context.Cause(ctx), ErrHandlerTimeout):
+		return AttemptTimeout
+	case isTerminal(err):
+		return AttemptTerminal
+	}
+	return AttemptTransient
+}
 
-// NewAttempt builds an Attempt.
+// NewAttempt builds an Attempt. The error text is cut to AttemptErrLimit bytes
+// on a rune boundary by TruncateHeader, so the truncation marker counts toward
+// the budget; a nil err gives an empty Err.
 func NewAttempt(n int, err error, class AttemptClass, started time.Time, duration, delay time.Duration) Attempt {
-	return Attempt{N: n}
+	a := Attempt{N: n, Class: class, Started: started, Duration: duration, Delay: delay}
+	if err != nil {
+		a.Err = TruncateHeader(err.Error(), AttemptErrLimit)
+	}
+	return a
 }
