@@ -35,23 +35,23 @@ func (e *fsEvent) calls() []error {
 	return append([]error(nil), e.errs...)
 }
 
-// fsBusErr records every bus OnErr callback.
-type fsBusErr struct {
-	mu   sync.Mutex
-	errs []error
-	evts []event.Event
+// fsObs is the recording Observer of the Settle tests: an obsRecorder whose
+// observer() also writes every log-worthy signal through slog.Default() without
+// deduplication, so the tests that capture log records see each one.
+type fsObs struct{ obsRecorder }
+
+// ctx returns parent carrying the fanned-out observer.
+func (o *fsObs) ctx(parent context.Context) context.Context {
+	return event.WithObserver(parent, event.MultiObserver(o, event.NewSlogObserver(nil, event.WithLogEvery(0))))
 }
 
-func (b *fsBusErr) fn(_ context.Context, evt event.Event, err error, _ string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.errs = append(b.errs, err)
-	b.evts = append(b.evts, evt)
-}
-func (b *fsBusErr) calls() []error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return append([]error(nil), b.errs...)
+// causes returns the Cause of every recorded Failure.
+func (o *fsObs) causes() []error {
+	var out []error
+	for _, f := range o.Failures() {
+		out = append(out, f.Cause)
+	}
+	return out
 }
 
 func fsMessageCtx(d event.Delivery) context.Context {
@@ -61,22 +61,21 @@ func fsMessageCtx(d event.Delivery) context.Context {
 }
 
 // Tracer: Delivery in ctx -> Dispose -> NewDLQRecord -> PublishDeadLetter ->
-// MemoryDLQ -> DeadLetteredError -> OnErr, end to end.
+// MemoryDLQ -> DeadLetteredError -> Observer.Failure and OnErr, end to end.
 func TestSettle_TerminalDeadLetteredOnce(t *testing.T) {
 	raw := []byte(`{"id":"evt-1","name":"orders.created","version":1}`)
 	ctx := fsMessageCtx(event.Delivery{Count: 1, Max: 1, Subject: "orders.created", Raw: raw})
 	cause := fsPermanent{msg: "bad order"}
 	evt := &fsEvent{}
-	bus := &fsBusErr{}
+	obs := &fsObs{}
 	dlq := event.NewMemoryDLQ()
 
-	got := event.Settle(ctx, event.SettleInput{
+	got := event.Settle(obs.ctx(ctx), event.SettleInput{
 		SubscriptionCtx: context.Background(),
 		Evt:             evt,
 		Handler:         "h",
 		Err:             &event.FailureError{Cause: cause, Reason: event.ReasonTerminal, Attempts: 2},
 		Publisher:       dlq,
-		OnErr:           bus.fn,
 	})
 
 	if got.Disposition != event.DispositionTerminal {
@@ -101,7 +100,7 @@ func TestSettle_TerminalDeadLetteredOnce(t *testing.T) {
 		t.Errorf("record = id %q handler %q subject %q attempts %d", rec.EventID, rec.Handler, rec.Subject, rec.Attempts)
 	}
 
-	for name, calls := range map[string][]error{"bus OnErr": bus.calls(), "event OnErr": evt.calls()} {
+	for name, calls := range map[string][]error{"observer Failure": obs.causes(), "event OnErr": evt.calls()} {
 		if len(calls) != 1 {
 			t.Fatalf("%s called %d times, want 1", name, len(calls))
 		}
@@ -113,16 +112,15 @@ func TestSettle_TerminalDeadLetteredOnce(t *testing.T) {
 
 func TestSettle_ChainDeadLetteredIsAcked(t *testing.T) {
 	ctx := fsMessageCtx(event.Delivery{Count: 1, Max: 1, Subject: "orders.created"})
-	bus := &fsBusErr{}
+	obs := &fsObs{}
 	dlq := event.NewMemoryDLQ()
 
-	got := event.Settle(ctx, event.SettleInput{
+	got := event.Settle(obs.ctx(ctx), event.SettleInput{
 		SubscriptionCtx: context.Background(),
 		Evt:             &fsEvent{},
 		Handler:         "h",
 		Err:             &event.DeadLetteredError{Cause: fsPermanent{msg: "bad"}, Reason: event.ReasonTerminal},
 		Publisher:       dlq,
-		OnErr:           bus.fn,
 	})
 
 	if got.Disposition != event.DispositionAck {
@@ -131,8 +129,11 @@ func TestSettle_ChainDeadLetteredIsAcked(t *testing.T) {
 	if dlq.Len() != 0 {
 		t.Errorf("published %d records, want 0 (the chain already dead-lettered)", dlq.Len())
 	}
-	if n := len(bus.calls()); n != 1 {
-		t.Errorf("OnErr called %d times, want 1", n)
+	if n := len(obs.Failures()); n != 1 {
+		t.Errorf("Failure called %d times, want 1", n)
+	}
+	if n := len(obs.DeadLetters()); n != 0 {
+		t.Errorf("DeadLettered signals = %d, want 0 (the chain already published)", n)
 	}
 }
 
@@ -198,18 +199,21 @@ func fsSettle(ctx context.Context, d event.Delivery, in event.SettleInput) event
 func TestSettle_DroppedWithoutPublisher(t *testing.T) {
 	logs := fsCaptureLogs(t)
 	evt := &fsEvent{}
-	bus := &fsBusErr{}
+	obs := &fsObs{}
 	err := &event.FailureError{Cause: fsPermanent{msg: "bad"}, Reason: event.ReasonTerminal, Attempts: 1}
 
-	got := fsSettle(context.Background(), event.Delivery{Count: 1, Max: 1, Subject: "s"}, event.SettleInput{
-		Evt: evt, Handler: "fs-dropped", Err: err, OnErr: bus.fn,
+	got := fsSettle(obs.ctx(context.Background()), event.Delivery{Count: 1, Max: 1, Subject: "s"}, event.SettleInput{
+		Evt: evt, Handler: "fs-dropped", Err: err,
 	})
 
 	if got.Disposition != event.DispositionTerminal || got.Outcome != event.OutcomeDropped {
 		t.Fatalf("got %v / %q, want terminal / dropped", got.Disposition, got.Outcome)
 	}
-	if calls := bus.calls(); len(calls) != 1 || calls[0] != error(err) {
-		t.Errorf("bus OnErr calls = %v, want the identical error once", calls)
+	if calls := obs.causes(); len(calls) != 1 || calls[0] != error(err) {
+		t.Errorf("observer Failure causes = %v, want the identical error once", calls)
+	}
+	if f := obs.Failures()[0]; f.Outcome != event.OutcomeDropped || f.Handler != "fs-dropped" || f.Event != event.Event(evt) {
+		t.Errorf("Failure = outcome %q handler %q event %v, want dropped, fs-dropped and the event", f.Outcome, f.Handler, f.Event)
 	}
 	if calls := evt.calls(); len(calls) != 1 || calls[0] != error(err) {
 		t.Errorf("event OnErr calls = %v, want the identical error once", calls)
@@ -226,10 +230,10 @@ func TestSettle_PublishFailureNeverTerminal(t *testing.T) {
 
 	t.Run("non-final", func(t *testing.T) {
 		logs := fsCaptureLogs(t)
-		bus := &fsBusErr{}
+		obs := &fsObs{}
 		pub := &fsPublisher{failUntil: -1}
-		got := fsSettle(context.Background(), event.Delivery{Count: 1, Max: 3}, event.SettleInput{
-			Evt: &fsEvent{}, Handler: "fs-pf-nonfinal", Err: chainErr, Publisher: pub, OnErr: bus.fn,
+		got := fsSettle(obs.ctx(context.Background()), event.Delivery{Count: 1, Max: 3}, event.SettleInput{
+			Evt: &fsEvent{}, Handler: "fs-pf-nonfinal", Err: chainErr, Publisher: pub,
 		})
 		if got.Disposition != event.DispositionRetryDelayed {
 			t.Fatalf("Disposition = %v, want retry_delayed", got.Disposition)
@@ -237,8 +241,11 @@ func TestSettle_PublishFailureNeverTerminal(t *testing.T) {
 		if pub.calls.Load() != 1 {
 			t.Errorf("publish calls = %d, want 1", pub.calls.Load())
 		}
-		if len(bus.calls()) != 0 {
-			t.Errorf("OnErr called %d times on a non-final delivery, want 0", len(bus.calls()))
+		if len(obs.Failures()) != 0 {
+			t.Errorf("Failure called %d times on a non-final delivery, want 0", len(obs.Failures()))
+		}
+		if f := obs.DLQPublishFailures(); len(f) != 1 || f[0].Final || f[0].Delivery.Raw != nil {
+			t.Errorf("DLQPublishFailed signals = %+v, want one non-final", f)
 		}
 		recs := logs.forHandler("fs-pf-nonfinal")
 		if len(recs) != 1 || recs[0].level != slog.LevelError {
@@ -249,10 +256,10 @@ func TestSettle_PublishFailureNeverTerminal(t *testing.T) {
 	t.Run("final", func(t *testing.T) {
 		fsCaptureLogs(t)
 		evt := &fsEvent{}
-		bus := &fsBusErr{}
+		obs := &fsObs{}
 		pub := &fsPublisher{failUntil: -1}
-		got := fsSettle(context.Background(), event.Delivery{Count: 3, Max: 3}, event.SettleInput{
-			Evt: evt, Handler: "fs-pf-final", Err: chainErr, Publisher: pub, OnErr: bus.fn,
+		got := fsSettle(obs.ctx(context.Background()), event.Delivery{Count: 3, Max: 3}, event.SettleInput{
+			Evt: evt, Handler: "fs-pf-final", Err: chainErr, Publisher: pub,
 		})
 		if got.Disposition != event.DispositionRetryDelayed || got.Outcome != event.OutcomeDLQPublishFailed {
 			t.Fatalf("got %v / %q, want retry_delayed / dlq_publish_failed", got.Disposition, got.Outcome)
@@ -260,10 +267,13 @@ func TestSettle_PublishFailureNeverTerminal(t *testing.T) {
 		if pub.calls.Load() != 3 {
 			t.Errorf("publish calls = %d, want 3", pub.calls.Load())
 		}
-		for name, calls := range map[string][]error{"bus": bus.calls(), "event": evt.calls()} {
+		for name, calls := range map[string][]error{"observer": obs.causes(), "event": evt.calls()} {
 			if len(calls) != 1 || !errors.Is(calls[0], event.ErrDeadLetterFailed) || !errors.Is(calls[0], cause) {
-				t.Errorf("%s OnErr calls = %v, want one error matching ErrDeadLetterFailed and the cause", name, calls)
+				t.Errorf("%s reports = %v, want one error matching ErrDeadLetterFailed and the cause", name, calls)
 			}
+		}
+		if f := obs.Failures()[0]; f.Outcome != event.OutcomeDLQPublishFailed {
+			t.Errorf("Failure outcome = %q, want dlq_publish_failed", f.Outcome)
 		}
 	})
 }
@@ -282,10 +292,10 @@ func TestSettle_ChainDeadLetterFailed(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			fsCaptureLogs(t)
-			bus := &fsBusErr{}
+			obs := &fsObs{}
 			dlq := event.NewMemoryDLQ()
-			got := fsSettle(context.Background(), c.d, event.SettleInput{
-				Evt: &fsEvent{}, Handler: "fs-chain-dlf", Err: failed, Publisher: dlq, OnErr: bus.fn,
+			got := fsSettle(obs.ctx(context.Background()), c.d, event.SettleInput{
+				Evt: &fsEvent{}, Handler: "fs-chain-dlf", Err: failed, Publisher: dlq,
 			})
 			if got.Disposition != event.DispositionRetryDelayed {
 				t.Errorf("Disposition = %v, want retry_delayed", got.Disposition)
@@ -293,8 +303,8 @@ func TestSettle_ChainDeadLetterFailed(t *testing.T) {
 			if dlq.Len() != 0 {
 				t.Errorf("published %d records, want 0 (the chain already tried)", dlq.Len())
 			}
-			if n := len(bus.calls()); n != c.wantReport {
-				t.Errorf("OnErr called %d times, want %d", n, c.wantReport)
+			if n := len(obs.Failures()); n != c.wantReport {
+				t.Errorf("Failure called %d times, want %d", n, c.wantReport)
 			}
 		})
 	}
@@ -306,26 +316,26 @@ func TestSettle_InterruptedNeverDeadLettered(t *testing.T) {
 
 	t.Run("non-final", func(t *testing.T) {
 		fsCaptureLogs(t)
-		bus := &fsBusErr{}
+		obs := &fsObs{}
 		dlq := event.NewMemoryDLQ()
-		got := fsSettle(context.Background(), event.Delivery{Count: 1, Max: 3}, event.SettleInput{
-			SubscriptionCtx: sub, Evt: &fsEvent{}, Handler: "fs-int", Err: context.Canceled, Publisher: dlq, OnErr: bus.fn,
+		got := fsSettle(obs.ctx(context.Background()), event.Delivery{Count: 1, Max: 3}, event.SettleInput{
+			SubscriptionCtx: sub, Evt: &fsEvent{}, Handler: "fs-int", Err: context.Canceled, Publisher: dlq,
 		})
 		if got.Disposition != event.DispositionRetry || got.Outcome != "" {
 			t.Errorf("got %v / %q, want retry / no outcome", got.Disposition, got.Outcome)
 		}
-		if dlq.Len() != 0 || len(bus.calls()) != 0 {
-			t.Errorf("published %d, reported %d; want 0 and 0", dlq.Len(), len(bus.calls()))
+		if dlq.Len() != 0 || len(obs.Failures()) != 0 {
+			t.Errorf("published %d, reported %d; want 0 and 0", dlq.Len(), len(obs.Failures()))
 		}
 	})
 
 	t.Run("final", func(t *testing.T) {
 		fsCaptureLogs(t)
 		evt := &fsEvent{}
-		bus := &fsBusErr{}
+		obs := &fsObs{}
 		dlq := event.NewMemoryDLQ()
-		got := fsSettle(context.Background(), event.Delivery{Count: 3, Max: 3}, event.SettleInput{
-			SubscriptionCtx: sub, Evt: evt, Handler: "fs-int", Err: context.Canceled, Publisher: dlq, OnErr: bus.fn,
+		got := fsSettle(obs.ctx(context.Background()), event.Delivery{Count: 3, Max: 3}, event.SettleInput{
+			SubscriptionCtx: sub, Evt: evt, Handler: "fs-int", Err: context.Canceled, Publisher: dlq,
 		})
 		if got.Disposition != event.DispositionRetry || got.Outcome != event.OutcomeInterrupted {
 			t.Errorf("got %v / %q, want retry / interrupted", got.Disposition, got.Outcome)
@@ -333,8 +343,11 @@ func TestSettle_InterruptedNeverDeadLettered(t *testing.T) {
 		if dlq.Len() != 0 {
 			t.Errorf("published %d records, want 0 (never dead-lettered, D-07)", dlq.Len())
 		}
-		if len(bus.calls()) != 1 || len(evt.calls()) != 1 {
-			t.Errorf("reported bus %d, event %d; want 1 and 1", len(bus.calls()), len(evt.calls()))
+		if len(obs.Failures()) != 1 || len(evt.calls()) != 1 {
+			t.Errorf("reported observer %d, event %d; want 1 and 1", len(obs.Failures()), len(evt.calls()))
+		}
+		if f := obs.Failures()[0]; f.Outcome != event.OutcomeInterrupted {
+			t.Errorf("Failure outcome = %q, want interrupted", f.Outcome)
 		}
 	})
 }
@@ -356,27 +369,27 @@ func TestSettle_HandlerTimeoutIsTransient(t *testing.T) {
 
 func TestSettle_DuplicateIsQuiet(t *testing.T) {
 	logs := fsCaptureLogs(t)
-	bus := &fsBusErr{}
+	obs := &fsObs{}
 	dlq := event.NewMemoryDLQ()
-	got := fsSettle(context.Background(), event.Delivery{Count: 3, Max: 3}, event.SettleInput{
-		Evt: &fsEvent{}, Handler: "fs-dup", Err: event.ErrDuplicate, Publisher: dlq, OnErr: bus.fn,
+	got := fsSettle(obs.ctx(context.Background()), event.Delivery{Count: 3, Max: 3}, event.SettleInput{
+		Evt: &fsEvent{}, Handler: "fs-dup", Err: event.ErrDuplicate, Publisher: dlq,
 	})
 	if got.Disposition != event.DispositionAck {
 		t.Errorf("Disposition = %v, want ack", got.Disposition)
 	}
-	if dlq.Len() != 0 || len(bus.calls()) != 0 || len(logs.forHandler("fs-dup")) != 0 {
-		t.Errorf("published %d, reported %d, logged %d; want all 0", dlq.Len(), len(bus.calls()), len(logs.forHandler("fs-dup")))
+	if dlq.Len() != 0 || len(obs.All()) != 0 || len(logs.forHandler("fs-dup")) != 0 {
+		t.Errorf("published %d, signals %d, logged %d; want all 0", dlq.Len(), len(obs.All()), len(logs.forHandler("fs-dup")))
 	}
 }
 
 func TestSettle_DecodeFailureEvtNil(t *testing.T) {
 	logs := fsCaptureLogs(t)
-	bus := &fsBusErr{}
+	obs := &fsObs{}
 	dlq := event.NewMemoryDLQ()
 	raw := []byte(`{"name":"nope"}`)
-	got := fsSettle(context.Background(), event.Delivery{Count: 1, Max: 1, Subject: "nope", Raw: raw}, event.SettleInput{
+	got := fsSettle(obs.ctx(context.Background()), event.Delivery{Count: 1, Max: 1, Subject: "nope", Raw: raw}, event.SettleInput{
 		Evt: nil, Handler: "fs-decode", Err: &event.DecodeError{Name: "nope", Err: event.ErrUnknownEvent},
-		Publisher: dlq, OnErr: bus.fn,
+		Publisher: dlq,
 	})
 	if got.Disposition != event.DispositionTerminal || got.Outcome != event.OutcomeDeadLettered {
 		t.Fatalf("got %v / %q, want terminal / dead_lettered", got.Disposition, got.Outcome)
@@ -385,10 +398,13 @@ func TestSettle_DecodeFailureEvtNil(t *testing.T) {
 	if len(recs) != 1 || recs[0].Evt != nil || recs[0].Reason != event.ReasonDecodeUnknownEvent || string(recs[0].Raw) != string(raw) {
 		t.Errorf("records = %+v, want one with nil Evt, reason decode_unknown_event and the raw bytes", recs)
 	}
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
-	if len(bus.errs) != 1 || bus.evts[0] != nil {
-		t.Errorf("bus OnErr calls = %d (evt %v), want 1 with a nil event", len(bus.errs), bus.evts)
+	failures := obs.Failures()
+	if len(failures) != 1 || failures[0].Event != nil || failures[0].Outcome != event.OutcomeDecodeFailed {
+		t.Errorf("Failure calls = %+v, want 1 with a nil event and outcome decode_failed", failures)
+	}
+	decodes := obs.DecodeFailures()
+	if len(decodes) != 1 || !decodes[0].Final || decodes[0].Delivery.Raw != nil || decodes[0].Reason != event.ReasonDecodeUnknownEvent {
+		t.Errorf("DecodeFailed signals = %+v, want one final, redacted, decode_unknown_event", decodes)
 	}
 	if len(logs.forHandler("fs-decode")) == 0 {
 		t.Error("decode failure was not logged")
@@ -400,8 +416,9 @@ func TestSettle_UnknownVersionRetriedThenDeadLettered(t *testing.T) {
 
 	t.Run("non-final retries with a warning", func(t *testing.T) {
 		logs := fsCaptureLogs(t)
+		obs := &fsObs{}
 		dlq := event.NewMemoryDLQ()
-		got := fsSettle(context.Background(), event.Delivery{Count: 1, Max: 3}, event.SettleInput{
+		got := fsSettle(obs.ctx(context.Background()), event.Delivery{Count: 1, Max: 3}, event.SettleInput{
 			Handler: "fs-uv-nonfinal", Err: err, Publisher: dlq,
 		})
 		if got.Disposition != event.DispositionRetryDelayed || dlq.Len() != 0 {
@@ -410,6 +427,9 @@ func TestSettle_UnknownVersionRetriedThenDeadLettered(t *testing.T) {
 		recs := logs.forHandler("fs-uv-nonfinal")
 		if len(recs) != 1 || recs[0].level != slog.LevelWarn {
 			t.Errorf("logs = %+v, want one Warn record", recs)
+		}
+		if d := obs.DecodeFailures(); len(d) != 1 || d[0].Final || len(obs.Failures()) != 0 {
+			t.Errorf("DecodeFailed %+v Failures %d, want one non-final DecodeFailed and no Failure", d, len(obs.Failures()))
 		}
 	})
 

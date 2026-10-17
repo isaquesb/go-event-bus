@@ -153,17 +153,13 @@ func TestLocalBus_MultipleHandlers(t *testing.T) {
 	}
 }
 
-func TestLocalBus_OnErrCallback(t *testing.T) {
+func TestLocalBus_ObserverFailureCallback(t *testing.T) {
 	ctx := context.Background()
-	var capturedErr error
-	var capturedHandler string
+	rec := &obsRecorder{}
 
 	bus := event.NewLocalBus(event.LocalBusOptions{
-		Invoker: &passthroughInvoker{},
-		OnErr: func(ctx context.Context, evt event.Event, err error, handler string) {
-			capturedErr = err
-			capturedHandler = handler
-		},
+		Invoker:  &passthroughInvoker{},
+		Observer: rec,
 	})
 
 	handlerErr := errors.New("handler failed")
@@ -176,11 +172,18 @@ func TestLocalBus_OnErrCallback(t *testing.T) {
 	evt := &testEvent{name: "user.created"}
 	_, _ = bus.EmitSync(ctx, evt)
 
-	if capturedErr != handlerErr {
-		t.Errorf("expected error '%v', got '%v'", handlerErr, capturedErr)
+	failures := rec.Failures()
+	if len(failures) != 1 {
+		t.Fatalf("expected 1 Failure, got %d", len(failures))
 	}
-	if capturedHandler != "failing-handler" {
-		t.Errorf("expected handler 'failing-handler', got '%s'", capturedHandler)
+	if failures[0].Cause != handlerErr {
+		t.Errorf("expected error '%v', got '%v'", handlerErr, failures[0].Cause)
+	}
+	if failures[0].Handler != "failing-handler" {
+		t.Errorf("expected handler 'failing-handler', got '%s'", failures[0].Handler)
+	}
+	if failures[0].Event != event.Event(evt) {
+		t.Errorf("expected the emitted event, got %v", failures[0].Event)
 	}
 }
 
@@ -444,12 +447,10 @@ func TestLocalBus_RegisterSubscribers_MultipleSubscribers(t *testing.T) {
 func TestLocalBus_RegisterSubscribers_HandlerNameFromSubscriberName(t *testing.T) {
 	ctx := context.Background()
 
-	var capturedHandler string
+	rec := &obsRecorder{}
 	bus := event.NewLocalBus(event.LocalBusOptions{
-		Invoker: &passthroughInvoker{},
-		OnErr: func(_ context.Context, _ event.Event, _ error, handler string) {
-			capturedHandler = handler
-		},
+		Invoker:  &passthroughInvoker{},
+		Observer: rec,
 	})
 
 	err := bus.RegisterSubscribers(ctx, &testSubscriber{
@@ -466,8 +467,9 @@ func TestLocalBus_RegisterSubscribers_HandlerNameFromSubscriberName(t *testing.T
 
 	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created"})
 
-	if capturedHandler != "my-service" {
-		t.Errorf("expected handler name 'my-service', got '%s'", capturedHandler)
+	failures := rec.Failures()
+	if len(failures) != 1 || failures[0].Handler != "my-service" {
+		t.Errorf("expected one Failure for handler name 'my-service', got %+v", failures)
 	}
 }
 

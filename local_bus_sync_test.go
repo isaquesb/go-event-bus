@@ -36,10 +36,8 @@ func lsHandlerErrors(t *testing.T, err error) map[string]*event.HandlerError {
 }
 
 func TestLocalBus_EmitSync_JoinsTerminalFailures(t *testing.T) {
-	var onErr atomic.Int32
-	bus := event.NewLocalBus(event.LocalBusOptions{
-		OnErr: func(context.Context, event.Event, error, string) { onErr.Add(1) },
-	})
+	rec := &obsRecorder{}
+	bus := event.NewLocalBus(event.LocalBusOptions{Observer: rec})
 
 	bad := errors.New("ls: bad")
 	var h3Ran atomic.Bool
@@ -85,8 +83,16 @@ func TestLocalBus_EmitSync_JoinsTerminalFailures(t *testing.T) {
 	if !h3Ran.Load() {
 		t.Error("h3 did not run after h1 panicked and h2 failed")
 	}
-	if got := onErr.Load(); got != 2 {
-		t.Errorf("bus OnErr calls = %d, want 2", got)
+	failures := rec.Failures()
+	if len(failures) != 2 {
+		t.Fatalf("observer Failure calls = %d, want 2", len(failures))
+	}
+	handlers := map[string]bool{}
+	for _, f := range failures {
+		handlers[f.Handler] = true
+	}
+	if !handlers["h1"] || !handlers["h2"] {
+		t.Errorf("failed handlers = %v, want h1 and h2", handlers)
 	}
 }
 
@@ -171,17 +177,17 @@ func TestLocalBus_EmitSync_HandledOutcomesNotErrors(t *testing.T) {
 	})
 
 	t.Run("duplicate", func(t *testing.T) {
-		var onErr atomic.Int32
+		rec := &obsRecorder{}
 		bus := event.NewLocalBus(event.LocalBusOptions{
-			Invoker: &lfInvoker{err: event.ErrDuplicate},
-			OnErr:   func(context.Context, event.Event, error, string) { onErr.Add(1) },
+			Invoker:  &lfInvoker{err: event.ErrDuplicate},
+			Observer: rec,
 		})
 		lfSubscribeNoop(t, bus, "ls.evt")
 		if _, err := bus.EmitSync(context.Background(), &lsEvent{}); err != nil {
 			t.Fatalf("EmitSync = %v, want nil for a duplicate", err)
 		}
-		if got := onErr.Load(); got != 0 {
-			t.Errorf("OnErr calls = %d, want 0", got)
+		if got := len(rec.Failures()); got != 0 {
+			t.Errorf("observer Failure calls = %d, want 0", got)
 		}
 	})
 }
@@ -227,32 +233,28 @@ func TestLocalBus_EmitSync_PanicDeadLetteredIsHandled(t *testing.T) {
 	}
 }
 
-// lsCapture records the bus OnErr calls and the DLQ-bound errors.
-type lsCapture struct {
-	mu   sync.Mutex
-	errs []error
-}
+// lsCapture is the bus Observer of the timeout tests: an obsRecorder with the
+// reported errors in call order.
+type lsCapture struct{ *obsRecorder }
 
-func (c *lsCapture) fn(_ context.Context, _ event.Event, err error, _ string) {
-	c.mu.Lock()
-	c.errs = append(c.errs, err)
-	c.mu.Unlock()
-}
+func newLsCapture() *lsCapture { return &lsCapture{obsRecorder: &obsRecorder{}} }
 
 func (c *lsCapture) all() []error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]error(nil), c.errs...)
+	var out []error
+	for _, f := range c.Failures() {
+		out = append(out, f.Cause)
+	}
+	return out
 }
 
 func TestLocalBus_HandlerTimeoutIsTransient(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		dlq := event.NewMemoryDLQ()
-		cap := &lsCapture{}
+		cap := newLsCapture()
 		bus := event.NewLocalBus(event.LocalBusOptions{
 			HandlerTimeout: time.Second,
 			DLQPublisher:   dlq,
-			OnErr:          cap.fn,
+			Observer:       cap,
 		})
 
 		var (
@@ -296,13 +298,13 @@ func TestLocalBus_HandlerTimeoutIsTransient(t *testing.T) {
 
 		errs := cap.all()
 		if len(errs) != 1 {
-			t.Fatalf("OnErr calls = %d, want 1", len(errs))
+			t.Fatalf("observer Failure calls = %d, want 1", len(errs))
 		}
 		if !errors.Is(errs[0], event.ErrDeadLettered) || !errors.Is(errs[0], event.ErrHandlerTimeout) {
-			t.Errorf("OnErr err = %v, want ErrDeadLettered and ErrHandlerTimeout", errs[0])
+			t.Errorf("observer Failure cause = %v, want ErrDeadLettered and ErrHandlerTimeout", errs[0])
 		}
 		if errors.Is(errs[0], event.ErrShutdownInterrupted) {
-			t.Errorf("OnErr err = %v, a timeout must not read as a shutdown interruption", errs[0])
+			t.Errorf("observer Failure cause = %v, a timeout must not read as a shutdown interruption", errs[0])
 		}
 	})
 }
@@ -390,11 +392,11 @@ func (p *lgBlockingDLQ) Publish(ctx context.Context, _ event.DLQRecord) error {
 func TestLocalBus_HandlerTimeoutDeadLettersWithCtxHonoringDLQ(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		pub := &lgCtxDLQ{}
-		cap := &lsCapture{}
+		cap := newLsCapture()
 		bus := event.NewLocalBus(event.LocalBusOptions{
 			HandlerTimeout: time.Second,
 			DLQPublisher:   pub,
-			OnErr:          cap.fn,
+			Observer:       cap,
 		})
 		if err := bus.Subscribe(context.Background(), "ls.evt", func(ctx context.Context, _ event.Event) error {
 			<-ctx.Done()
@@ -426,13 +428,13 @@ func TestLocalBus_HandlerTimeoutDeadLettersWithCtxHonoringDLQ(t *testing.T) {
 
 		errs := cap.all()
 		if len(errs) != 1 {
-			t.Fatalf("OnErr calls = %d (%v), want 1", len(errs), errs)
+			t.Fatalf("observer Failure calls = %d (%v), want 1", len(errs), errs)
 		}
 		if !errors.Is(errs[0], event.ErrDeadLettered) || !errors.Is(errs[0], event.ErrHandlerTimeout) {
-			t.Errorf("OnErr err = %v, want ErrDeadLettered and ErrHandlerTimeout", errs[0])
+			t.Errorf("observer Failure cause = %v, want ErrDeadLettered and ErrHandlerTimeout", errs[0])
 		}
 		if errors.Is(errs[0], event.ErrDeadLetterFailed) {
-			t.Errorf("OnErr err = %v, must not be ErrDeadLetterFailed", errs[0])
+			t.Errorf("observer Failure cause = %v, must not be ErrDeadLetterFailed", errs[0])
 		}
 	})
 }
@@ -444,10 +446,10 @@ func TestLocalBus_HandlerTimeoutDeadLettersWithCtxHonoringDLQ(t *testing.T) {
 func TestLocalBus_EmitSync_CallerDeadlineDeadLetters(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		pub := &lgCtxDLQ{}
-		cap := &lsCapture{}
+		cap := newLsCapture()
 		bus := event.NewLocalBus(event.LocalBusOptions{
 			DLQPublisher: pub,
-			OnErr:        cap.fn,
+			Observer:     cap,
 		})
 		if err := bus.Subscribe(context.Background(), "ls.evt", func(context.Context, event.Event) error {
 			time.Sleep(2 * time.Second) // ignores its ctx
@@ -475,10 +477,10 @@ func TestLocalBus_EmitSync_CallerDeadlineDeadLetters(t *testing.T) {
 		}
 		errs := cap.all()
 		if len(errs) != 1 {
-			t.Fatalf("OnErr calls = %d (%v), want 1", len(errs), errs)
+			t.Fatalf("observer Failure calls = %d (%v), want 1", len(errs), errs)
 		}
 		if !errors.Is(errs[0], event.ErrDeadLettered) || errors.Is(errs[0], event.ErrDeadLetterFailed) {
-			t.Errorf("OnErr err = %v, want ErrDeadLettered and not ErrDeadLetterFailed", errs[0])
+			t.Errorf("observer Failure cause = %v, want ErrDeadLettered and not ErrDeadLetterFailed", errs[0])
 		}
 		if err := bus.Shutdown(context.Background()); err != nil {
 			t.Fatalf("Shutdown = %v, want nil", err)
@@ -492,11 +494,11 @@ func TestLocalBus_EmitSync_CallerDeadlineDeadLetters(t *testing.T) {
 func TestLocalBus_SettleBoundedByShutdownDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		pub := &lgBlockingDLQ{}
-		cap := &lsCapture{}
+		cap := newLsCapture()
 		bus := event.NewLocalBus(event.LocalBusOptions{
 			HandlerTimeout: time.Second,
 			DLQPublisher:   pub,
-			OnErr:          cap.fn,
+			Observer:       cap,
 		})
 		if err := bus.Subscribe(context.Background(), "ls.evt", func(ctx context.Context, _ event.Event) error {
 			<-ctx.Done()
@@ -523,10 +525,10 @@ func TestLocalBus_SettleBoundedByShutdownDeadline(t *testing.T) {
 		}
 		errs := cap.all()
 		if len(errs) != 1 {
-			t.Fatalf("OnErr calls = %d (%v), want 1", len(errs), errs)
+			t.Fatalf("observer Failure calls = %d (%v), want 1", len(errs), errs)
 		}
 		if !errors.Is(errs[0], event.ErrDeadLetterFailed) || !errors.Is(errs[0], event.ErrHandlerTimeout) {
-			t.Errorf("OnErr err = %v, want ErrDeadLetterFailed and ErrHandlerTimeout", errs[0])
+			t.Errorf("observer Failure cause = %v, want ErrDeadLetterFailed and ErrHandlerTimeout", errs[0])
 		}
 	})
 }

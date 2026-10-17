@@ -72,14 +72,12 @@ func TestLocalBus_SelfEmitNoDeadlock(t *testing.T) {
 		event.OverflowBlock, event.OverflowDrop, event.OverflowUnbounded,
 	} {
 		synctest.Test(t, func(t *testing.T) {
-			var onErr atomic.Int32
+			rec := &obsRecorder{}
 			bus := event.NewLocalBus(event.LocalBusOptions{
 				MaxConcurrent: 1,
 				QueueSize:     1,
 				Overflow:      mode,
-				OnErr: func(context.Context, event.Event, error, string) {
-					onErr.Add(1)
-				},
+				Observer:      rec,
 			})
 
 			var runs atomic.Int32
@@ -103,8 +101,8 @@ func TestLocalBus_SelfEmitNoDeadlock(t *testing.T) {
 			if got := runs.Load(); got != 31 {
 				t.Errorf("%s: handler runs = %d, want 31", mode, got)
 			}
-			if got := onErr.Load(); got != 0 {
-				t.Errorf("%s: OnErr calls = %d, want 0", mode, got)
+			if got := len(rec.Failures()); got != 0 {
+				t.Errorf("%s: observer Failure calls = %d, want 0", mode, got)
 			}
 		})
 	}
@@ -160,24 +158,24 @@ func lrInstallLogs(t *testing.T) *lrLogs {
 	return l
 }
 
-// lrErrs records the bus OnErr calls.
-type lrErrs struct {
-	mu       sync.Mutex
-	errs     []error
-	handlers []string
-}
+// lrErrs is the recording bus Observer of these tests: an obsRecorder with the
+// reported errors and handlers in call order.
+type lrErrs struct{ obsRecorder }
 
-func (c *lrErrs) fn(_ context.Context, _ event.Event, err error, handler string) {
-	c.mu.Lock()
-	c.errs = append(c.errs, err)
-	c.handlers = append(c.handlers, handler)
-	c.mu.Unlock()
+// observer returns the recorder fanned out with a SlogObserver without
+// deduplication, so the tests that capture log records see every one.
+func (c *lrErrs) observer() event.Observer {
+	return event.MultiObserver(c, event.NewSlogObserver(nil, event.WithLogEvery(0)))
 }
 
 func (c *lrErrs) snapshot() ([]error, []string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]error(nil), c.errs...), append([]string(nil), c.handlers...)
+	var errs []error
+	var handlers []string
+	for _, f := range c.Failures() {
+		errs = append(errs, f.Cause)
+		handlers = append(handlers, f.Handler)
+	}
+	return errs, handlers
 }
 
 // lrRan is a set of the event ids whose handler started.
@@ -218,7 +216,7 @@ func lrBlockedBus(t *testing.T, policy event.OverflowPolicy, errs *lrErrs) (*eve
 		MaxConcurrent: 1,
 		QueueSize:     1,
 		Overflow:      policy,
-		OnErr:         errs.fn,
+		Observer:      errs.observer(),
 	})
 	if err := bus.Subscribe(context.Background(), "lr.evt", func(ctx context.Context, _ event.Event) error {
 		md, _ := event.MetadataFromContext(ctx)
@@ -246,7 +244,7 @@ func TestLocalBus_Overflow_DropReportsQueueFull(t *testing.T) {
 
 		got, handlers := errs.snapshot()
 		if len(got) != 1 || !errors.Is(got[0], event.ErrQueueFull) || handlers[0] != "h" {
-			t.Fatalf("OnErr = %v handlers %v, want one ErrQueueFull for handler h", got, handlers)
+			t.Fatalf("observer Failure = %v handlers %v, want one ErrQueueFull for handler h", got, handlers)
 		}
 		if n := e3.onErr.Load(); n != 1 {
 			t.Errorf("event OnErr calls = %d, want 1", n)
@@ -289,7 +287,7 @@ func TestLocalBus_Overflow_BlockExpiresWithQueueFull(t *testing.T) {
 
 		got, _ := errs.snapshot()
 		if len(got) != 1 || !errors.Is(got[0], event.ErrQueueFull) {
-			t.Fatalf("OnErr = %v, want one ErrQueueFull", got)
+			t.Fatalf("observer Failure = %v, want one ErrQueueFull", got)
 		}
 
 		close(gate)
@@ -338,7 +336,7 @@ func TestLocalBus_Overflow_BlockProceedsWhenSlotFrees(t *testing.T) {
 			t.Errorf("handlers started = %d, want 3", n)
 		}
 		if got, _ := errs.snapshot(); len(got) != 0 {
-			t.Errorf("OnErr = %v, want none", got)
+			t.Errorf("observer Failure = %v, want none", got)
 		}
 	})
 }
@@ -363,7 +361,7 @@ func TestLocalBus_Overflow_BlockCancelledEmitterWithRoom(t *testing.T) {
 			t.Error("e2 did not run, want it parked and run despite the cancelled emitter ctx")
 		}
 		if got, _ := errs.snapshot(); len(got) != 0 {
-			t.Errorf("OnErr = %v, want none (no ErrQueueFull)", got)
+			t.Errorf("observer Failure = %v, want none (no ErrQueueFull)", got)
 		}
 	})
 }
@@ -389,7 +387,7 @@ func TestLocalBus_Overflow_UnboundedNeverBlocks(t *testing.T) {
 			t.Errorf("handlers started = %d, want 51", n)
 		}
 		if got, _ := errs.snapshot(); len(got) != 0 {
-			t.Errorf("OnErr = %v, want none", got)
+			t.Errorf("observer Failure = %v, want none", got)
 		}
 	})
 }
@@ -399,7 +397,7 @@ func TestLocalBus_EmitAfterShutdownRejected(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		errs := &lrErrs{}
 		var ran atomic.Int32
-		bus := event.NewLocalBus(event.LocalBusOptions{OnErr: errs.fn})
+		bus := event.NewLocalBus(event.LocalBusOptions{Observer: errs.observer()})
 		if err := bus.Subscribe(context.Background(), "lr.evt", func(context.Context, event.Event) error {
 			ran.Add(1)
 			return nil
@@ -415,7 +413,7 @@ func TestLocalBus_EmitAfterShutdownRejected(t *testing.T) {
 
 		got, handlers := errs.snapshot()
 		if len(got) != 1 || !errors.Is(got[0], event.ErrBusClosed) || handlers[0] != "" {
-			t.Fatalf("OnErr = %v handlers %q, want one ErrBusClosed with handler \"\"", got, handlers)
+			t.Fatalf("observer Failure = %v handlers %q, want one ErrBusClosed with handler \"\"", got, handlers)
 		}
 		if n := evt.onErr.Load(); n != 1 {
 			t.Errorf("event OnErr calls = %d, want 1", n)
@@ -445,7 +443,7 @@ func TestLocalBus_EmitAfterShutdownNoHandlersIsNoop(t *testing.T) {
 	logs := lrInstallLogs(t)
 	synctest.Test(t, func(t *testing.T) {
 		errs := &lrErrs{}
-		bus := event.NewLocalBus(event.LocalBusOptions{OnErr: errs.fn})
+		bus := event.NewLocalBus(event.LocalBusOptions{Observer: errs.observer()})
 		if err := bus.Shutdown(context.Background()); err != nil {
 			t.Fatalf("Shutdown = %v, want nil", err)
 		}
@@ -457,7 +455,7 @@ func TestLocalBus_EmitAfterShutdownNoHandlersIsNoop(t *testing.T) {
 		}
 
 		if got, _ := errs.snapshot(); len(got) != 0 {
-			t.Errorf("OnErr = %v, want none", got)
+			t.Errorf("observer Failure = %v, want none", got)
 		}
 		if n := evt.onErr.Load(); n != 0 {
 			t.Errorf("event OnErr calls = %d, want 0", n)
@@ -515,7 +513,7 @@ func TestLocalBus_AsyncPanicRecovered(t *testing.T) {
 	lrInstallLogs(t)
 	synctest.Test(t, func(t *testing.T) {
 		errs := &lrErrs{}
-		bus := event.NewLocalBus(event.LocalBusOptions{OnErr: errs.fn})
+		bus := event.NewLocalBus(event.LocalBusOptions{Observer: errs.observer()})
 
 		var normal atomic.Int32
 		if err := bus.Subscribe(context.Background(), "lr.evt",
@@ -539,7 +537,7 @@ func TestLocalBus_AsyncPanicRecovered(t *testing.T) {
 		}
 		got, handlers := errs.snapshot()
 		if len(got) != 1 || !errors.Is(got[0], event.ErrHandlerPanic) || handlers[0] != "panicker" {
-			t.Fatalf("OnErr = %v handlers %q, want one ErrHandlerPanic from panicker", got, handlers)
+			t.Fatalf("observer Failure = %v handlers %q, want one ErrHandlerPanic from panicker", got, handlers)
 		}
 	})
 }
@@ -549,56 +547,94 @@ type lrPanickyEvent struct{ lrEvent }
 
 func (*lrPanickyEvent) OnErr(context.Context, error, string) { panic("lr: OnErr boom") }
 
-// TestLocalBus_PanicInOnErrRecovered proves the task-level recover: a panic in
-// user reporting code (the bus OnErr callback or the event's OnErr hook) on an
-// async task is logged, does not crash the process and does not leak the task.
+// lgPanicObserver counts its Failure calls and panics in every one of them.
+type lgPanicObserver struct {
+	event.NopObserver
+	calls atomic.Int32
+	value string
+}
+
+func (o *lgPanicObserver) Failure(context.Context, event.FailureContext) {
+	o.calls.Add(1)
+	panic(o.value)
+}
+
+// lgPanicDLQ is a DLQ publisher that panics.
+type lgPanicDLQ struct{}
+
+func (lgPanicDLQ) Publish(context.Context, event.DLQRecord) error { panic("lr: publisher boom") }
+
+// TestLocalBus_PanicInOnErrRecovered proves the panic containment of the report
+// path on an async task: a panic in user reporting code (the observer, the
+// event's OnErr hook) or in the DLQ publisher is isolated, reported, does not
+// crash the process and does not leak the task.
 func TestLocalBus_PanicInOnErrRecovered(t *testing.T) {
 	logs := lrInstallLogs(t)
-	synctest.Test(t, func(t *testing.T) {
-		var busOnErr atomic.Int32
-		bus := event.NewLocalBus(event.LocalBusOptions{
-			OnErr: func(context.Context, event.Event, error, string) {
-				busOnErr.Add(1)
-				panic("lr: bus OnErr boom")
-			},
-		})
-		if err := bus.Subscribe(context.Background(), "lr.evt",
-			func(context.Context, event.Event) error { return errors.New("lr: handler failed") },
-			event.WithHandlerName("h")); err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+	fail := func(context.Context, event.Event) error { return errors.New("lr: handler failed") }
 
-		bus.Emit(context.Background(), &lrEvent{})
-		if err := bus.Shutdown(context.Background()); err != nil {
-			t.Fatalf("Shutdown = %v, want nil", err)
-		}
-		if got := busOnErr.Load(); got != 1 {
-			t.Errorf("bus OnErr calls = %d, want 1", got)
-		}
-
-		var logged bool
-		logs.mu.Lock()
-		for _, r := range logs.recs {
-			if r.attrs["panic"] == "lr: bus OnErr boom" {
-				logged = true
+	t.Run("observer", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			obs := &lgPanicObserver{value: "lr: observer boom"}
+			bus := event.NewLocalBus(event.LocalBusOptions{Observer: obs})
+			if err := bus.Subscribe(context.Background(), "lr.evt", fail, event.WithHandlerName("h")); err != nil {
+				t.Fatalf("Subscribe: %v", err)
 			}
-		}
-		logs.mu.Unlock()
-		if !logged {
-			t.Error("the OnErr panic was not logged by the task-level recover")
-		}
 
-		// The same holds when the panic comes from the event's own OnErr hook.
-		hook := event.NewLocalBus(event.LocalBusOptions{})
-		if err := hook.Subscribe(context.Background(), "lr.evt",
-			func(context.Context, event.Event) error { return errors.New("lr: handler failed") },
-			event.WithHandlerName("h")); err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
-		hook.Emit(context.Background(), &lrPanickyEvent{})
-		if err := hook.Shutdown(context.Background()); err != nil {
-			t.Fatalf("Shutdown after event OnErr panic = %v, want nil", err)
-		}
+			bus.Emit(context.Background(), &lrEvent{})
+			if err := bus.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown = %v, want nil", err)
+			}
+			if got := obs.calls.Load(); got != 1 {
+				t.Errorf("observer Failure calls = %d, want 1", got)
+			}
+			if got := lgPanicRecords(logs, "lr: observer boom"); got != 1 {
+				t.Errorf("logged observer panics = %d, want 1 (MultiObserver isolates and logs it)", got)
+			}
+		})
+	})
+
+	t.Run("event OnErr hook", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			rec := &obsRecorder{}
+			hook := event.NewLocalBus(event.LocalBusOptions{Observer: rec})
+			if err := hook.Subscribe(context.Background(), "lr.evt", fail, event.WithHandlerName("h")); err != nil {
+				t.Fatalf("Subscribe: %v", err)
+			}
+			hook.Emit(context.Background(), &lrPanickyEvent{})
+			if err := hook.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown after event OnErr panic = %v, want nil", err)
+			}
+			ie := rec.InternalErrors()
+			if len(ie) != 1 || ie[0].Component != event.ComponentEvent || ie[0].Op != event.OpPanic || ie[0].Handler != "h" {
+				t.Fatalf("InternalErrors = %+v, want one event/panic for handler h", ie)
+			}
+			var pe *event.PanicError
+			if !errors.As(ie[0].Err, &pe) || pe.Value != "lr: OnErr boom" || len(pe.Stack) == 0 {
+				t.Errorf("InternalError Err = %v, want a PanicError with the value and a stack", ie[0].Err)
+			}
+			if len(rec.Failures()) != 1 {
+				t.Errorf("observer Failure calls = %d, want 1 (reported before the hook ran)", len(rec.Failures()))
+			}
+		})
+	})
+
+	t.Run("dlq publisher", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			rec := &obsRecorder{}
+			bus := event.NewLocalBus(event.LocalBusOptions{Observer: rec, DLQPublisher: lgPanicDLQ{}})
+			if err := bus.Subscribe(context.Background(), "lr.evt", fail, event.WithHandlerName("h")); err != nil {
+				t.Fatalf("Subscribe: %v", err)
+			}
+			bus.Emit(context.Background(), &lrEvent{})
+			if err := bus.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown after publisher panic = %v, want nil", err)
+			}
+			ie := rec.InternalErrors()
+			if len(ie) != 1 || ie[0].Component != event.ComponentTransport || ie[0].Op != event.OpPanic ||
+				ie[0].Handler != "h" || ie[0].Subject != "lr.evt" {
+				t.Fatalf("InternalErrors = %+v, want one transport/panic for h on lr.evt", ie)
+			}
+		})
 	})
 }
 
@@ -622,7 +658,7 @@ func TestLocalBus_ShutdownNestedEmitDuringDrain(t *testing.T) {
 	lrInstallLogs(t)
 	synctest.Test(t, func(t *testing.T) {
 		errs := &lrErrs{}
-		bus := event.NewLocalBus(event.LocalBusOptions{OnErr: errs.fn})
+		bus := event.NewLocalBus(event.LocalBusOptions{Observer: errs.observer()})
 
 		gate := make(chan struct{})
 		var childRuns, childDone atomic.Int32
@@ -652,7 +688,7 @@ func TestLocalBus_ShutdownNestedEmitDuringDrain(t *testing.T) {
 		bus.Emit(context.Background(), &lrEvent{})
 		got, handlers := errs.snapshot()
 		if len(got) != 1 || !errors.Is(got[0], event.ErrBusClosed) || handlers[0] != "" {
-			t.Fatalf("OnErr = %v handlers %q, want one ErrBusClosed with handler \"\"", got, handlers)
+			t.Fatalf("observer Failure = %v handlers %q, want one ErrBusClosed with handler \"\"", got, handlers)
 		}
 		select {
 		case err := <-res:
@@ -671,7 +707,7 @@ func TestLocalBus_ShutdownNestedEmitDuringDrain(t *testing.T) {
 			t.Errorf("child finished %d times before Shutdown returned, want 1", n)
 		}
 		if got, _ := errs.snapshot(); len(got) != 1 {
-			t.Errorf("OnErr calls = %d, want only the external rejection", len(got))
+			t.Errorf("observer Failure calls = %d, want only the external rejection", len(got))
 		}
 	})
 }
@@ -689,7 +725,7 @@ func TestLocalBus_ShutdownDeadlineInterrupts(t *testing.T) {
 			MaxConcurrent: 1,
 			QueueSize:     4,
 			DLQPublisher:  dlq,
-			OnErr:         errs.fn,
+			Observer:      errs.observer(),
 		})
 
 		var (
@@ -729,11 +765,11 @@ func TestLocalBus_ShutdownDeadlineInterrupts(t *testing.T) {
 
 		got, _ := errs.snapshot()
 		if len(got) != 3 {
-			t.Fatalf("OnErr calls = %d (%v), want 3", len(got), got)
+			t.Fatalf("observer Failure calls = %d (%v), want 3", len(got), got)
 		}
 		for i, err := range got {
 			if !errors.Is(err, event.ErrShutdownInterrupted) || !errors.Is(err, context.Canceled) {
-				t.Errorf("OnErr[%d] = %v, want ErrShutdownInterrupted and context.Canceled", i, err)
+				t.Errorf("Failure[%d] cause = %v, want ErrShutdownInterrupted and context.Canceled", i, err)
 			}
 		}
 		mu.Lock()
@@ -761,7 +797,7 @@ func TestLocalBus_ShutdownDeadlineInterrupts(t *testing.T) {
 		// After the deadline everything is refused.
 		bus.Emit(context.Background(), &lrEvent{})
 		if got, _ := errs.snapshot(); len(got) != 4 || !errors.Is(got[3], event.ErrBusClosed) {
-			t.Errorf("late emit OnErr = %v, want a fourth report matching ErrBusClosed", got)
+			t.Errorf("late emit observer Failure = %v, want a fourth report matching ErrBusClosed", got)
 		}
 	})
 }
@@ -910,20 +946,17 @@ func lgPanicRecords(logs *lrLogs, value string) int {
 }
 
 // TestLocalBus_ParkedTaskOnErrPanicRecovered pins CR-01 (D-01, D-05, D-07): a
-// panicking OnErr on a parked task handed back at the Shutdown deadline is
+// panicking observer on a parked task handed back at the Shutdown deadline is
 // recovered, and the in-flight count is released from a defer, so a later
 // Shutdown drains instead of waiting on a leaked count.
 func TestLocalBus_ParkedTaskOnErrPanicRecovered(t *testing.T) {
 	logs := lrInstallLogs(t)
 	synctest.Test(t, func(t *testing.T) {
-		var onErr atomic.Int32
+		obs := &lgPanicObserver{value: "lg: observer boom"}
 		bus := event.NewLocalBus(event.LocalBusOptions{
 			MaxConcurrent: 1,
 			QueueSize:     4,
-			OnErr: func(context.Context, event.Event, error, string) {
-				onErr.Add(1)
-				panic("lg: OnErr boom")
-			},
+			Observer:      obs,
 		})
 		if err := bus.Subscribe(context.Background(), "lr.evt", func(ctx context.Context, _ event.Event) error {
 			<-ctx.Done()
@@ -944,11 +977,11 @@ func TestLocalBus_ParkedTaskOnErrPanicRecovered(t *testing.T) {
 		}
 		synctest.Wait() // the interrupted tasks report asynchronously
 
-		if got := onErr.Load(); got != 2 {
-			t.Errorf("OnErr calls = %d, want 2 (the running and the parked task)", got)
+		if got := obs.calls.Load(); got != 2 {
+			t.Errorf("observer Failure calls = %d, want 2 (the running and the parked task)", got)
 		}
-		if got := lgPanicRecords(logs, "lg: OnErr boom"); got < 2 {
-			t.Errorf("logged OnErr panics = %d, want at least 2", got)
+		if got := lgPanicRecords(logs, "lg: observer boom"); got != 1 {
+			t.Errorf("logged observer panics = %d, want 1 (logged once per observer and method)", got)
 		}
 
 		// A leaked in-flight count would make this wait the whole minute.
@@ -961,24 +994,21 @@ func TestLocalBus_ParkedTaskOnErrPanicRecovered(t *testing.T) {
 }
 
 // TestLocalBus_SyncReportPanicDoesNotLeak pins CR-01 (D-04, D-10): a panicking
-// OnErr on a report made by the Emit caller goroutine is recovered and logged,
+// observer on a report made by the Emit caller goroutine is recovered and logged,
 // Emit returns normally and the in-flight count is released.
 func TestLocalBus_SyncReportPanicDoesNotLeak(t *testing.T) {
 	const boom = "lg: report boom"
 
 	// build returns a bus with one slot and one queue place whose handler "h"
-	// blocks on gate; its OnErr counts and panics.
-	build := func(t *testing.T, policy event.OverflowPolicy, onErr *atomic.Int32) (*event.LocalBus, chan struct{}) {
+	// blocks on gate; its observer counts and panics.
+	build := func(t *testing.T, policy event.OverflowPolicy, obs *lgPanicObserver) (*event.LocalBus, chan struct{}) {
 		t.Helper()
 		gate := make(chan struct{})
 		bus := event.NewLocalBus(event.LocalBusOptions{
 			MaxConcurrent: 1,
 			QueueSize:     1,
 			Overflow:      policy,
-			OnErr: func(context.Context, event.Event, error, string) {
-				onErr.Add(1)
-				panic(boom)
-			},
+			Observer:      obs,
 		})
 		if err := bus.Subscribe(context.Background(), "lr.evt", func(context.Context, event.Event) error {
 			<-gate
@@ -992,17 +1022,17 @@ func TestLocalBus_SyncReportPanicDoesNotLeak(t *testing.T) {
 	t.Run("drop", func(t *testing.T) {
 		logs := lrInstallLogs(t)
 		synctest.Test(t, func(t *testing.T) {
-			var onErr atomic.Int32
-			bus, gate := build(t, event.OverflowDrop, &onErr)
+			obs := &lgPanicObserver{value: boom}
+			bus, gate := build(t, event.OverflowDrop, obs)
 
 			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-1"))
 			synctest.Wait()
 			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-2"))
 			synctest.Wait()
-			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-3")) // dropped, OnErr panics
+			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-3")) // dropped, the observer panics
 
-			if got := onErr.Load(); got != 1 {
-				t.Errorf("OnErr calls = %d, want 1", got)
+			if got := obs.calls.Load(); got != 1 {
+				t.Errorf("observer Failure calls = %d, want 1", got)
 			}
 			if got := lgPanicRecords(logs, boom); got != 1 {
 				t.Errorf("logged report panics = %d, want 1", got)
@@ -1019,8 +1049,8 @@ func TestLocalBus_SyncReportPanicDoesNotLeak(t *testing.T) {
 	t.Run("block", func(t *testing.T) {
 		logs := lrInstallLogs(t)
 		synctest.Test(t, func(t *testing.T) {
-			var onErr atomic.Int32
-			bus, gate := build(t, event.OverflowBlock, &onErr)
+			obs := &lgPanicObserver{value: boom}
+			bus, gate := build(t, event.OverflowBlock, obs)
 
 			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-1"))
 			synctest.Wait()
@@ -1030,13 +1060,13 @@ func TestLocalBus_SyncReportPanicDoesNotLeak(t *testing.T) {
 			emitCtx, cancelEmit := context.WithTimeout(context.Background(), time.Second)
 			defer cancelEmit()
 			start := time.Now()
-			bus.Emit(emitCtx, &lrEvent{}, event.WithID("lg-3")) // waits 1s, dropped, OnErr panics
+			bus.Emit(emitCtx, &lrEvent{}, event.WithID("lg-3")) // waits 1s, dropped, the observer panics
 			if got := time.Since(start); got != time.Second {
 				t.Errorf("Emit took %v of fake time, want 1s", got)
 			}
 
-			if got := onErr.Load(); got != 1 {
-				t.Errorf("OnErr calls = %d, want 1", got)
+			if got := obs.calls.Load(); got != 1 {
+				t.Errorf("observer Failure calls = %d, want 1", got)
 			}
 			if got := lgPanicRecords(logs, boom); got != 1 {
 				t.Errorf("logged report panics = %d, want 1", got)
@@ -1053,13 +1083,8 @@ func TestLocalBus_SyncReportPanicDoesNotLeak(t *testing.T) {
 	t.Run("rejected", func(t *testing.T) {
 		logs := lrInstallLogs(t)
 		synctest.Test(t, func(t *testing.T) {
-			var onErr atomic.Int32
-			bus := event.NewLocalBus(event.LocalBusOptions{
-				OnErr: func(context.Context, event.Event, error, string) {
-					onErr.Add(1)
-					panic(boom)
-				},
-			})
+			obs := &lgPanicObserver{value: boom}
+			bus := event.NewLocalBus(event.LocalBusOptions{Observer: obs})
 			if err := bus.Subscribe(context.Background(), "lr.evt",
 				func(context.Context, event.Event) error { return nil },
 				event.WithHandlerName("h")); err != nil {
@@ -1069,10 +1094,10 @@ func TestLocalBus_SyncReportPanicDoesNotLeak(t *testing.T) {
 				t.Fatalf("Shutdown = %v, want nil", err)
 			}
 
-			bus.Emit(context.Background(), &lrEvent{}) // rejected, OnErr panics
+			bus.Emit(context.Background(), &lrEvent{}) // rejected, the observer panics
 
-			if got := onErr.Load(); got != 1 {
-				t.Errorf("OnErr calls = %d, want 1", got)
+			if got := obs.calls.Load(); got != 1 {
+				t.Errorf("observer Failure calls = %d, want 1", got)
 			}
 			if got := lgPanicRecords(logs, boom); got != 1 {
 				t.Errorf("logged report panics = %d, want 1", got)

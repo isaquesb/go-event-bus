@@ -60,19 +60,13 @@ func TestInvokeHandler_PanicDeadLetteredWithReasonPanic(t *testing.T) {
 	}
 
 	dlq := event.NewMemoryDLQ()
-	var mu sync.Mutex
-	var busErrs []error
-	s := event.Settle(ctx, event.SettleInput{
+	rec := &obsRecorder{}
+	s := event.Settle(event.WithObserver(ctx, rec), event.SettleInput{
 		SubscriptionCtx: context.Background(),
 		Evt:             evt,
 		Handler:         "h",
 		Err:             err,
 		Publisher:       dlq,
-		OnErr: func(_ context.Context, _ event.Event, e error, _ string) {
-			mu.Lock()
-			defer mu.Unlock()
-			busErrs = append(busErrs, e)
-		},
 	})
 	if s.Disposition != event.DispositionTerminal {
 		t.Errorf("Disposition = %v, want terminal", s.Disposition)
@@ -96,13 +90,12 @@ func TestInvokeHandler_PanicDeadLetteredWithReasonPanic(t *testing.T) {
 		t.Errorf("panic stack header length = %d, want 1..1024", len(stack))
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(busErrs) != 1 {
-		t.Fatalf("bus OnErr calls = %d, want 1", len(busErrs))
+	failures := rec.Failures()
+	if len(failures) != 1 {
+		t.Fatalf("observer failures = %d, want 1", len(failures))
 	}
-	if !errors.Is(busErrs[0], event.ErrDeadLettered) || !errors.Is(busErrs[0], event.ErrHandlerPanic) {
-		t.Errorf("bus OnErr error = %v, want ErrDeadLettered and ErrHandlerPanic", busErrs[0])
+	if !errors.Is(failures[0].Cause, event.ErrDeadLettered) || !errors.Is(failures[0].Cause, event.ErrHandlerPanic) {
+		t.Errorf("observer failure cause = %v, want ErrDeadLettered and ErrHandlerPanic", failures[0].Cause)
 	}
 	if n := evt.onErrCalls(); n != 1 {
 		t.Errorf("event OnErr calls = %d, want 1", n)

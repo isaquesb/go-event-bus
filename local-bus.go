@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -20,8 +19,8 @@ const DefaultQueueSize = 1024
 // ErrQueueFull is reported, never returned, when an external emit finds no free
 // execution slot and no queue room (OverflowDrop), or when the emitter context
 // expired while it waited for queue room (OverflowBlock). The event is dropped
-// for that handler and the drop is reported once through the bus OnErr, the
-// event's own OnErr and an Error-level slog record.
+// for that handler and the drop is reported once, through Observer.Failure and
+// the event's own OnErr method.
 var ErrQueueFull = errors.New("event: queue full")
 
 // OverflowPolicy selects what LocalBus does with an external emit when every
@@ -72,7 +71,15 @@ func (p *passthroughInvoker) Invoke(
 
 type LocalBusOptions struct {
 	Invoker Invoker
-	OnErr   func(ctx context.Context, evt Event, err error, handler string)
+
+	// Observer receives every failure and resilience signal of the bus, in
+	// particular Observer.Failure, the OnFailure hook: once per terminal outcome
+	// of a message, with the attempt count, delivery, failing invoker, breaker
+	// state and outcome. It is configured here once and installed in every
+	// handler context. nil means NewSlogObserver(nil), so failures are never
+	// silent with zero configuration; NopObserver{} silences everything. The bus
+	// wraps the observer with MultiObserver, which isolates its panics.
+	Observer Observer
 
 	// MaxConcurrent is the number of async handlers that run at once. Values at
 	// or below 0 mean DefaultMaxConcurrent.
@@ -147,9 +154,12 @@ func NewLocalBus(opts LocalBusOptions) *LocalBus {
 	if opts.Invoker == nil {
 		opts.Invoker = &passthroughInvoker{}
 	}
+	if opts.Observer == nil {
+		opts.Observer = NewSlogObserver(nil)
+	}
 	return &LocalBus{
 		handlers:        make(map[string][]*namedHandle),
-		onErr:           opts.OnErr,
+		observer:        MultiObserver(opts.Observer),
 		dlq:             opts.DLQPublisher,
 		invoker:         opts.Invoker,
 		exec:            make(chan struct{}, opts.MaxConcurrent),
@@ -169,7 +179,7 @@ func NewLocalBus(opts LocalBusOptions) *LocalBus {
 type LocalBus struct {
 	mu              sync.RWMutex
 	handlers        map[string][]*namedHandle
-	onErr           func(ctx context.Context, evt Event, err error, handler string)
+	observer        Observer
 	dlq             DLQPublisher
 	invoker         Invoker
 	exec            chan struct{}
@@ -257,7 +267,7 @@ func (b *LocalBus) Close() error {
 
 // Emit dispatches e to every handler subscribed to its subject and returns
 // without waiting for them. It has no error return: a drop or a rejection is
-// reported through the bus OnErr, the event's OnErr and slog, never lost.
+// reported through Observer.Failure and the event's OnErr method, never lost.
 //
 // Async handlers run under a handler ctx that:
 //
@@ -278,7 +288,7 @@ func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 	cfg.IDGenerator = b.idGen
 	cfg.InheritHeaders = b.inherit
 	md := ResolveOutbound(ctx, e, cfg)
-	ctx = WithMetadata(ctx, md)
+	ctx = WithObserver(WithMetadata(ctx, md), b.observer)
 
 	hList := b.snapshot(cfg.Subject)
 	if len(hList) == 0 {
@@ -287,7 +297,7 @@ func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 
 	release, err := b.life.Admit(ctx)
 	if err != nil {
-		b.guardReport(ctx, e, "", func() { b.reject(ctx, cfg.Subject, e, err) })
+		b.guardReport(ctx, cfg.Subject, "", func() { b.reject(ctx, cfg.Subject, e, err) })
 		return
 	}
 	defer release()
@@ -321,7 +331,7 @@ func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) (E
 	cfg.IDGenerator = b.idGen
 	cfg.InheritHeaders = b.inherit
 	md := ResolveOutbound(ctx, e, cfg)
-	ctx = WithMetadata(ctx, md)
+	ctx = WithObserver(WithMetadata(ctx, md), b.observer)
 
 	hList := b.snapshot(cfg.Subject)
 	if len(hList) == 0 {
@@ -364,12 +374,12 @@ func (b *LocalBus) snapshot(subject string) []*namedHandle {
 // and every synchronous drop branch releases its Track count from a defer, so a
 // panicking or exiting reporter cannot leak the in-flight count. The parked
 // goroutine owns its release through a defer as well and recovers like runTask,
-// so a panicking OnErr during a shutdown interruption cannot crash the process
-// or block a later Shutdown.
+// so a panicking reporter during a shutdown interruption cannot crash the
+// process or block a later Shutdown.
 func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h *namedHandle) {
 	release, ok := b.life.Track()
 	if !ok {
-		b.guardReport(ctx, e, h.Name, func() { b.interrupted(ctx, subject, e, h.Name) })
+		b.guardReport(ctx, subject, h.Name, func() { b.interrupted(ctx, subject, e, h.Name) })
 		return
 	}
 
@@ -395,7 +405,7 @@ func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h
 			parked = true
 		default:
 			defer release()
-			b.guardReport(ctx, e, h.Name, func() { b.dropQueueFull(ctx, subject, e, h.Name) })
+			b.guardReport(ctx, subject, h.Name, func() { b.dropQueueFull(ctx, subject, e, h.Name) })
 			return
 		}
 	case OverflowBlock:
@@ -410,11 +420,11 @@ func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h
 				parked = true
 			case <-ctx.Done():
 				defer release()
-				b.guardReport(ctx, e, h.Name, func() { b.dropQueueFull(ctx, subject, e, h.Name) })
+				b.guardReport(ctx, subject, h.Name, func() { b.dropQueueFull(ctx, subject, e, h.Name) })
 				return
 			case <-b.life.Context().Done():
 				defer release()
-				b.guardReport(ctx, e, h.Name, func() { b.interrupted(ctx, subject, e, h.Name) })
+				b.guardReport(ctx, subject, h.Name, func() { b.interrupted(ctx, subject, e, h.Name) })
 				return
 			}
 		}
@@ -426,12 +436,7 @@ func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h
 		defer release()
 		defer func() {
 			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "event: panic in LocalBus parked task",
-					"handler", h.Name,
-					"event", safeEventName(e),
-					"panic", fmt.Sprint(r),
-					"stack", string(debug.Stack()),
-				)
+				b.reportPanic(ctx, subject, h.Name, r)
 			}
 		}()
 		select {
@@ -456,27 +461,35 @@ func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h
 
 // guardReport runs a report made on the Emit caller goroutine (the Admit
 // rejection, the refused Track, a queue-full drop and a bus-ctx interruption)
-// under a recover. The report reaches user code (the bus OnErr, the event's
+// under a recover. The report reaches user code (the observer, the event's
 // OnErr hook), and a panic there must neither unwind through Emit, which would
 // skip the remaining handlers of the same emit, nor leak accounting. The panic
-// is logged instead, consistent with runTask.
-func (b *LocalBus) guardReport(ctx context.Context, e Event, handler string, report func()) {
+// is reported as an InternalError instead, consistent with runTask.
+func (b *LocalBus) guardReport(ctx context.Context, subject, handler string, report func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.ErrorContext(ctx, "event: panic in LocalBus report",
-				"handler", handler,
-				"event", safeEventName(e),
-				"panic", fmt.Sprint(r),
-				"stack", string(debug.Stack()),
-			)
+			b.reportPanic(ctx, subject, handler, r)
 		}
 	}()
 	report()
 }
 
+// reportPanic reports a panic recovered by a task-level or report-level guard as
+// an InternalError of the transport. It must be called from the deferred
+// function that recovered r. The bus observer isolates its own panics.
+func (b *LocalBus) reportPanic(ctx context.Context, subject, handler string, r any) {
+	b.observer.InternalError(ctx, InternalErrorInfo{
+		Component: ComponentTransport,
+		Op:        OpPanic,
+		Handler:   handler,
+		Subject:   subject,
+		Err:       recoveredPanic(r),
+	})
+}
+
 // runTask runs one handler and releases its accounting. The recover guards the
-// code InvokeHandler does not (OnErr, Settle, DLQ publishers); handler and
-// invoker panics are already converted to errors by InvokeHandler.
+// code InvokeHandler does not (Settle, DLQ publishers); handler, invoker,
+// observer and event OnErr panics are already isolated or converted.
 func (b *LocalBus) runTask(
 	ctx context.Context,
 	subject string,
@@ -491,12 +504,7 @@ func (b *LocalBus) runTask(
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			slog.ErrorContext(ctx, "event: panic in LocalBus task",
-				"handler", h.Name,
-				"event", safeEventName(e),
-				"panic", fmt.Sprint(r),
-				"stack", string(debug.Stack()),
-			)
+			b.reportPanic(ctx, subject, h.Name, r)
 		}
 	}()
 	_ = b.execute(ctx, subject, e, h, true)
@@ -526,6 +534,10 @@ func (b *LocalBus) execute(
 	// LocalBus never redelivers, so every delivery is the final one.
 	hctx = WithDelivery(hctx, Delivery{Count: 1, Max: 1, Subject: subject})
 	hctx = WithExecution(hctx, Execution{Handler: h.Name, StartedAt: time.Now()})
+	// The bus observer overwrites one inherited from another bus (a nested emit
+	// made with a handler ctx), and every delivery gets its own FailureScope.
+	hctx = WithObserver(hctx, b.observer)
+	hctx, _ = WithFailureScope(hctx)
 
 	err := InvokeHandler(hctx, b.invoker, e, h.Name, func(c context.Context) error {
 		return h.Fn(c, e)
@@ -557,7 +569,6 @@ func (b *LocalBus) execute(
 		Handler:         h.Name,
 		Err:             err,
 		Publisher:       b.dlq,
-		OnErr:           b.onErr,
 	})
 	if s.Err != nil {
 		return s.Err
@@ -565,16 +576,24 @@ func (b *LocalBus) execute(
 	return err
 }
 
+// reportCtx prepares the context of a report made outside a handler execution:
+// a final first delivery on subject, the bus observer, which overwrites one
+// inherited from another bus, and a fresh FailureScope, so an inherited scope
+// of a parent handler is never consumed by this report.
+func (b *LocalBus) reportCtx(ctx context.Context, subject string) context.Context {
+	ctx = WithObserver(WithDelivery(ctx, Delivery{Count: 1, Max: 1, Subject: subject}), b.observer)
+	ctx, _ = WithFailureScope(ctx)
+	return ctx
+}
+
 // reject reports an emit refused before any handler ran.
 func (b *LocalBus) reject(ctx context.Context, subject string, e Event, err error) {
-	reportUnsettled(WithDelivery(ctx, Delivery{Count: 1, Max: 1, Subject: subject}),
-		SettleInput{Evt: e, OnErr: b.onErr}, OutcomeRejected, err)
+	reportUnsettled(b.reportCtx(ctx, subject), SettleInput{Evt: e}, OutcomeRejected, err)
 }
 
 // dropQueueFull reports a task dropped for lack of a slot and queue room.
 func (b *LocalBus) dropQueueFull(ctx context.Context, subject string, e Event, handler string) {
-	reportUnsettled(WithDelivery(ctx, Delivery{Count: 1, Max: 1, Subject: subject}),
-		SettleInput{Evt: e, Handler: handler, OnErr: b.onErr}, OutcomeDropped, ErrQueueFull)
+	reportUnsettled(b.reportCtx(ctx, subject), SettleInput{Evt: e, Handler: handler}, OutcomeDropped, ErrQueueFull)
 }
 
 // interrupted reports a task that never ran because the bus was shut down. When
@@ -586,12 +605,11 @@ func (b *LocalBus) interrupted(ctx context.Context, subject string, e Event, han
 		b.reject(ctx, subject, e, ErrBusClosed)
 		return
 	}
-	_ = Settle(WithDelivery(ctx, Delivery{Count: 1, Max: 1, Subject: subject}), SettleInput{
+	_ = Settle(b.reportCtx(ctx, subject), SettleInput{
 		SubscriptionCtx: bus,
 		Evt:             e,
 		Handler:         handler,
 		Err:             WrapInterrupted(bus, context.Canceled),
 		Publisher:       b.dlq,
-		OnErr:           b.onErr,
 	})
 }

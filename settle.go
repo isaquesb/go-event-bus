@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
+	"runtime/debug"
+	"slices"
+	"time"
 )
 
 // Disposition is what a transport does with a message after the handler chain
@@ -121,8 +123,6 @@ type SettleInput struct {
 	Err error
 	// Publisher is the per-bus DLQ publisher, nil when none is configured.
 	Publisher DLQPublisher
-	// OnErr is the bus OnErr callback, nil when none is configured.
-	OnErr func(ctx context.Context, evt Event, err error, handler string)
 }
 
 // Settlement is the decision Settle reached.
@@ -149,16 +149,34 @@ type Settlement struct {
 //     with outcome dead_lettered, failure is RetryDelayed and never Terminal,
 //     and no publisher is Terminal with outcome dropped.
 //
-// Every terminal outcome is logged with slog and reported once to in.OnErr
-// and to the event's own OnErr method. A decode failure has no event, so only
-// the bus callback runs. Phase 10 replaces this sink.
-func Settle(ctx context.Context, in SettleInput) Settlement {
+// Settle is the only place a terminal outcome is reported. Every terminal
+// outcome reaches Observer.Failure once (the OnFailure hook of OBS-03) and then
+// the event's own OnErr method; a decode failure has no event, so only the
+// observer runs. Settle never logs: SlogObserver turns the signals into log
+// records. A transport installs the Observer and a FailureScope on ctx
+// (WithObserver, WithFailureScope) before calling it; the scope is also what
+// makes the report exactly-once and lets Settle complete a deferred HandlerDone
+// signal with the settled outcome.
+func Settle(ctx context.Context, in SettleInput) (res Settlement) {
 	if in.Err == nil {
 		return Settlement{Disposition: DispositionAck}
 	}
+	scope, _ := FailureScopeFromContext(ctx)
+	defer func() { scope.flushHandlerDone(ctx, handlerDoneOutcome(res)) }()
+
 	d, ok := DeliveryFromContext(ctx)
 	if !ok {
 		d = Delivery{Count: 1, Max: 1}
+	}
+	if in.Evt == nil && isDecodeError(in.Err) {
+		ObserverFromContext(ctx).DecodeFailed(ctx, DecodeFailure{
+			Handler:  in.Handler,
+			Subject:  d.Subject,
+			Reason:   ReasonOf(in.Err),
+			Err:      in.Err,
+			Delivery: redactDelivery(d),
+			Final:    d.Final(),
+		})
 	}
 
 	if IsInterrupted(in.SubscriptionCtx, in.Err) {
@@ -181,18 +199,15 @@ func Settle(ctx context.Context, in SettleInput) Settlement {
 		return Settlement{Disposition: DispositionAck, Reason: reason, Outcome: OutcomeDeadLettered, Err: in.Err}
 
 	case DispositionRetryDelayed:
+		// A non-final retry is reported by the signals that already fired:
+		// DLQPublishFailed from PublishDeadLetter and DecodeFailed above.
 		s := Settlement{Disposition: DispositionRetryDelayed, Reason: reason}
-		switch {
-		case errors.Is(in.Err, ErrDeadLetterFailed):
+		if errors.Is(in.Err, ErrDeadLetterFailed) {
 			s.Err = in.Err
 			if d.Final() {
 				s.Outcome = OutcomeDLQPublishFailed
 				reportTerminal(ctx, in, d, s.Outcome, reason, in.Err)
-			} else {
-				logSettle(ctx, slog.LevelError, "event: dead-letter publish failed, will be redelivered", in, d, reason, in.Err)
 			}
-		case isDecodeError(in.Err):
-			logSettle(ctx, slog.LevelWarn, "event: decode failed, will be redelivered", in, d, reason, in.Err)
 		}
 		return s
 
@@ -208,8 +223,6 @@ func Settle(ctx context.Context, in SettleInput) Settlement {
 			if d.Final() {
 				s.Outcome = OutcomeDLQPublishFailed
 				reportTerminal(ctx, in, d, s.Outcome, reason, failed)
-			} else {
-				logSettle(ctx, slog.LevelError, "event: dead-letter publish failed, will be redelivered", in, d, reason, failed)
 			}
 			return s
 		}
@@ -219,22 +232,92 @@ func Settle(ctx context.Context, in SettleInput) Settlement {
 	}
 }
 
-// reportTerminal is the only place that reports a terminal outcome: one slog
-// record, then the bus OnErr callback, then the event's own OnErr method.
+// handlerDoneOutcome maps a settlement to the outcome of the HandlerDone signal
+// that InvokeHandler deferred: what really happened to the message. A zero
+// Settlement, which is what a panicking Settle leaves behind, is failed.
+func handlerDoneOutcome(s Settlement) Outcome {
+	switch s.Disposition {
+	case DispositionAck:
+		if s.Outcome == OutcomeDeadLettered {
+			return OutcomeDeadLettered
+		}
+	case DispositionTerminal:
+		switch s.Outcome {
+		case OutcomeDeadLettered:
+			return OutcomeDeadLettered
+		case OutcomeDropped:
+			return OutcomeDropped
+		}
+	case DispositionRetryDelayed:
+		if s.Outcome != OutcomeDLQPublishFailed {
+			return OutcomeRetry
+		}
+	case DispositionRetry:
+		return OutcomeInterrupted
+	}
+	return OutcomeFailed
+}
+
+// reportTerminal is the only place that reports a terminal outcome: one
+// Observer.Failure call, then the event's own OnErr method. A FailureScope in
+// ctx makes it exactly-once per delivery, even when two code paths report.
 func reportTerminal(ctx context.Context, in SettleInput, d Delivery, outcome Outcome, reason string, err error) {
-	level := slog.LevelError
-	if outcome == OutcomeDeadLettered || outcome == OutcomeRejected {
-		level = slog.LevelWarn
+	scope, _ := FailureScopeFromContext(ctx)
+	if !scope.markReported() {
+		return
 	}
-	logSettle(ctx, level, "event: terminal outcome", in, d, reason, err, slog.String("outcome", string(outcome)))
-	if in.OnErr != nil {
-		in.OnErr(ctx, in.Evt, err, in.Handler)
+	if outcome != OutcomeDLQPublishFailed && in.Evt == nil && isDecodeError(err) {
+		outcome = OutcomeDecodeFailed
 	}
+	// The invoker is read from the error the chain returned, not from the
+	// DeadLetteredError or DeadLetterFailedError that Settle wraps around it for
+	// its own backstop publish: that failure belongs to the transport.
+	origin := in.Err
+	if origin == nil {
+		origin = err
+	}
+	fc := FailureContext{
+		Handler:  in.Handler,
+		Event:    in.Evt,
+		Outcome:  outcome,
+		Reason:   reason,
+		Cause:    err,
+		Invoker:  FailingInvokerOf(origin),
+		Attempts: AttemptsOf(err),
+		Delivery: redactDelivery(d),
+		Breaker:  scope.Breaker(),
+		At:       time.Now().UTC(),
+	}
+	if md, ok := MetadataFromContext(ctx); ok {
+		fc.Metadata = md
+	}
+	var fe *FailureError
+	if errors.As(err, &fe) && len(fe.History) > 0 {
+		fc.History = slices.Clone(fe.History)
+	}
+	ObserverFromContext(ctx).Failure(ctx, fc)
 	if in.Evt != nil {
 		if h, ok := in.Evt.(OnErr); ok {
-			h.OnErr(ctx, err, in.Handler)
+			callEventOnErr(ctx, h, in.Handler, d.Subject, err)
 		}
 	}
+}
+
+// callEventOnErr runs the event's own OnErr method. A panic there is reported as
+// an InternalError and never reaches the transport goroutine.
+func callEventOnErr(ctx context.Context, h OnErr, handler, subject string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			ObserverFromContext(ctx).InternalError(ctx, InternalErrorInfo{
+				Component: ComponentEvent,
+				Op:        OpPanic,
+				Handler:   handler,
+				Subject:   subject,
+				Err:       recoveredPanic(r),
+			})
+		}
+	}()
+	h.OnErr(ctx, err, handler)
 }
 
 // reportUnsettled reports a drop or a rejection that never reached a handler,
@@ -248,24 +331,9 @@ func reportUnsettled(ctx context.Context, in SettleInput, outcome Outcome, err e
 	reportTerminal(ctx, in, d, outcome, ReasonOf(err), err)
 }
 
-// logSettle writes one structured record. It never includes the payload.
-func logSettle(ctx context.Context, level slog.Level, msg string, in SettleInput, d Delivery, reason string, err error, extra ...slog.Attr) {
-	attrs := append(make([]slog.Attr, 0, 9+len(extra)), extra...)
-	attrs = append(attrs,
-		slog.String("reason", reason),
-		slog.String("handler", in.Handler),
-		slog.String("subject", d.Subject),
-		slog.Int("delivery_count", d.Count),
-		slog.Int("max_deliver", d.Max),
-	)
-	if in.Evt != nil {
-		attrs = append(attrs, slog.String("event", in.Evt.Name()))
-	}
-	if md, ok := MetadataFromContext(ctx); ok {
-		attrs = append(attrs, slog.String("event_id", md.ID))
-	}
-	if err != nil {
-		attrs = append(attrs, slog.String("error", err.Error()))
-	}
-	slog.LogAttrs(ctx, level, msg, attrs...)
+// recoveredPanic wraps a recovered panic value and the current stack. It must be
+// called from the deferred function that recovered r, so the stack still holds
+// the panicking frames.
+func recoveredPanic(r any) *PanicError {
+	return &PanicError{Value: r, Stack: debug.Stack()}
 }

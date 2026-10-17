@@ -3,7 +3,6 @@ package event_test
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,28 +27,29 @@ type lfPermanent struct{}
 func (lfPermanent) Error() string  { return "lf: permanent failure" }
 func (lfPermanent) Terminal() bool { return true }
 
-// lfErrCapture records the bus OnErr calls.
+// lfErrCapture is the bus Observer of these tests: an obsRecorder that also
+// signals every Failure on done.
 type lfErrCapture struct {
-	mu   sync.Mutex
-	errs []error
+	*obsRecorder
 	done chan struct{}
 }
 
 func newLfErrCapture() *lfErrCapture {
-	return &lfErrCapture{done: make(chan struct{}, 16)}
+	return &lfErrCapture{obsRecorder: &obsRecorder{}, done: make(chan struct{}, 16)}
 }
 
-func (c *lfErrCapture) fn(_ context.Context, _ event.Event, err error, _ string) {
-	c.mu.Lock()
-	c.errs = append(c.errs, err)
-	c.mu.Unlock()
+func (c *lfErrCapture) Failure(ctx context.Context, f event.FailureContext) {
+	c.obsRecorder.Failure(ctx, f)
 	c.done <- struct{}{}
 }
 
+// all returns the Cause of every recorded Failure.
 func (c *lfErrCapture) all() []error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]error(nil), c.errs...)
+	var out []error
+	for _, f := range c.Failures() {
+		out = append(out, f.Cause)
+	}
+	return out
 }
 
 func TestLocalBus_DeadLettersTerminalFailure(t *testing.T) {
@@ -58,7 +58,7 @@ func TestLocalBus_DeadLettersTerminalFailure(t *testing.T) {
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:      &passthroughInvoker{},
 		DLQPublisher: dlq,
-		OnErr:        capture.fn,
+		Observer:     capture,
 	})
 
 	cause := lfPermanent{}
@@ -103,13 +103,16 @@ func TestLocalBus_DeadLettersTerminalFailure(t *testing.T) {
 
 	errs := capture.all()
 	if len(errs) != 1 {
-		t.Fatalf("bus OnErr calls = %d, want 1", len(errs))
+		t.Fatalf("observer Failure calls = %d, want 1", len(errs))
 	}
 	if !errors.Is(errs[0], event.ErrDeadLettered) {
-		t.Errorf("bus OnErr err = %v, want ErrDeadLettered", errs[0])
+		t.Errorf("observer Failure cause = %v, want ErrDeadLettered", errs[0])
 	}
 	if !errors.Is(errs[0], cause) {
-		t.Errorf("bus OnErr err = %v, want to wrap the handler error", errs[0])
+		t.Errorf("observer Failure cause = %v, want to wrap the handler error", errs[0])
+	}
+	if f := capture.Failures()[0]; f.Handler != "h" || f.Event != event.Event(evt) {
+		t.Errorf("Failure handler %q event %v, want h and the emitted event", f.Handler, f.Event)
 	}
 	if got := evt.onErr.Load(); got != 1 {
 		t.Errorf("event OnErr calls = %d, want 1", got)
@@ -190,8 +193,8 @@ func TestLocalBus_HandlerCtxCarriesDelivery(t *testing.T) {
 func TestLocalBus_DroppedKeepsErrorIdentity(t *testing.T) {
 	capture := newLfErrCapture()
 	bus := event.NewLocalBus(event.LocalBusOptions{
-		Invoker: &passthroughInvoker{},
-		OnErr:   capture.fn,
+		Invoker:  &passthroughInvoker{},
+		Observer: capture,
 	})
 
 	boom := errors.New("lf: boom")
@@ -211,10 +214,10 @@ func TestLocalBus_DroppedKeepsErrorIdentity(t *testing.T) {
 
 	errs := capture.all()
 	if len(errs) != 1 {
-		t.Fatalf("bus OnErr calls = %d, want 1", len(errs))
+		t.Fatalf("observer Failure calls = %d, want 1", len(errs))
 	}
 	if errs[0] != boom {
-		t.Errorf("bus OnErr err = %v, want the identical handler error value", errs[0])
+		t.Errorf("observer Failure cause = %v, want the identical handler error value", errs[0])
 	}
 	if got := evt.onErr.Load(); got != 1 {
 		t.Errorf("event OnErr calls = %d, want 1", got)
@@ -228,7 +231,7 @@ func TestLocalBus_ChainDeadLetteredNotRepublished(t *testing.T) {
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:      &lfInvoker{err: chainErr},
 		DLQPublisher: dlq,
-		OnErr:        capture.fn,
+		Observer:     capture,
 	})
 	lfSubscribeNoop(t, bus, "orders.created")
 
@@ -241,10 +244,10 @@ func TestLocalBus_ChainDeadLetteredNotRepublished(t *testing.T) {
 	}
 	errs := capture.all()
 	if len(errs) != 1 {
-		t.Fatalf("bus OnErr calls = %d, want 1", len(errs))
+		t.Fatalf("observer Failure calls = %d, want 1", len(errs))
 	}
 	if !errors.Is(errs[0], event.ErrDeadLettered) {
-		t.Errorf("bus OnErr err = %v, want ErrDeadLettered", errs[0])
+		t.Errorf("observer Failure cause = %v, want ErrDeadLettered", errs[0])
 	}
 }
 
@@ -254,7 +257,7 @@ func TestLocalBus_DeadLetterFailedReported(t *testing.T) {
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:      &lfInvoker{err: lfPermanent{}},
 		DLQPublisher: pub,
-		OnErr:        capture.fn,
+		Observer:     capture,
 	})
 	lfSubscribeNoop(t, bus, "orders.created")
 
@@ -269,10 +272,10 @@ func TestLocalBus_DeadLetterFailedReported(t *testing.T) {
 	}
 	errs := capture.all()
 	if len(errs) != 1 {
-		t.Fatalf("bus OnErr calls = %d, want 1", len(errs))
+		t.Fatalf("observer Failure calls = %d, want 1", len(errs))
 	}
 	if !errors.Is(errs[0], event.ErrDeadLetterFailed) {
-		t.Errorf("bus OnErr err = %v, want ErrDeadLetterFailed", errs[0])
+		t.Errorf("observer Failure cause = %v, want ErrDeadLetterFailed", errs[0])
 	}
 }
 
@@ -282,7 +285,7 @@ func TestLocalBus_DuplicateNotReported(t *testing.T) {
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:      &lfInvoker{err: event.ErrDuplicate},
 		DLQPublisher: dlq,
-		OnErr:        capture.fn,
+		Observer:     capture,
 	})
 	lfSubscribeNoop(t, bus, "orders.created")
 
@@ -292,7 +295,7 @@ func TestLocalBus_DuplicateNotReported(t *testing.T) {
 	}
 
 	if got := len(capture.all()); got != 0 {
-		t.Errorf("bus OnErr calls = %d, want 0 for a duplicate", got)
+		t.Errorf("observer Failure calls = %d, want 0 for a duplicate", got)
 	}
 	if got := evt.onErr.Load(); got != 0 {
 		t.Errorf("event OnErr calls = %d, want 0 for a duplicate", got)
@@ -308,7 +311,7 @@ func TestLocalBus_InterruptedNeverDeadLettered(t *testing.T) {
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:      &passthroughInvoker{},
 		DLQPublisher: dlq,
-		OnErr:        capture.fn,
+		Observer:     capture,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -334,10 +337,10 @@ func TestLocalBus_InterruptedNeverDeadLettered(t *testing.T) {
 	}
 	errs := capture.all()
 	if len(errs) != 1 {
-		t.Fatalf("bus OnErr calls = %d, want 1", len(errs))
+		t.Fatalf("observer Failure calls = %d, want 1", len(errs))
 	}
 	if !errors.Is(errs[0], context.Canceled) {
-		t.Errorf("bus OnErr err = %v, want context.Canceled", errs[0])
+		t.Errorf("observer Failure cause = %v, want context.Canceled", errs[0])
 	}
 }
 
@@ -347,7 +350,7 @@ func TestLocalBus_InProgressDeadLettered(t *testing.T) {
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:      &lfInvoker{err: event.ErrInProgress},
 		DLQPublisher: dlq,
-		OnErr:        capture.fn,
+		Observer:     capture,
 	})
 	lfSubscribeNoop(t, bus, "orders.created")
 
@@ -366,7 +369,7 @@ func TestLocalBus_InProgressDeadLettered(t *testing.T) {
 		t.Errorf("Attempts = %d, want 0 (the handler never ran)", recs[0].Attempts)
 	}
 	if got := len(capture.all()); got != 1 {
-		t.Errorf("bus OnErr calls = %d, want 1", got)
+		t.Errorf("observer Failure calls = %d, want 1", got)
 	}
 }
 
@@ -376,7 +379,7 @@ func TestLocalBus_AsyncEmitDeadLetters(t *testing.T) {
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:      &passthroughInvoker{},
 		DLQPublisher: dlq,
-		OnErr:        capture.fn,
+		Observer:     capture,
 	})
 	if err := bus.Subscribe(context.Background(), "orders.created",
 		func(context.Context, event.Event) error { return lfPermanent{} },
