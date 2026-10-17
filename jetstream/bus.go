@@ -614,7 +614,8 @@ func (b *Bus) delivery(msg jetstream.Msg, policy deliveryPolicy) event.Delivery 
 // reported is instead reported through the bus OnErr (nil event,
 // *event.PanicError) and ended with TermWithReason, because the server would not
 // redeliver it. The recover never dead-letters and never calls the reason-less
-// Term.
+// Term. Its broker action happens while the message is still counted in flight,
+// so Shutdown does not return before it.
 func (b *Bus) msgHandler(
 	ctx context.Context,
 	handlerName string,
@@ -624,10 +625,16 @@ func (b *Bus) msgHandler(
 	return func(msg jetstream.Msg) {
 		// acted is set immediately before every broker action, so the recover
 		// below never acts on a message twice. guard records whether Settle got
-		// past the point of no return. The recover is registered before Track,
-		// so the deferred release and stop run first while it unwinds.
+		// past the point of no return. Track comes first and the recover is
+		// registered after the deferred release, so the recover runs first on
+		// unwinding: its single broker action goes out while the message is still
+		// counted in flight and Shutdown cannot return before it (G-09-2).
 		acted := false
 		guard := &settleGuard{}
+		release, ok := b.life.Track()
+		if ok {
+			defer release()
+		}
 		defer func() {
 			r := recover()
 			if r == nil {
@@ -668,18 +675,11 @@ func (b *Bus) msgHandler(
 			}
 		}()
 
-		if b.life.Closing() {
+		if !ok || b.life.Closing() {
 			acted = true
 			b.handBack(ctx, msg, handlerName, policy)
 			return
 		}
-		release, ok := b.life.Track()
-		if !ok {
-			acted = true
-			b.handBack(ctx, msg, handlerName, policy)
-			return
-		}
-		defer release()
 
 		// hctx keeps the Subscribe ctx values and cancellation and is also
 		// cancelled, with cause ErrShutdownInterrupted, when Shutdown gives up.

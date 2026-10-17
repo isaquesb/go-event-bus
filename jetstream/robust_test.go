@@ -864,6 +864,126 @@ func TestJetStreamBus_CallbackPanicAfterSettleTermed(t *testing.T) {
 	}
 }
 
+// wrGatedMsg is an mdMsg whose NakWithDelay and TermWithReason announce
+// themselves on entered, then block on gate before they are recorded.
+type wrGatedMsg struct {
+	*mdMsg
+	entered chan struct{}
+	once    sync.Once
+	gate    *rbGate
+}
+
+func newWrGatedMsg(payload []byte, delivered uint64) *wrGatedMsg {
+	return &wrGatedMsg{
+		mdMsg:   &mdMsg{data: payload, numDelivered: delivered},
+		entered: make(chan struct{}),
+		gate:    newRbGate(),
+	}
+}
+
+func (m *wrGatedMsg) enter() {
+	m.once.Do(func() { close(m.entered) })
+	<-m.gate.ch
+}
+
+func (m *wrGatedMsg) NakWithDelay(d time.Duration) error {
+	m.enter()
+	return m.mdMsg.NakWithDelay(d)
+}
+
+func (m *wrGatedMsg) TermWithReason(reason string) error {
+	m.enter()
+	return m.mdMsg.TermWithReason(reason)
+}
+
+// TestJetStreamBus_RecoverActsBeforeShutdownReturns covers G-09-2 on JetStream:
+// the recover's broker action runs while the message is still counted in
+// flight, so Shutdown does not return before it.
+func TestJetStreamBus_RecoverActsBeforeShutdownReturns(t *testing.T) {
+	for _, row := range []struct {
+		name          string
+		delivered     uint64
+		wantNakDelays []time.Duration
+		wantTerms     []string
+		wantOnErr     int
+	}{
+		{"non-final: NakWithDelay", 1, []time.Duration{time.Second}, nil, 0},
+		{"final: OnErr and TermWithReason", 3, nil, []string{termReasonPanicOnFinal}, 1},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			logs := wrInstallLogs(t)
+			synctest.Test(t, func(t *testing.T) {
+				errs := &rbErrs{}
+				handlerGate := newRbGate()
+				defer handlerGate.open()
+				started := make(chan struct{}, 1)
+				bus, cons, _, payload := rbShutdownBus(t, BusOptions{DLQPublisher: wrPanicDLQ{}, OnErr: errs.onErr},
+					func(context.Context, event.Event) error {
+						started <- struct{}{}
+						<-handlerGate.ch
+						return dispPermanent{}
+					})
+				defer cons.cc.finish()
+
+				msg := newWrGatedMsg(payload, row.delivered)
+				defer msg.gate.open()
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					cons.handler(msg)
+				}()
+				synctest.Wait()
+				<-started
+
+				res := rbShutdown(bus, context.Background())
+				synctest.Wait()
+				cons.cc.finish()
+				synctest.Wait()
+				select {
+				case err := <-res:
+					t.Fatalf("Shutdown returned %v while a handler was in flight", err)
+				default:
+				}
+
+				handlerGate.open()
+				<-msg.entered
+				synctest.Wait()
+				select {
+				case err := <-res:
+					t.Fatalf("Shutdown returned %v before the recover's broker action went out", err)
+				default:
+				}
+				if _, stops := cons.cc.counts(); stops != 0 {
+					t.Errorf("Stop calls = %d before the recover acted, want 0", stops)
+				}
+				if _, errList := errs.snapshot(); len(errList) != row.wantOnErr {
+					t.Errorf("OnErr calls = %d while the action is pending, want %d", len(errList), row.wantOnErr)
+				}
+
+				msg.gate.open()
+				<-done
+				if err := <-res; err != nil {
+					t.Errorf("Shutdown = %v, want nil", err)
+				}
+
+				got := msg.snapshot()
+				if !slices.Equal(got.nakDelays, row.wantNakDelays) || !slices.Equal(got.termReasons, row.wantTerms) {
+					t.Errorf("snapshot = %+v, want nakDelays %v and termReasons %q", got, row.wantNakDelays, row.wantTerms)
+				}
+				if got.naks != 0 || got.acks != 0 || got.plainTerms != 0 {
+					t.Errorf("snapshot = %+v, want no plain Nak, Ack or Term", got)
+				}
+				if p, ok := logs.panicAt(); !ok || p != "wr: dlq boom" {
+					t.Errorf("panic record = %q (found %v), want wr: dlq boom", p, ok)
+				}
+				if drains, stops := cons.cc.counts(); drains != 1 || stops != 0 {
+					t.Errorf("Drain/Stop calls = %d/%d, want 1/0", drains, stops)
+				}
+			})
+		})
+	}
+}
+
 func TestJetStreamBus_HandBackOnErrPanicNakedOnce(t *testing.T) {
 	logs := wrInstallLogs(t)
 	synctest.Test(t, func(t *testing.T) {
