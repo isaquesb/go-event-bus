@@ -198,6 +198,34 @@ func TestSlogObserver_PanicStackAttribute(t *testing.T) {
 	}
 }
 
+func TestSlogObserver_InternalErrorPanicStackAttribute(t *testing.T) {
+	capt := newSoCapture()
+	obs := event.NewSlogObserver(slog.New(capt))
+	obs.InternalError(context.Background(), event.InternalErrorInfo{
+		Component: event.ComponentTransport,
+		Op:        event.OpPanic,
+		Handler:   "h",
+		Err:       &event.PanicError{Value: "x", Stack: []byte("goroutine 7 [running]")},
+	})
+	obs.InternalError(context.Background(), event.InternalErrorInfo{
+		Component: event.ComponentTransport,
+		Op:        event.OpAck,
+		Handler:   "plain",
+		Err:       errors.New("no stack"),
+	})
+
+	recs := capt.records()
+	if len(recs) != 2 {
+		t.Fatalf("got %d records, want 2", len(recs))
+	}
+	if stack, _ := recs[0].Attrs["stack"].(string); !strings.Contains(stack, "goroutine 7") {
+		t.Errorf("panic record stack = %q, want it to contain the panic stack", stack)
+	}
+	if _, ok := recs[1].Attrs["stack"]; ok {
+		t.Error("a plain internal error carries a stack attribute")
+	}
+}
+
 func TestSlogObserver_ExplicitLogger(t *testing.T) {
 	def := soInstallDefault(t)
 	capt := newSoCapture()

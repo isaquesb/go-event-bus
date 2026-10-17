@@ -300,7 +300,8 @@ func (o *SlogObserver) IdempotencyStale(ctx context.Context, s IdempotencyStaleI
 	)
 }
 
-// InternalError logs an error inside the library at Error.
+// InternalError logs an error inside the library at Error. A recovered panic
+// adds its stack.
 func (o *SlogObserver) InternalError(ctx context.Context, e InternalErrorInfo) {
 	attrs := []slog.Attr{
 		slog.String("component", e.Component),
@@ -310,6 +311,10 @@ func (o *SlogObserver) InternalError(ctx context.Context, e InternalErrorInfo) {
 	}
 	if e.Err != nil {
 		attrs = append(attrs, slog.String("err", e.Err.Error()))
+	}
+	var pe *PanicError
+	if errors.As(e.Err, &pe) && pe != nil && len(pe.Stack) > 0 {
+		attrs = append(attrs, slog.String("stack", string(pe.Stack)))
 	}
 	o.record(ctx, soKey{"internal_error", e.Handler, "", e.Component + ":" + e.Op}, slog.LevelError, "eventbus: internal error", attrs...)
 }
