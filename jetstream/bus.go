@@ -646,7 +646,7 @@ func (b *Bus) startPublish(ctx context.Context, subject, id string) (context.Con
 // handler ctx came from. A non-nil g sees every Failure on its way to the bus
 // Observer, see guardObserver.
 func (b *Bus) msgScope(ctx context.Context, g *settleGuard) context.Context {
-	var o event.Observer = b.obs()
+	o := b.obs()
 	if g != nil {
 		o = guardObserver{Observer: o, g: g}
 	}

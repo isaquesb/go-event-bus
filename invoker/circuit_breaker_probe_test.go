@@ -14,11 +14,11 @@ import (
 	"github.com/isaquesb/go-event-bus/invoker"
 )
 
-// cbpFail is the transient failure the probe tests feed to the breaker.
-var cbpFail = errors.New("cbp: transient failure")
+// errCbpFail is the transient failure the probe tests feed to the breaker.
+var errCbpFail = errors.New("cbp: transient failure")
 
 func cbpOK(context.Context) error   { return nil }
-func cbpBoom(context.Context) error { return cbpFail }
+func cbpBoom(context.Context) error { return errCbpFail }
 
 func cbpInvoke(cb *invoker.CircuitBreaker, fn func(context.Context) error) error {
 	return cb.Invoke(context.Background(), &testEvent{}, "handler", fn)
@@ -36,7 +36,7 @@ func TestCircuitBreaker_HalfOpenOneProbe(t *testing.T) {
 		OpenTimeout:      openTimeout,
 	})
 
-	if err := cbpInvoke(cb, cbpBoom); !errors.Is(err, cbpFail) {
+	if err := cbpInvoke(cb, cbpBoom); !errors.Is(err, errCbpFail) {
 		t.Fatalf("opening call: got %v", err)
 	}
 	time.Sleep(openTimeout + 20*time.Millisecond)
@@ -115,7 +115,7 @@ func TestCircuitBreaker_StaleGenerationIgnored(t *testing.T) {
 			_ = cbpInvoke(cb, func(context.Context) error {
 				close(started)
 				<-release
-				return cbpFail
+				return errCbpFail
 			})
 		}()
 		<-started
@@ -342,7 +342,7 @@ func TestCircuitBreaker_ProbeLeaseSupersedes(t *testing.T) {
 		_ = cbpInvoke(cb, cbpBoom)
 		time.Sleep(2 * time.Second)
 
-		started, release, done := cbpHold(cb, cbpFail)
+		started, release, done := cbpHold(cb, errCbpFail)
 		<-started
 
 		// Inside the lease the slot stays taken.

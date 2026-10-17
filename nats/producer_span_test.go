@@ -90,8 +90,8 @@ func psWantAttrs(t *testing.T, sp psSpan, destination, messageID string) {
 		}
 	}
 	for k, v := range sp.attrs {
-		if strings.Contains(v.Emit(), psSecret) {
-			t.Errorf("attribute %s carries payload bytes: %q", k, v.Emit())
+		if strings.Contains(v.String(), psSecret) {
+			t.Errorf("attribute %s carries payload bytes: %q", k, v.String())
 		}
 	}
 }

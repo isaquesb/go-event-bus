@@ -185,7 +185,7 @@ func TestObserverMetrics_AttributeSets(t *testing.T) {
 		}
 		for _, p := range sum.DataPoints {
 			for _, kv := range p.Attributes.ToSlice() {
-				v := kv.Value.Emit()
+				v := kv.Value.String()
 				if strings.Contains(v, "orders.42") || strings.Contains(v, "boom") {
 					t.Errorf("%s attribute %s leaks %q", name, kv.Key, v)
 				}

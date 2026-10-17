@@ -137,8 +137,8 @@ func jpWantAttrs(t *testing.T, sp jpSpan, destination, messageID string) {
 		t.Errorf("span has %d attributes (%v), want %d: the semconv five and the attempt count", len(sp.attrs), sp.attrs, len(want)+1)
 	}
 	for k, v := range sp.attrs {
-		if strings.Contains(v.Emit(), jpSecret) {
-			t.Errorf("attribute %s carries payload bytes: %q", k, v.Emit())
+		if strings.Contains(v.String(), jpSecret) {
+			t.Errorf("attribute %s carries payload bytes: %q", k, v.String())
 		}
 	}
 }

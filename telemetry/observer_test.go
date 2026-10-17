@@ -20,7 +20,7 @@ func (tmEvent) Name() string { return "order.created" }
 func tmAttrMap(kvs []attribute.KeyValue) map[string]string {
 	m := make(map[string]string, len(kvs))
 	for _, kv := range kvs {
-		m[string(kv.Key)] = kv.Value.Emit()
+		m[string(kv.Key)] = kv.Value.String()
 	}
 	return m
 }
@@ -139,7 +139,7 @@ func TestObserver_SpanEventsOnProcessSpan(t *testing.T) {
 	})
 	for _, e := range evs {
 		for _, a := range e.Attributes {
-			if a.Value.Emit() == boom.Error() {
+			if a.Value.String() == boom.Error() {
 				t.Errorf("event %s leaks the error text in %s", e.Name, a.Key)
 			}
 		}

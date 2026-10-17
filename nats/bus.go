@@ -376,7 +376,7 @@ func (b *Bus) Subscribe(
 
 		msgCtx, evt, err := b.reg.Decode(hctx, msg.Data)
 		if err != nil {
-			b.settleDecode(hctx, msg, handlerName, err)
+			_, _ = b.settleDecode(hctx, msg, handlerName, err)
 			return
 		}
 

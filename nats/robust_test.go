@@ -810,7 +810,7 @@ func (c *wrGatedReplyConn) PublishMsg(m *natsgo.Msg) error {
 	if m.Subject == rbInbox {
 		c.once.Do(func() { close(c.entered) })
 		<-c.gate.ch
-		c.closesAtReply.Store(int32(c.rbConn.closeCount()))
+		c.closesAtReply.Store(int32(c.closeCount()))
 	}
 	return c.rbConn.PublishMsg(m)
 }

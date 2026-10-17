@@ -70,7 +70,7 @@ func TestAttributeMapping(t *testing.T) {
 
 	attrs := map[string]string{}
 	for _, a := range spans[0].Attributes() {
-		attrs[string(a.Key)] = a.Value.Emit()
+		attrs[string(a.Key)] = a.Value.String()
 	}
 
 	want := map[string]string{
