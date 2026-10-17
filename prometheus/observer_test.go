@@ -2,7 +2,11 @@ package prometheus
 
 import (
 	"context"
+	"errors"
+	"slices"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -86,4 +90,283 @@ eventbus_handler_total{event="order.created",handler="billing",outcome="dead_let
 			t.Errorf("bucket le=%v count = %d, want %d", ub, buckets[ub], want)
 		}
 	}
+}
+
+// poExerciseAll calls every Observer method once with the fixed values below.
+func poExerciseAll(o *Observer) {
+	ctx := context.Background()
+	o.RetryAttempt(ctx, event.RetryAttemptInfo{Handler: "h", Event: "e", Attempt: 1, Class: event.AttemptTransient, Err: errors.New("boom id=42"), Delay: time.Second})
+	o.BreakerTransition(ctx, event.BreakerTransition{Handler: "h", From: event.BreakerClosed, To: event.BreakerOpen, Reason: event.BreakerReasonFailureThreshold, Seq: 1})
+	o.Failure(ctx, event.FailureContext{Handler: "h", Outcome: event.OutcomeDeadLettered, Reason: "exhausted", Cause: errors.New("boom id=42")})
+	o.DeadLettered(ctx, event.DeadLetterInfo{Handler: "h", Event: "e", Reason: "exhausted", Subject: "orders.42"})
+	o.HandlerDone(ctx, event.HandlerResult{Handler: "h", Event: "e", Outcome: event.OutcomeOK, Duration: time.Millisecond, Err: errors.New("boom id=42")})
+	o.DecodeFailed(ctx, event.DecodeFailure{Handler: "h", Subject: "orders.42", Reason: "invalid_json", Err: errors.New("boom id=42")})
+	o.DLQPublishFailed(ctx, event.DLQPublishFailure{Handler: "h", Event: "e", Reason: "exhausted", Subject: "orders.42", Err: errors.New("boom id=42")})
+	o.StoreError(ctx, event.StoreErrorInfo{Handler: "h", Event: "e", Store: "idempotency", Op: "begin", Err: errors.New("boom id=42")})
+	o.IdempotencyStale(ctx, event.IdempotencyStaleInfo{Handler: "h", Event: "e", Age: time.Minute})
+	o.InternalError(ctx, event.InternalErrorInfo{Component: event.ComponentTransport, Op: event.OpAck, Handler: "h", Subject: "orders.42", Err: errors.New("boom id=42")})
+}
+
+// poFamilies gathers reg and returns, per family name, the sorted label names of
+// its series (every series of a family has the same label names).
+func poFamilies(t *testing.T, reg *prometheus.Registry) map[string][]string {
+	t.Helper()
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	out := make(map[string][]string, len(fams))
+	for _, f := range fams {
+		if len(f.GetMetric()) == 0 {
+			t.Fatalf("family %s has no series", f.GetName())
+		}
+		var first []string
+		for i, m := range f.GetMetric() {
+			var names []string
+			for _, l := range m.GetLabel() {
+				names = append(names, l.GetName())
+			}
+			sort.Strings(names)
+			if i == 0 {
+				first = names
+			} else if !slices.Equal(first, names) {
+				t.Errorf("family %s series disagree on label names: %v vs %v", f.GetName(), first, names)
+			}
+		}
+		out[f.GetName()] = first
+	}
+	return out
+}
+
+var poWantLabels = map[string][]string{
+	"eventbus_handler_duration_seconds":  {"event", "handler", "outcome"},
+	"eventbus_handler_total":             {"event", "handler", "outcome"},
+	"eventbus_retry_attempts_total":      {"event", "handler", "reason"},
+	"eventbus_breaker_transitions_total": {"from", "handler", "reason", "to"},
+	"eventbus_breaker_state":             {"handler"},
+	"eventbus_dlq_records_total":         {"event", "handler", "reason"},
+	"eventbus_dlq_publish_errors_total":  {"event", "handler"},
+	"eventbus_decode_failures_total":     {"reason"},
+	"eventbus_store_errors_total":        {"handler", "op", "store"},
+	"eventbus_idempotency_stale_total":   {"handler"},
+	"eventbus_internal_errors_total":     {"component", "op"},
+}
+
+func TestObserver_EveryMethodMapped(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg)
+	poExerciseAll(o)
+
+	got := poFamilies(t, reg)
+	if len(got) != len(poWantLabels) {
+		t.Fatalf("got %d families, want %d: %v", len(got), len(poWantLabels), got)
+	}
+	for name := range poWantLabels {
+		if _, ok := got[name]; !ok {
+			t.Errorf("family %s missing", name)
+		}
+	}
+}
+
+func TestObserver_FailureAddsNoSeries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg)
+	o.Failure(context.Background(), event.FailureContext{Handler: "h", Outcome: event.OutcomeDeadLettered, Reason: "exhausted"})
+
+	if n := testutil.CollectAndCount(reg); n != 0 {
+		t.Fatalf("Failure created %d series, want 0", n)
+	}
+}
+
+func TestObserver_LabelSets(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg)
+	poExerciseAll(o)
+
+	got := poFamilies(t, reg)
+	for name, want := range poWantLabels {
+		if !slices.Equal(got[name], want) {
+			t.Errorf("%s labels = %v, want %v", name, got[name], want)
+		}
+	}
+
+	// No unbounded value ever becomes a label value: the error text and the
+	// subject carry "42".
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fams {
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if strings.Contains(l.GetValue(), "42") || strings.Contains(l.GetValue(), "boom") {
+					t.Errorf("%s label %s=%q carries unbounded text", f.GetName(), l.GetName(), l.GetValue())
+				}
+			}
+		}
+	}
+}
+
+func TestObserver_SignalValues(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg)
+	poExerciseAll(o)
+
+	checks := []struct {
+		name string
+		got  float64
+	}{
+		{"retry reason is the attempt class", testutil.ToFloat64(o.retryAttempts.WithLabelValues("h", "e", "transient"))},
+		{"dlq record", testutil.ToFloat64(o.dlqRecords.WithLabelValues("h", "e", "exhausted"))},
+		{"dlq publish error", testutil.ToFloat64(o.dlqPublishErrors.WithLabelValues("h", "e"))},
+		{"decode failure uses only reason", testutil.ToFloat64(o.decodeFailures.WithLabelValues("invalid_json"))},
+		{"store error", testutil.ToFloat64(o.storeErrors.WithLabelValues("h", "idempotency", "begin"))},
+		{"idempotency stale", testutil.ToFloat64(o.idempotencyStale.WithLabelValues("h"))},
+		{"internal error uses component and op", testutil.ToFloat64(o.internalErrors.WithLabelValues("transport", "ack"))},
+	}
+	for _, c := range checks {
+		if c.got != 1 {
+			t.Errorf("%s = %v, want 1", c.name, c.got)
+		}
+	}
+}
+
+func TestObserver_BreakerGaugeSeq(t *testing.T) {
+	ctx := context.Background()
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg)
+	tr := func(from, to event.BreakerState, seq uint64) event.BreakerTransition {
+		return event.BreakerTransition{Handler: "h", From: from, To: to, Reason: event.BreakerReasonFailureThreshold, Seq: seq}
+	}
+	state := func() float64 { return testutil.ToFloat64(o.breakerState.WithLabelValues("h")) }
+
+	o.BreakerTransition(ctx, tr(event.BreakerClosed, event.BreakerOpen, 2))
+	o.BreakerTransition(ctx, tr(event.BreakerOpen, event.BreakerClosed, 1)) // late, older Seq
+	if got := state(); got != 1 {
+		t.Fatalf("state after Seq 2 then Seq 1 = %v, want 1 (open)", got)
+	}
+	o.BreakerTransition(ctx, tr(event.BreakerOpen, event.BreakerHalfOpen, 3))
+	if got := state(); got != 2 {
+		t.Fatalf("state after Seq 3 = %v, want 2 (half_open)", got)
+	}
+	o.BreakerTransition(ctx, tr(event.BreakerHalfOpen, event.BreakerClosed, 4))
+	if got := state(); got != 0 {
+		t.Fatalf("state after Seq 4 = %v, want 0 (closed)", got)
+	}
+
+	var total float64
+	for _, to := range []event.BreakerState{event.BreakerOpen, event.BreakerClosed, event.BreakerHalfOpen} {
+		for _, from := range []event.BreakerState{event.BreakerClosed, event.BreakerOpen, event.BreakerHalfOpen} {
+			total += testutil.ToFloat64(o.breakerTransitions.WithLabelValues("h", string(from), string(to), string(event.BreakerReasonFailureThreshold)))
+		}
+	}
+	if total != 4 {
+		t.Fatalf("transitions counted = %v, want 4 (all of them, including the stale one)", total)
+	}
+}
+
+func TestObserver_BreakerGaugePerHandler(t *testing.T) {
+	ctx := context.Background()
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg)
+
+	o.BreakerTransition(ctx, event.BreakerTransition{Handler: "a", From: event.BreakerClosed, To: event.BreakerOpen, Reason: event.BreakerReasonFailureThreshold, Seq: 5})
+	o.BreakerTransition(ctx, event.BreakerTransition{Handler: "b", From: event.BreakerClosed, To: event.BreakerOpen, Reason: event.BreakerReasonFailureThreshold, Seq: 1})
+
+	if got := testutil.ToFloat64(o.breakerState.WithLabelValues("b")); got != 1 {
+		t.Fatalf("handler b state = %v, want 1: Seq is tracked per handler", got)
+	}
+}
+
+func TestObserver_Namespace(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg, WithNamespace("shop"))
+	poExerciseAll(o)
+
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fams) != len(poWantLabels) {
+		t.Fatalf("got %d families, want %d", len(fams), len(poWantLabels))
+	}
+	for _, f := range fams {
+		name, ok := strings.CutPrefix(f.GetName(), "shop_")
+		if !ok {
+			t.Errorf("family %s lacks the shop_ prefix", f.GetName())
+			continue
+		}
+		if _, ok := poWantLabels[name]; !ok {
+			t.Errorf("unexpected family %s", f.GetName())
+		}
+	}
+	if testutil.ToFloat64(o.handlerTotal.WithLabelValues("h", "e", "ok")) != 1 {
+		t.Fatal("shop_eventbus_handler_total not counted")
+	}
+}
+
+func TestObserver_Promlint(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg)
+	poExerciseAll(o)
+
+	problems, err := testutil.GatherAndLint(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range problems {
+		t.Errorf("promlint: %s: %s", p.Metric, p.Text)
+	}
+}
+
+func TestObserver_Concurrent(t *testing.T) {
+	const goroutines, iterations = 64, 500
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg)
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				poExerciseAll(o)
+			}
+		}()
+	}
+	wg.Wait()
+
+	const want = goroutines * iterations
+	counters := map[string]float64{
+		"handler_total":       testutil.ToFloat64(o.handlerTotal.WithLabelValues("h", "e", "ok")),
+		"retry_attempts":      testutil.ToFloat64(o.retryAttempts.WithLabelValues("h", "e", "transient")),
+		"breaker_transitions": testutil.ToFloat64(o.breakerTransitions.WithLabelValues("h", "closed", "open", "failure_threshold")),
+		"dlq_records":         testutil.ToFloat64(o.dlqRecords.WithLabelValues("h", "e", "exhausted")),
+		"dlq_publish_errors":  testutil.ToFloat64(o.dlqPublishErrors.WithLabelValues("h", "e")),
+		"decode_failures":     testutil.ToFloat64(o.decodeFailures.WithLabelValues("invalid_json")),
+		"store_errors":        testutil.ToFloat64(o.storeErrors.WithLabelValues("h", "idempotency", "begin")),
+		"idempotency_stale":   testutil.ToFloat64(o.idempotencyStale.WithLabelValues("h")),
+		"internal_errors":     testutil.ToFloat64(o.internalErrors.WithLabelValues("transport", "ack")),
+	}
+	for name, got := range counters {
+		if got != want {
+			t.Errorf("%s = %v, want %d", name, got, want)
+		}
+	}
+	count, _ := poHistogram(t, reg, "eventbus_handler_duration_seconds")
+	if count != want {
+		t.Errorf("duration count = %d, want %d", count, want)
+	}
+}
+
+func TestObserver_DoubleRegistrationPanics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewObserver(reg)
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("second NewObserver on the same registry did not panic")
+		}
+	}()
+	NewObserver(reg)
 }

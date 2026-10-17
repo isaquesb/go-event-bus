@@ -103,10 +103,6 @@ func WithNamespace(ns string) Option {
 // Observer implements event.Observer with a fixed set of Prometheus metrics.
 // It is safe for concurrent use.
 type Observer struct {
-	// Embedded so that Observer keeps compiling when event.Observer gains
-	// methods; the methods this package maps are defined below.
-	event.NopObserver
-
 	handlerDuration    *prometheus.HistogramVec
 	handlerTotal       *prometheus.CounterVec
 	retryAttempts      *prometheus.CounterVec
@@ -180,6 +176,47 @@ func NewObserver(reg prometheus.Registerer, opts ...Option) *Observer {
 			"Errors inside the library that no handler sees.", "component", "op"),
 		lastSeq: make(map[string]uint64),
 	}
+}
+
+// RetryAttempt counts a failed attempt that the retry policy repeats. The reason
+// label is the attempt class (transient, terminal, timeout, panic).
+func (o *Observer) RetryAttempt(_ context.Context, info event.RetryAttemptInfo) {
+	o.retryAttempts.WithLabelValues(info.Handler, info.Event, string(info.Class)).Inc()
+}
+
+// Failure does nothing: terminal failures are already visible through
+// eventbus_handler_total (HandlerDone) and eventbus_dlq_records_total
+// (DeadLettered), so counting them again would double count.
+func (o *Observer) Failure(context.Context, event.FailureContext) {}
+
+// DeadLettered counts a successful dead-letter publish.
+func (o *Observer) DeadLettered(_ context.Context, info event.DeadLetterInfo) {
+	o.dlqRecords.WithLabelValues(info.Handler, info.Event, info.Reason).Inc()
+}
+
+// DLQPublishFailed counts a failed dead-letter publish.
+func (o *Observer) DLQPublishFailed(_ context.Context, f event.DLQPublishFailure) {
+	o.dlqPublishErrors.WithLabelValues(f.Handler, f.Event).Inc()
+}
+
+// DecodeFailed counts a message that could not be decoded, by reason only.
+func (o *Observer) DecodeFailed(_ context.Context, f event.DecodeFailure) {
+	o.decodeFailures.WithLabelValues(f.Reason).Inc()
+}
+
+// StoreError counts a failing idempotency or rate-limit store call.
+func (o *Observer) StoreError(_ context.Context, e event.StoreErrorInfo) {
+	o.storeErrors.WithLabelValues(e.Handler, e.Store, e.Op).Inc()
+}
+
+// IdempotencyStale counts a stale in-progress marker that was taken over.
+func (o *Observer) IdempotencyStale(_ context.Context, s event.IdempotencyStaleInfo) {
+	o.idempotencyStale.WithLabelValues(s.Handler).Inc()
+}
+
+// InternalError counts an error inside the library, by component and operation.
+func (o *Observer) InternalError(_ context.Context, e event.InternalErrorInfo) {
+	o.internalErrors.WithLabelValues(e.Component, e.Op).Inc()
 }
 
 // HandlerDone observes the handler duration and counts the invocation by
