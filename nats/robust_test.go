@@ -3,6 +3,7 @@ package nats
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -568,6 +569,193 @@ func TestNatsBus_StructLiteralShutdown(t *testing.T) {
 		err := bus.Emit(context.Background(), &mdEvent{name: "rb.order", EventID: "rb-1"})
 		if !errors.Is(err, event.ErrBusClosed) {
 			t.Errorf("Emit after Shutdown = %v, want ErrBusClosed", err)
+		}
+	})
+}
+
+// --- callback-level panic recovery (WR-01) ---
+
+// wrRecord is one captured log record.
+type wrRecord struct {
+	level slog.Level
+	msg   string
+	attrs map[string]string
+}
+
+// wrLogs is a slog.Handler capturing every record.
+type wrLogs struct {
+	mu   sync.Mutex
+	recs []wrRecord
+}
+
+func (l *wrLogs) Enabled(context.Context, slog.Level) bool { return true }
+
+func (l *wrLogs) Handle(_ context.Context, r slog.Record) error {
+	rec := wrRecord{level: r.Level, msg: r.Message, attrs: map[string]string{}}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs[a.Key] = a.Value.String()
+		return true
+	})
+	l.mu.Lock()
+	l.recs = append(l.recs, rec)
+	l.mu.Unlock()
+	return nil
+}
+
+func (l *wrLogs) WithAttrs([]slog.Attr) slog.Handler { return l }
+func (l *wrLogs) WithGroup(string) slog.Handler      { return l }
+
+// errorWithPanic reports whether an Error record carries attrs["panic"] == text.
+func (l *wrLogs) errorWithPanic(text string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, r := range l.recs {
+		if r.level == slog.LevelError && r.attrs["panic"] == text {
+			return true
+		}
+	}
+	return false
+}
+
+// wrInstallLogs makes a fresh wrLogs the slog default until the test ends. Call
+// it outside any synctest bubble.
+func wrInstallLogs(t *testing.T) *wrLogs {
+	t.Helper()
+	logs := &wrLogs{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(logs))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return logs
+}
+
+// wrPanicRegistry panics in Decode.
+type wrPanicRegistry struct{ *mdRegistry }
+
+func (wrPanicRegistry) Decode(context.Context, []byte) (context.Context, event.Event, error) {
+	panic("wr: decode boom")
+}
+
+// wrPanicDLQ panics in Publish.
+type wrPanicDLQ struct{}
+
+func (wrPanicDLQ) Publish(context.Context, event.DLQRecord) error { panic("wr: dlq boom") }
+
+// wrPanicReplyConn panics when a reply is published.
+type wrPanicReplyConn struct{ *rbConn }
+
+func (wrPanicReplyConn) PublishMsg(*natsgo.Msg) error { panic("wr: reply boom") }
+
+func wrOnErrPanic(context.Context, event.Event, error, string) { panic("wr: onerr boom") }
+
+func wrFailHandler(context.Context, event.Event) error { return errors.New("wr: failed") }
+
+func TestNatsBus_CallbackPanicRecovered(t *testing.T) {
+	rows := []struct {
+		name  string
+		panic string
+		build func(conn *rbConn, reg *mdRegistry) *Bus
+	}{
+		{"bus OnErr", "wr: onerr boom", func(conn *rbConn, reg *mdRegistry) *Bus {
+			return &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+		}},
+		{"DLQ publisher", "wr: dlq boom", func(conn *rbConn, reg *mdRegistry) *Bus {
+			return &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: wrPanicDLQ{}}
+		}},
+		{"decode", "wr: decode boom", func(conn *rbConn, reg *mdRegistry) *Bus {
+			return &Bus{nc: conn, reg: wrPanicRegistry{reg}, timeout: time.Second}
+		}},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			logs := wrInstallLogs(t)
+			synctest.Test(t, func(t *testing.T) {
+				conn := newRbConn()
+				reg := newMdRegistry("rb.order")
+				bus := row.build(conn, reg)
+				if err := bus.Subscribe(context.Background(), "rb.order", wrFailHandler, event.WithHandlerName("h")); err != nil {
+					t.Fatalf("Subscribe: %v", err)
+				}
+
+				// The callback returns normally: a propagated panic aborts the binary.
+				conn.callback(t, "rb.order")(&natsgo.Msg{Subject: "rb.order", Data: rbPayload(t, reg, "wr-1")})
+
+				if !logs.errorWithPanic(row.panic) {
+					t.Errorf("no Error record with panic %q", row.panic)
+				}
+				sctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				defer cancel()
+				if err := bus.Shutdown(sctx); err != nil {
+					t.Errorf("Shutdown = %v, want nil (the in-flight count must be released)", err)
+				}
+			})
+		})
+	}
+}
+
+func TestNatsSync_CallbackPanicRepliesPanic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn := newRbConn()
+		reg := newMdRegistry("rb.order")
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+		if err := bus.SubscribeSync(context.Background(), "rb.order", wrFailHandler); err != nil {
+			t.Fatalf("SubscribeSync: %v", err)
+		}
+
+		got, err := bus.EmitSync(context.Background(), &mdEvent{name: "rb.order", EventID: "wr-s1"})
+		if got != nil {
+			t.Errorf("EmitSync event = %v, want nil", got)
+		}
+		var re *RemoteError
+		if !errors.As(err, &re) {
+			t.Fatalf("EmitSync error = %v, want *RemoteError", err)
+		}
+		if re.Reason != event.ReasonPanic {
+			t.Errorf("RemoteError.Reason = %q, want %q", re.Reason, event.ReasonPanic)
+		}
+		if !errors.Is(err, event.ErrHandlerPanic) {
+			t.Errorf("EmitSync error = %v, want ErrHandlerPanic", err)
+		}
+
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		var inbox []*natsgo.Msg
+		for _, m := range conn.replies {
+			if m.Subject == rbInbox {
+				inbox = append(inbox, m)
+			}
+		}
+		if len(inbox) != 1 {
+			t.Fatalf("messages published to %s = %d, want 1", rbInbox, len(inbox))
+		}
+		if len(inbox[0].Data) != 0 {
+			t.Errorf("reply data = %q, want empty", inbox[0].Data)
+		}
+	})
+}
+
+func TestNatsSync_PanicReplyPanicContained(t *testing.T) {
+	logs := wrInstallLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		reg := newMdRegistry("rb.order")
+		conn := &wrPanicReplyConn{rbConn: newRbConn()}
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+		if err := bus.SubscribeSync(context.Background(), "rb.order", wrFailHandler, event.WithHandlerName("h")); err != nil {
+			t.Fatalf("SubscribeSync: %v", err)
+		}
+
+		// The callback returns normally: a propagated panic aborts the binary.
+		conn.callback(t, "rb.order")(&natsgo.Msg{Subject: "rb.order", Data: rbPayload(t, reg, "wr-s2"), Reply: rbInbox})
+
+		if !logs.errorWithPanic("wr: onerr boom") {
+			t.Error("no Error record with panic \"wr: onerr boom\"")
+		}
+		if !logs.errorWithPanic("wr: reply boom") {
+			t.Error("no Error record with panic \"wr: reply boom\"")
+		}
+		sctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := bus.Shutdown(sctx); err != nil {
+			t.Errorf("Shutdown = %v, want nil", err)
 		}
 	})
 }

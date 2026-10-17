@@ -2,7 +2,9 @@ package nats
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -253,6 +255,10 @@ func (b *Bus) EmitSync(ctx context.Context, e event.Event) (event.Event, error) 
 
 // Subscribe registers a handler for events on the given subject.
 // Options can be used to configure the subscription (e.g., WithHandlerName).
+//
+// A panic in the callback outside the handler (Decode, Settle, the bus or event
+// OnErr, the DLQ publisher) is recovered and logged at Error with its stack.
+// NATS Core never redelivers, so the message ends there.
 func (b *Bus) Subscribe(
 	ctx context.Context,
 	subject string,
@@ -270,6 +276,8 @@ func (b *Bus) Subscribe(
 	}
 
 	sub, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
+		defer b.recoverCallback(ctx, msg, handlerName, nil)
+
 		release, ok := b.life.Track()
 		if !ok {
 			b.rejectInbound(ctx, msg, handlerName, false)
@@ -307,6 +315,11 @@ func (b *Bus) Subscribe(
 
 // SubscribeSync registers a handler that responds synchronously to requests.
 // Options can be used to configure the subscription (e.g., WithHandlerName).
+//
+// A panic in the callback outside the handler (Decode, Settle, the bus or event
+// OnErr, the DLQ publisher, the reply encode) is recovered and logged at Error
+// with its stack. NATS Core never redelivers, so the message ends there, and a
+// request not answered yet gets an Eventbus-Error reply with reason panic.
 func (b *Bus) SubscribeSync(
 	ctx context.Context,
 	subject string,
@@ -324,9 +337,13 @@ func (b *Bus) SubscribeSync(
 	}
 
 	sub, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
+		var replied bool
+		defer b.recoverCallback(ctx, msg, handlerName, &replied)
+
 		release, ok := b.life.Track()
 		if !ok {
 			b.rejectInbound(ctx, msg, handlerName, true)
+			replied = true
 			return
 		}
 		defer release()
@@ -338,6 +355,7 @@ func (b *Bus) SubscribeSync(
 		if err != nil {
 			s, derr := b.settleDecode(hctx, msg, handlerName, err)
 			b.replyError(hctx, msg, settleReason(s, derr), derr)
+			replied = true
 			return
 		}
 
@@ -351,6 +369,7 @@ func (b *Bus) SubscribeSync(
 		if handleErr != nil {
 			s := b.settle(hctx, msgCtx, evt, handlerName, handleErr)
 			b.replyError(msgCtx, msg, settleReason(s, handleErr), handleErr)
+			replied = true
 			return
 		}
 
@@ -371,11 +390,52 @@ func (b *Bus) SubscribeSync(
 		}
 
 		b.reply(msgCtx, msg, resp, nil)
+		replied = true
 	})
 	if err != nil {
 		return err
 	}
 	return b.trackSub(sub)
+}
+
+// recoverCallback is deferred by the Subscribe and SubscribeSync callbacks. The
+// invoker chain recovers handler panics (event.InvokeHandler), but Decode, Settle
+// with the bus OnErr, the event's OnErr, the DLQ publisher and the reply encode
+// run on the nats.go delivery goroutine, where an unrecovered panic kills the
+// process. The panic is logged once at Error with its stack. NATS Core never
+// redelivers, so the message ends there; it is not reported through OnErr (the
+// panic may come from it) and never dead-lettered. When replied is non-nil and
+// false the request is still unanswered, so it gets an Eventbus-Error reply with
+// reason panic instead of waiting for the requester timeout.
+//
+// It must be called directly by defer, as recover only works there.
+func (b *Bus) recoverCallback(ctx context.Context, msg *nats.Msg, handlerName string, replied *bool) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	stack := debug.Stack()
+	slog.ErrorContext(ctx, "nats: panic in message callback recovered",
+		"handler", handlerName,
+		"subject", msg.Subject,
+		"panic", fmt.Sprint(r),
+		"stack", string(stack),
+	)
+	if replied == nil || *replied {
+		return
+	}
+	func() {
+		defer func() {
+			if r2 := recover(); r2 != nil {
+				slog.ErrorContext(ctx, "nats: panic in recovered callback reply",
+					"handler", handlerName,
+					"subject", msg.Subject,
+					"panic", fmt.Sprint(r2),
+				)
+			}
+		}()
+		b.replyError(ctx, msg, event.ReasonPanic, &event.PanicError{Value: r, Stack: stack})
+	}()
 }
 
 // trackSub registers sub for the drain Shutdown runs. A nil sub (a test mock)
