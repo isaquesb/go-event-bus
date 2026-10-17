@@ -78,7 +78,8 @@ type LocalBusOptions struct {
 	// state and outcome. It is configured here once and installed in every
 	// handler context. nil means NewSlogObserver(nil), so failures are never
 	// silent with zero configuration; NopObserver{} silences everything. The bus
-	// wraps the observer with MultiObserver, which isolates its panics.
+	// wraps the observer with MultiObserver, which isolates its panics. The bus
+	// flushes only the default observer it created, in Shutdown; flush your own.
 	Observer Observer
 
 	// MaxConcurrent is the number of async handlers that run at once. Values at
@@ -154,10 +155,13 @@ func NewLocalBus(opts LocalBusOptions) *LocalBus {
 	if opts.Invoker == nil {
 		opts.Invoker = &passthroughInvoker{}
 	}
+	var defaultLog *SlogObserver
 	if opts.Observer == nil {
-		opts.Observer = NewSlogObserver(nil)
+		defaultLog = NewSlogObserver(nil)
+		opts.Observer = defaultLog
 	}
 	return &LocalBus{
+		defaultLog:      defaultLog,
 		handlers:        make(map[string][]*namedHandle),
 		observer:        MultiObserver(opts.Observer),
 		dlq:             opts.DLQPublisher,
@@ -180,6 +184,7 @@ type LocalBus struct {
 	mu              sync.RWMutex
 	handlers        map[string][]*namedHandle
 	observer        Observer
+	defaultLog      *SlogObserver // the observer the bus created itself; nil when the user supplied one
 	dlq             DLQPublisher
 	invoker         Invoker
 	exec            chan struct{}
@@ -253,8 +258,17 @@ func (b *LocalBus) RegisterSubscribers(ctx context.Context, subs ...Subscriber) 
 // without waiting further. Interrupted tasks are reported once through the
 // single report sink and are never dead-lettered. Shutdown is safe to call more
 // than once and concurrently.
+//
+// When LocalBusOptions.Observer is nil, Shutdown flushes the default
+// SlogObserver the bus created, on every return path, so a pending dedup
+// summary with its suppressed count is logged. An Observer supplied by the
+// caller is never flushed by the bus: it owns its Flush.
 func (b *LocalBus) Shutdown(ctx context.Context) error {
-	return b.life.Shutdown(ctx)
+	err := b.life.Shutdown(ctx)
+	if b.defaultLog != nil {
+		b.defaultLog.Flush()
+	}
+	return err
 }
 
 // Close shuts the bus down, bounded by LocalBusOptions.ShutdownTimeout (default

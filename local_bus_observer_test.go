@@ -131,6 +131,89 @@ func TestLocalBus_ZeroConfigLogsFailureOnce(t *testing.T) {
 	}
 }
 
+// lbSoFailures returns the failure log records captured by capt.
+func lbSoFailures(capt soCapture) []soRecord {
+	var out []soRecord
+	for _, r := range capt.records() {
+		if r.Msg == lbFailureMsg {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// lbThreeDrops drops the same terminal failure three times on bus.
+func lbThreeDrops(t *testing.T, bus *event.LocalBus) {
+	t.Helper()
+	for i := 0; i < 3; i++ {
+		_, _ = bus.EmitSync(context.Background(), &lbEvent{})
+	}
+}
+
+// TestLocalBus_ShutdownFlushesDefaultObserver: the default SlogObserver of a
+// LocalBus without Observer logs its pending dedup summary when the bus is shut
+// down (WR-05). The test replaces the process-wide slog default, so it must not
+// run in parallel.
+func TestLocalBus_ShutdownFlushesDefaultObserver(t *testing.T) {
+	capt := soInstallDefault(t)
+	bus := lbPermanentBus(t, nil)
+	lbThreeDrops(t, bus)
+
+	if n := len(lbSoFailures(capt)); n != 1 {
+		t.Fatalf("before Shutdown got %d failure records, want 1", n)
+	}
+	if n := len(soSummaries(capt.records())); n != 0 {
+		t.Fatalf("before Shutdown got %d summaries, want 0", n)
+	}
+	if err := bus.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown = %v", err)
+	}
+	recs := capt.records()
+	sums := soSummaries(recs)
+	if len(lbSoFailures(capt)) != 1 || len(sums) != 1 {
+		t.Fatalf("after Shutdown got %d failure records and %d summaries, want 1 and 1: %+v", len(lbSoFailures(capt)), len(sums), recs)
+	}
+	soCheckSummary(t, sums[0], map[string]any{"handler": "billing", "suppressed": int64(2)})
+}
+
+// TestLocalBus_ShutdownFlushesOnClose: Close goes through Shutdown, so it
+// flushes the default observer too.
+func TestLocalBus_ShutdownFlushesOnClose(t *testing.T) {
+	capt := soInstallDefault(t)
+	bus := lbPermanentBus(t, nil)
+	lbThreeDrops(t, bus)
+
+	if err := bus.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if n := len(soSummaries(capt.records())); n != 1 {
+		t.Fatalf("summaries after Close = %d, want 1", n)
+	}
+}
+
+// TestLocalBus_ShutdownLeavesUserObserver: an Observer supplied by the caller is
+// never flushed by the bus. It must not run in parallel with other tests that
+// replace the slog default.
+func TestLocalBus_ShutdownLeavesUserObserver(t *testing.T) {
+	capt := newSoCapture()
+	obs := event.NewSlogObserver(slog.New(capt))
+	bus := lbPermanentBus(t, obs)
+	lbThreeDrops(t, bus)
+
+	if err := bus.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown = %v", err)
+	}
+	if n := len(soSummaries(capt.records())); n != 0 {
+		t.Fatalf("summaries after Shutdown = %d, want 0: the bus does not flush a user observer", n)
+	}
+	obs.Flush()
+	sums := soSummaries(capt.records())
+	if len(sums) != 1 {
+		t.Fatalf("summaries after the user Flush = %d, want 1", len(sums))
+	}
+	soCheckSummary(t, sums[0], map[string]any{"suppressed": int64(2)})
+}
+
 // TestLocalBus_NopObserverSilences: NopObserver{} produces no record, while the
 // event's own OnErr method still runs.
 func TestLocalBus_NopObserverSilences(t *testing.T) {

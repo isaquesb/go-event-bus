@@ -87,9 +87,25 @@ func (NopObserver) InternalError(context.Context, InternalErrorInfo) {}
 type observerKey struct{}
 
 // WithObserver returns a context that carries o. A nil o stores NopObserver.
+//
+// The observer in ctx is panic-isolated: a NopObserver or the result of
+// MultiObserver is stored unchanged, and any other observer is wrapped with
+// MultiObserver, so a panic in a raw observer never reaches the handler
+// goroutine. ObserverFromContext therefore returns an isolating observer, not
+// necessarily the value that was passed in.
 func WithObserver(ctx context.Context, o Observer) context.Context {
-	if o == nil {
+	switch v := o.(type) {
+	case nil:
 		o = NopObserver{}
+	case NopObserver:
+		// Already inert.
+	case *multiObserver:
+		// Already isolated. A nil *multiObserver would panic on first use.
+		if v == nil {
+			o = NopObserver{}
+		}
+	default:
+		o = MultiObserver(o)
 	}
 	return context.WithValue(ctx, observerKey{}, o)
 }

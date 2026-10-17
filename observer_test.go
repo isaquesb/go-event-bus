@@ -179,9 +179,56 @@ func TestObserver_ContextFallback(t *testing.T) {
 	if got := event.ObserverFromContext(ctx); got != (event.NopObserver{}) {
 		t.Fatalf("nil observer = %#v, want NopObserver{}", got)
 	}
+	// A raw observer is isolated: it is wrapped, not stored as is (IN-03).
 	rec := &obsRecorder{}
-	if got := event.ObserverFromContext(event.WithObserver(context.Background(), rec)); got != event.Observer(rec) {
-		t.Fatalf("observer = %#v, want the installed recorder", got)
+	got := event.ObserverFromContext(event.WithObserver(context.Background(), rec))
+	if got == event.Observer(rec) {
+		t.Fatalf("observer = the raw recorder, want it wrapped by MultiObserver")
+	}
+	obEmitAll(context.Background(), got)
+	if calls := rec.Calls(); !reflect.DeepEqual(calls, obAllMethods) {
+		t.Fatalf("wrapped recorder calls = %v, want every signal %v", calls, obAllMethods)
+	}
+}
+
+func TestWithObserver_KeepsMultiObserver(t *testing.T) {
+	m := event.MultiObserver(&obsRecorder{})
+	if got := event.ObserverFromContext(event.WithObserver(context.Background(), m)); got != m {
+		t.Fatalf("observer = %#v, want the MultiObserver result unchanged", got)
+	}
+	nop := event.NopObserver{}
+	if got := event.ObserverFromContext(event.WithObserver(context.Background(), nop)); got != event.Observer(nop) {
+		t.Fatalf("observer = %#v, want NopObserver unchanged", got)
+	}
+}
+
+func TestWithObserver_IsolatesRawObserverPanic(t *testing.T) {
+	logs := obCaptureSlog(t)
+	ctx := event.WithObserver(context.Background(), obPanicObserver{})
+
+	want := errors.New("ob: handler error")
+	got := event.InvokeHandler(ctx, nil, &hdEvent{}, "h", func(context.Context) error { return want })
+	if !errors.Is(got, want) {
+		t.Fatalf("InvokeHandler = %v, want the handler error despite the panicking observer", got)
+	}
+	if got := event.InvokeHandler(ctx, nil, &hdEvent{}, "h", func(context.Context) error { return nil }); got != nil {
+		t.Fatalf("InvokeHandler = %v, want nil", got)
+	}
+	if n := len(logs.panicRecords()); n < 1 {
+		t.Errorf("panic log records = %d, want the recovered panic logged", n)
+	}
+}
+
+func TestOpValues_UnsubscribeDrain(t *testing.T) {
+	if event.OpUnsubscribe != "unsubscribe" || event.OpDrain != "drain" {
+		t.Fatalf("OpUnsubscribe = %q, OpDrain = %q, want unsubscribe and drain", event.OpUnsubscribe, event.OpDrain)
+	}
+	var zero event.BreakerTransition
+	if zero.BreakerID != 0 {
+		t.Fatalf("zero BreakerID = %d, want 0 (unknown)", zero.BreakerID)
+	}
+	if got := (event.BreakerTransition{Handler: "h", BreakerID: 7}).BreakerID; got != 7 {
+		t.Fatalf("BreakerID = %d, want 7", got)
 	}
 }
 

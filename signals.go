@@ -52,12 +52,22 @@ type BreakerTransition struct {
 	To BreakerState
 	// Reason is why the state changed.
 	Reason BreakerReason
-	// Failures is the consecutive failure count when the change happened.
+	// Failures is the consecutive failure count the breaker holds when it
+	// reports the change. For failure_threshold it is the count that reached
+	// the threshold. For open_timeout_elapsed and probe_failed it is the count
+	// kept from the moment the breaker opened, because a probe failure does not
+	// add to it. For probe_succeeded it is 0, because the counters reset before
+	// the breaker closes.
 	Failures int
 	// At is when the change happened.
 	At time.Time
 	// Seq increases by one on every transition of the same handler breaker.
 	Seq uint64
+	// BreakerID identifies the CircuitBreaker instance that reported the
+	// transition, unique within the process and assigned at construction;
+	// together with Handler it scopes Seq. Zero means unknown (a transition
+	// built by hand).
+	BreakerID uint64
 }
 
 // FailingInvoker names the part of the pipeline that produced a terminal
@@ -332,6 +342,10 @@ const (
 	OpEncodeReply = "encode_reply"
 	// OpPanic is a recovered panic outside a handler.
 	OpPanic = "panic"
+	// OpUnsubscribe is removing a subscription after the bus closed.
+	OpUnsubscribe = "unsubscribe"
+	// OpDrain is draining a subscription during Shutdown.
+	OpDrain = "drain"
 )
 
 // redactDelivery returns a copy of d with Raw set to nil. Every root builder of
