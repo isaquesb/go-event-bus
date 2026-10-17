@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -212,4 +213,224 @@ func oxFirst(vs []string) string {
 		return ""
 	}
 	return vs[0]
+}
+
+// oxWaitFor polls cond every 25 ms for up to d and fails the test with msg on
+// timeout.
+func oxWaitFor(t testing.TB, d time.Duration, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout after %s waiting for %s", d, msg)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// TestIntegration_FinalDeliveryPublishFailureReportedOnce proves research DR-10
+// and Assumption A3 on a real server: when even the dead-letter publish fails
+// until MaxDeliver, the message is reported once as dlq_publish_failed, it is
+// never terminated (no MSG_TERMINATED advisory, only MAX_DELIVERIES), and it is
+// still in its stream for operator recovery (OBS-03, T-10-43).
+func TestIntegration_FinalDeliveryPublishFailureReportedOnce(t *testing.T) {
+	nc, js := connect(t)
+
+	base := uniqueName(t, "ox")
+	subject := base + ".order"
+	stream := newStream(t, js, base+".>")
+	consumer := uniqueName(t, "C")
+
+	// No stream captures this prefix, so every DLQ publish fails.
+	dlq := NewDLQ(js, uniqueName(t, "nostream")+".")
+	rec := &joRecorder{}
+	bus := NewBus(js, itRegistry(), BusOptions{
+		Invoker:          invoker.NewChain(),
+		DLQPublisher:     dlq,
+		Observer:         rec,
+		CircuitOpenDelay: time.Second,
+		RateLimitDelay:   time.Second,
+	})
+	t.Cleanup(func() { _ = bus.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	terminated := itAdvisories(t, nc, termAdvisorySubject(stream, consumer))
+	maxDeliveries := itAdvisories(t, nc, maxDeliveriesAdvisorySubject(stream, consumer))
+
+	handler := func(context.Context, event.Event) error {
+		return &joTerminal{msg: "ox: terminal"}
+	}
+	if err := bus.Subscribe(ctx, subject, handler,
+		event.WithStream(stream),
+		event.WithConsumer(consumer),
+		event.WithMaxDeliver(2),
+		event.WithBackOff([]time.Duration{100 * time.Millisecond}),
+	); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if err := bus.Emit(ctx, &itOrder{ID: "o-ox-2"}, event.WithSubject(subject)); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	oxWaitFor(t, 10*time.Second, "the Failure of the final delivery", func() bool { return len(rec.failures()) >= 1 })
+	fails := rec.failures()
+	if len(fails) != 1 {
+		t.Fatalf("Failure called %d times, want exactly 1", len(fails))
+	}
+	if fails[0].Outcome != event.OutcomeDLQPublishFailed {
+		t.Errorf("Failure outcome = %q, want %q", fails[0].Outcome, event.OutcomeDLQPublishFailed)
+	}
+	if !errors.Is(fails[0].Cause, event.ErrDeadLetterFailed) {
+		t.Errorf("Failure cause = %v, want it to match event.ErrDeadLetterFailed", fails[0].Cause)
+	}
+
+	// The failed publish is signalled on every attempt: the terminal error is
+	// dead-lettered on delivery 1 (Final false) and again on delivery 2 (Final
+	// true).
+	pubFails := rec.dlqPublishFailures()
+	if len(pubFails) < 2 {
+		t.Fatalf("DLQPublishFailed called %d times, want at least 2: %+v", len(pubFails), pubFails)
+	}
+	if pubFails[0].Final {
+		t.Errorf("first DLQPublishFailed has Final = true, want false (delivery 1 of 2)")
+	}
+	if !pubFails[len(pubFails)-1].Final {
+		t.Errorf("last DLQPublishFailed has Final = false, want true (final delivery)")
+	}
+
+	// The server abandons the message after MaxDeliver and says so.
+	if a := itNextAdvisory(t, maxDeliveries, 10*time.Second); a.Deliveries != 2 {
+		t.Errorf("MAX_DELIVERIES advisory deliveries = %d, want 2", a.Deliveries)
+	}
+
+	// A further second (lower bound): still one Failure, nothing terminated.
+	time.Sleep(time.Second)
+	if n := len(rec.failures()); n != 1 {
+		t.Errorf("Failure called %d times after the settle period, want exactly 1", n)
+	}
+	select {
+	case data := <-terminated:
+		t.Errorf("MSG_TERMINATED advisory raised although the DLQ publish never succeeded: %s", data)
+	default:
+	}
+
+	// Assumption A3: the message stays in the stream for operator recovery.
+	kept := itStreamMsg(t, js, stream, 1)
+	var env event.Envelope
+	if err := json.Unmarshal(kept.Data, &env); err != nil {
+		t.Fatalf("stream message 1 is not an envelope: %v", err)
+	}
+	if env.ID != "o-ox-2" {
+		t.Errorf("stream message 1 envelope id = %q, want o-ox-2", env.ID)
+	}
+}
+
+// oxCall is one handler invocation of the redelivery test.
+type oxCall struct {
+	count int
+	at    time.Time
+}
+
+// TestIntegration_FailureOnceAcrossRedeliveries proves on a real server that a
+// transient failure redelivered up to MaxDeliver reports Failure exactly once,
+// on the final delivery, and HandlerDone once per delivery with the outcomes
+// retry, retry, dead_lettered (OBS-03, D-14). Timing assertions are lower
+// bounds.
+func TestIntegration_FailureOnceAcrossRedeliveries(t *testing.T) {
+	_, js := connect(t)
+
+	base := uniqueName(t, "ox")
+	subject := base + ".order"
+	stream := newStream(t, js, base+".>")
+	prefix, dlqStream := itNewDLQStream(t, js)
+	consumer := uniqueName(t, "C")
+	const backOff = 100 * time.Millisecond
+
+	dlq := NewDLQ(js, prefix)
+	rec := &joRecorder{}
+	bus := NewBus(js, itRegistry(), BusOptions{
+		Invoker:          invoker.NewChain(),
+		DLQPublisher:     dlq,
+		Observer:         rec,
+		CircuitOpenDelay: time.Second,
+		RateLimitDelay:   time.Second,
+	})
+	t.Cleanup(func() { _ = bus.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	var calls []oxCall
+	handler := func(hctx context.Context, _ event.Event) error {
+		d, _ := event.DeliveryFromContext(hctx)
+		mu.Lock()
+		calls = append(calls, oxCall{count: d.Count, at: time.Now()})
+		mu.Unlock()
+		return errors.New("transient")
+	}
+	if err := bus.Subscribe(ctx, subject, handler,
+		event.WithStream(stream),
+		event.WithConsumer(consumer),
+		event.WithMaxDeliver(3),
+		event.WithBackOff([]time.Duration{backOff, backOff}),
+	); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if err := bus.Emit(ctx, &itOrder{ID: "o-ox-3"}, event.WithSubject(subject)); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	oxWaitFor(t, 10*time.Second, "three HandlerDone signals and the Failure", func() bool {
+		return len(rec.handlerDones()) >= 3 && len(rec.failures()) >= 1
+	})
+	itWaitStreamMsgs(t, js, dlqStream, 1)
+
+	// A further 500 ms (lower bound) to catch a stray extra report.
+	time.Sleep(500 * time.Millisecond)
+
+	fails := rec.failures()
+	if len(fails) != 1 {
+		t.Fatalf("Failure called %d times across 3 deliveries, want exactly 1", len(fails))
+	}
+	if fails[0].Outcome != event.OutcomeDeadLettered {
+		t.Errorf("Failure outcome = %q, want %q", fails[0].Outcome, event.OutcomeDeadLettered)
+	}
+	if fails[0].Delivery.Count != 3 {
+		t.Errorf("Failure delivery count = %d, want 3 (the final delivery)", fails[0].Delivery.Count)
+	}
+
+	dones := rec.handlerDones()
+	want := []event.Outcome{event.OutcomeRetry, event.OutcomeRetry, event.OutcomeDeadLettered}
+	if len(dones) != len(want) {
+		t.Fatalf("HandlerDone called %d times, want %d (one per delivery): %+v", len(dones), len(want), dones)
+	}
+	for i, w := range want {
+		if dones[i].Outcome != w {
+			t.Errorf("HandlerDone %d outcome = %q, want %q", i+1, dones[i].Outcome, w)
+		}
+	}
+
+	mu.Lock()
+	got := append([]oxCall(nil), calls...)
+	mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("handler ran %d times, want 3: %+v", len(got), got)
+	}
+	for i, c := range got {
+		if c.count != i+1 {
+			t.Errorf("call %d saw delivery count %d, want %d", i, c.count, i+1)
+		}
+	}
+	for i := 1; i < len(got); i++ {
+		if gap := got[i].at.Sub(got[i-1].at); gap < backOff {
+			t.Errorf("redelivery gap before delivery %d = %s, want at least %s", i+1, gap, backOff)
+		}
+	}
+
+	if n := itStreamMsgs(t, js, dlqStream); n != 1 {
+		t.Errorf("DLQ stream holds %d messages, want exactly 1", n)
+	}
 }
