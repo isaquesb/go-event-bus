@@ -14,10 +14,12 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
-var tracer = otel.Tracer("go-event-bus")
+// tracerName is the instrumentation scope of the producer spans.
+const tracerName = "github.com/isaquesb/go-event-bus/nats"
 
 // natsConn is an internal interface over *nats.Conn to allow testing.
 type natsConn interface {
@@ -167,23 +169,53 @@ func (b *Bus) msgScope(ctx context.Context) context.Context {
 	return ctx
 }
 
+// tracer returns the tracer of the producer spans: BusOptions.TracerProvider, or
+// the global provider resolved at call time when none was configured.
+func (b *Bus) tracer() trace.Tracer {
+	tp := b.tp
+	if tp == nil {
+		tp = otel.GetTracerProvider()
+	}
+	return tp.Tracer(tracerName)
+}
+
+// startPublish starts the producer span of an Emit or EmitSync following the
+// OTel messaging conventions: "publish <subject>", kind Producer. The
+// attributes are ids and the subject only, never the payload.
+func (b *Bus) startPublish(ctx context.Context, subject, id string) (context.Context, trace.Span) {
+	attrs := []attribute.KeyValue{
+		semconv.MessagingSystemKey.String("nats"),
+		semconv.MessagingOperationName("publish"),
+		semconv.MessagingOperationTypeSend,
+		semconv.MessagingDestinationName(subject),
+	}
+	if id != "" {
+		attrs = append(attrs, semconv.MessagingMessageID(id))
+	}
+	return b.tracer().Start(ctx, "publish "+subject,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(attrs...),
+	)
+}
+
 // reply sends data and h to the reply subject of msg through the natsConn seam.
-// It does nothing for a message without a reply subject (a plain publish).
-func (b *Bus) reply(ctx context.Context, msg *nats.Msg, data []byte, h nats.Header) {
+// It does nothing for a message without a reply subject (a plain publish). A
+// failed publish is reported as an InternalError signal (Op reply).
+func (b *Bus) reply(ctx context.Context, msg *nats.Msg, handlerName string, data []byte, h nats.Header) {
 	if msg.Reply == "" {
 		return
 	}
 	if err := b.nc.PublishMsg(&nats.Msg{Subject: msg.Reply, Header: h, Data: data}); err != nil {
-		slog.WarnContext(ctx, "nats reply failed", "subject", msg.Subject, "err", err)
+		b.internalError(ctx, event.OpReply, handlerName, msg.Subject, err)
 	}
 }
 
 // replyError sends the failure reply of a request: the HeaderError header and
 // no body.
-func (b *Bus) replyError(ctx context.Context, msg *nats.Msg, reason string, err error) {
+func (b *Bus) replyError(ctx context.Context, msg *nats.Msg, handlerName, reason string, err error) {
 	h := nats.Header{}
 	h.Set(HeaderError, errorHeaderValue(reason, err, b.replyErrMsg))
-	b.reply(ctx, msg, nil, h)
+	b.reply(ctx, msg, handlerName, nil, h)
 }
 
 // resolve applies the bus-owned options to cfg and resolves the Metadata of an
@@ -215,14 +247,7 @@ func (b *Bus) Emit(ctx context.Context, e event.Event, opts ...event.EmitOption)
 	cfg := event.ApplyEmitOptions(e, opts...)
 	md := b.resolve(ctx, e, cfg)
 
-	ctx, span := tracer.Start(ctx, "eventbus.emit",
-		trace.WithSpanKind(trace.SpanKindProducer),
-		trace.WithAttributes(
-			attribute.String("messaging.system", "nats"),
-			attribute.String("messaging.destination", cfg.Subject),
-			attribute.String("event.name", e.Name()),
-		),
-	)
+	ctx, span := b.startPublish(ctx, cfg.Subject, md.ID)
 	defer span.End()
 
 	data, err := event.EncodeEvent(ctx, b.reg, e, md)
@@ -257,14 +282,7 @@ func (b *Bus) EmitSync(ctx context.Context, e event.Event) (event.Event, error) 
 	// satisfying event.SyncBus. Lineage comes from the Metadata in ctx.
 	md := b.resolve(ctx, e, event.ApplyEmitOptions(e))
 
-	ctx, span := tracer.Start(ctx, "eventbus.emit_sync",
-		trace.WithSpanKind(trace.SpanKindProducer),
-		trace.WithAttributes(
-			attribute.String("messaging.system", "nats"),
-			attribute.String("messaging.destination", e.Name()),
-			attribute.String("event.name", e.Name()),
-		),
-	)
+	ctx, span := b.startPublish(ctx, e.Name(), md.ID)
 	defer span.End()
 
 	data, err := event.EncodeEvent(ctx, b.reg, e, md)
@@ -423,7 +441,7 @@ func (b *Bus) SubscribeSync(
 		msgCtx, evt, err := b.reg.Decode(hctx, msg.Data)
 		if err != nil {
 			s, derr := b.settleDecode(hctx, msg, handlerName, err)
-			b.replyError(hctx, msg, settleReason(s, derr), derr)
+			b.replyError(hctx, msg, handlerName, settleReason(s, derr), derr)
 			replied = true
 			return
 		}
@@ -437,7 +455,7 @@ func (b *Bus) SubscribeSync(
 
 		if handleErr != nil {
 			s := b.settle(hctx, msgCtx, evt, handlerName, handleErr)
-			b.replyError(msgCtx, msg, settleReason(s, handleErr), handleErr)
+			b.replyError(msgCtx, msg, handlerName, settleReason(s, handleErr), handleErr)
 			replied = true
 			return
 		}
@@ -451,14 +469,11 @@ func (b *Bus) SubscribeSync(
 		md := b.resolve(msgCtx, evt, rcfg)
 		resp, err := event.EncodeEvent(msgCtx, b.reg, evt, md)
 		if err != nil {
-			slog.ErrorContext(msgCtx, "failed to encode reply",
-				"subject", subject,
-				"err", err,
-			)
+			b.internalError(msgCtx, event.OpEncodeReply, handlerName, msg.Subject, err)
 			return
 		}
 
-		b.reply(msgCtx, msg, resp, nil)
+		b.reply(msgCtx, msg, handlerName, resp, nil)
 		replied = true
 	})
 	if err != nil {
@@ -502,7 +517,7 @@ func (b *Bus) recoverCallback(ctx context.Context, msg *nats.Msg, handlerName st
 					&event.PanicError{Value: r2, Stack: debug.Stack()})
 			}
 		}()
-		b.replyError(ctx, msg, event.ReasonPanic, &event.PanicError{Value: r, Stack: stack})
+		b.replyError(ctx, msg, handlerName, event.ReasonPanic, &event.PanicError{Value: r, Stack: stack})
 	}()
 }
 
@@ -550,7 +565,7 @@ func (b *Bus) rejectInbound(ctx context.Context, msg *nats.Msg, handlerName stri
 		Publisher:       b.dlq,
 	})
 	if sync {
-		b.replyError(ictx, msg, s.Reason, event.ErrShutdownInterrupted)
+		b.replyError(ictx, msg, handlerName, s.Reason, event.ErrShutdownInterrupted)
 	}
 }
 
