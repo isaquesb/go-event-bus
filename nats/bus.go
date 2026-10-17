@@ -280,14 +280,20 @@ func (b *Bus) Subscribe(
 	}
 
 	sub, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
-		defer b.recoverCallback(ctx, msg, handlerName, nil)
-
+		// Track first, then the deferred release, then the deferred recover: on
+		// unwinding the recover runs first, while the message is still counted in
+		// flight, so a Shutdown in progress cannot see it idle (and close the
+		// connection) before a panic is handled. Track only takes the lifecycle
+		// mutex and never panics, and the recover also guards the refused branch.
 		release, ok := b.life.Track()
+		if ok {
+			defer release()
+		}
+		defer b.recoverCallback(ctx, msg, handlerName, nil)
 		if !ok {
 			b.rejectInbound(ctx, msg, handlerName, false)
 			return
 		}
-		defer release()
 
 		// hctx keeps the Subscribe ctx values and cancellation and is also
 		// cancelled, with cause ErrShutdownInterrupted, when Shutdown gives up.
@@ -418,6 +424,12 @@ func (b *Bus) SubscribeSync(
 // panic may come from it) and never dead-lettered. When replied is non-nil and
 // false the request is still unanswered, so it gets an Eventbus-Error reply with
 // reason panic instead of waiting for the requester timeout.
+//
+// Both callbacks register it after the deferred Track release, so it runs first
+// on unwinding, while the message is still counted in flight: a Shutdown in
+// progress cannot close the connection before the panic reply went out. It also
+// covers the branch where Track refused the message, where rejectInbound runs the
+// user OnErr through Settle.
 //
 // It must be called directly by defer, as recover only works there.
 func (b *Bus) recoverCallback(ctx context.Context, msg *nats.Msg, handlerName string, replied *bool) {
@@ -571,7 +583,8 @@ func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber)
 // handler, which is accepted so the handler can finish its work. Every tracked
 // subscription is drained (messages already received are still delivered), then
 // Shutdown waits for the in-flight callbacks, and only then closes the
-// connection, so the replies of SubscribeSync requests still go out.
+// connection, so the replies of SubscribeSync requests, including the
+// Eventbus-Error reply of a recovered panic, still go out.
 //
 // When ctx expires first the handlers are interrupted (their context is
 // cancelled with cause event.ErrShutdownInterrupted and they are reported, never

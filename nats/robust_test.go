@@ -976,3 +976,117 @@ func TestNatsSync_PanicReplyBeforeShutdownCloses(t *testing.T) {
 		}
 	})
 }
+
+func TestNatsBus_RejectedDeliveryPanicRecovered(t *testing.T) {
+	rows := []struct {
+		name string
+		sync bool
+	}{
+		{"Subscribe", false},
+		{"SubscribeSync", true},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			logs := wrInstallLogs(t)
+			synctest.Test(t, func(t *testing.T) {
+				conn := newRbConn()
+				reg := newMdRegistry("rb.order")
+				bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+				handler := func(context.Context, event.Event) error {
+					t.Error("handler ran for a rejected delivery")
+					return nil
+				}
+				var err error
+				if row.sync {
+					err = bus.SubscribeSync(context.Background(), "rb.order", handler, event.WithHandlerName("h"))
+				} else {
+					err = bus.Subscribe(context.Background(), "rb.order", handler, event.WithHandlerName("h"))
+				}
+				if err != nil {
+					t.Fatalf("subscribe: %v", err)
+				}
+				if err := bus.Shutdown(context.Background()); err != nil {
+					t.Fatalf("Shutdown = %v, want nil", err)
+				}
+
+				// Track refuses the message now; the OnErr panics inside rejectInbound.
+				// The callback returns normally: a propagated panic aborts the binary.
+				msg := &natsgo.Msg{Subject: "rb.order", Data: rbPayload(t, reg, "wr-r1")}
+				if row.sync {
+					msg.Reply = rbInbox
+				}
+				conn.callback(t, "rb.order")(msg)
+
+				if !logs.errorWithPanic("wr: onerr boom") {
+					t.Error("no Error record with panic \"wr: onerr boom\"")
+				}
+				conn.mu.Lock()
+				var inbox []*natsgo.Msg
+				for _, m := range conn.replies {
+					if m.Subject == rbInbox {
+						inbox = append(inbox, m)
+					}
+				}
+				conn.mu.Unlock()
+				if row.sync {
+					if len(inbox) != 1 {
+						t.Fatalf("messages published to %s = %d, want 1", rbInbox, len(inbox))
+					}
+					if v := inbox[0].Header.Get(HeaderError); v != event.ReasonPanic {
+						t.Errorf("reply %s = %q, want %q", HeaderError, v, event.ReasonPanic)
+					}
+				} else if len(inbox) != 0 {
+					t.Errorf("messages published to %s = %d, want 0", rbInbox, len(inbox))
+				}
+				if err := bus.Shutdown(context.Background()); err != nil {
+					t.Errorf("second Shutdown = %v, want nil", err)
+				}
+			})
+		})
+	}
+}
+
+func TestNatsBus_PanicDuringShutdownLoggedBeforeReturn(t *testing.T) {
+	logs := wrInstallLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		conn := newRbConn()
+		reg := newMdRegistry("rb.order")
+		gate := newRbGate()
+		defer gate.open()
+		entered := make(chan struct{})
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+
+		err := bus.Subscribe(context.Background(), "rb.order", func(context.Context, event.Event) error {
+			close(entered)
+			<-gate.ch
+			return errors.New("wr: failed")
+		}, event.WithHandlerName("h"))
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		cbDone := rbDeliver(t, conn, "rb.order", &natsgo.Msg{Subject: "rb.order", Data: rbPayload(t, reg, "wr-d1")})
+		<-entered
+
+		shutDone := make(chan error, 1)
+		go func() { shutDone <- bus.Shutdown(context.Background()) }()
+		synctest.Wait()
+		select {
+		case err := <-shutDone:
+			t.Fatalf("Shutdown returned %v while a handler was in flight", err)
+		default:
+		}
+
+		gate.open()
+		if err := <-shutDone; err != nil {
+			t.Errorf("Shutdown = %v, want nil", err)
+		}
+		// The record is logged before release, and release happens before Wait returns.
+		if !logs.errorWithPanic("wr: onerr boom") {
+			t.Error("panic record not logged before Shutdown returned")
+		}
+		rbWait(t, cbDone)
+		if n := conn.closeCount(); n != 1 {
+			t.Errorf("conn closed %d times, want 1", n)
+		}
+	})
+}
