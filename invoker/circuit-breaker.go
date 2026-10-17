@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/isaquesb/go-event-bus"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -124,8 +125,13 @@ type CircuitBreakerConfig struct {
 	OnStateChange func(ctx context.Context, t event.BreakerTransition)
 }
 
+// breakerIDs hands out the identity of each CircuitBreaker. The first id is 1,
+// so zero keeps meaning "unknown" in event.BreakerTransition.BreakerID.
+var breakerIDs atomic.Uint64
+
 func NewCircuitBreaker(cfg CircuitBreakerConfig) *CircuitBreaker {
 	return &CircuitBreaker{
+		id:       breakerIDs.Add(1),
 		cfg:      cfg,
 		breakers: make(map[string]*handlerBreaker),
 	}
@@ -151,6 +157,11 @@ func NewCircuitBreaker(cfg CircuitBreakerConfig) *CircuitBreaker {
 // probe still running after that is superseded by the next arrival and its
 // late completion is ignored. A zero OpenTimeout never expires the lease.
 type CircuitBreaker struct {
+	// id is process-unique and never zero. It is copied into every
+	// event.BreakerTransition this breaker reports, so an Observer can tell
+	// two breakers that serve the same handler name apart and order Seq per
+	// breaker.
+	id  uint64
 	cfg CircuitBreakerConfig
 
 	mu       sync.Mutex
@@ -362,13 +373,14 @@ func (c *CircuitBreaker) emitTransition(ctx context.Context, handler string, tr 
 	}
 
 	t := event.BreakerTransition{
-		Handler:  handler,
-		From:     breakerState(tr.from),
-		To:       breakerState(tr.to),
-		Reason:   event.BreakerReason(tr.reason),
-		Failures: tr.failures,
-		At:       tr.at,
-		Seq:      tr.seq,
+		Handler:   handler,
+		From:      breakerState(tr.from),
+		To:        breakerState(tr.to),
+		Reason:    event.BreakerReason(tr.reason),
+		Failures:  tr.failures,
+		At:        tr.at,
+		Seq:       tr.seq,
+		BreakerID: c.id,
 	}
 
 	c.guarded(ctx, handler, func() {

@@ -78,6 +78,10 @@ func TestCircuitBreaker_TransitionToObserverAndCallback(t *testing.T) {
 			t.Errorf("%s: At must be set", label)
 		}
 		got.At = time.Time{}
+		if got.BreakerID == 0 {
+			t.Errorf("%s: BreakerID must be set", label)
+		}
+		got.BreakerID = 0
 		if got != want {
 			t.Errorf("%s: got %+v, want %+v", label, got, want)
 		}
@@ -106,6 +110,44 @@ func TestCircuitBreaker_TransitionToObserverAndCallback(t *testing.T) {
 	next := cb.Invoke(ctx, btEvent{}, "h", func(context.Context) error { return nil })
 	if !errors.Is(next, event.ErrCircuitOpen) {
 		t.Errorf("a call on the open breaker must match ErrCircuitOpen, got %v", next)
+	}
+}
+
+// TestCircuitBreaker_BreakerIDUniquePerInstance proves that every breaker stamps
+// a non-zero id on its transitions, that the id differs between instances and
+// that all transitions of one breaker share it.
+func TestCircuitBreaker_BreakerIDUniquePerInstance(t *testing.T) {
+	trip := func(handlers ...string) []event.BreakerTransition {
+		rec := &invRecorder{}
+		cb := invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
+			FailureThreshold: 1,
+			SuccessThreshold: 1,
+			OpenTimeout:      time.Hour,
+		})
+		ctx := event.WithObserver(context.Background(), rec)
+		for _, h := range handlers {
+			_ = cb.Invoke(ctx, btEvent{}, h, func(context.Context) error { return errors.New("transient") })
+		}
+		var out []event.BreakerTransition
+		for _, c := range rec.Transitions() {
+			out = append(out, c.Val)
+		}
+		return out
+	}
+
+	a := trip("h", "other")
+	b := trip("h")
+	if len(a) != 2 || len(b) != 1 {
+		t.Fatalf("transitions = %d and %d, want 2 and 1", len(a), len(b))
+	}
+	if a[0].BreakerID == 0 || b[0].BreakerID == 0 {
+		t.Fatalf("BreakerID must be non-zero, got %d and %d", a[0].BreakerID, b[0].BreakerID)
+	}
+	if a[0].BreakerID == b[0].BreakerID {
+		t.Errorf("two breakers share BreakerID %d", a[0].BreakerID)
+	}
+	if a[0].BreakerID != a[1].BreakerID {
+		t.Errorf("transitions of one breaker carry ids %d and %d, want the same", a[0].BreakerID, a[1].BreakerID)
 	}
 }
 

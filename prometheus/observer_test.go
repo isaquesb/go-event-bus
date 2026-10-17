@@ -278,6 +278,37 @@ func TestObserver_BreakerGaugePerHandler(t *testing.T) {
 	}
 }
 
+// TestObserver_BreakerGaugeNewBreakerSameHandler is the tracer end of WR-03: a
+// rebuilt breaker that reuses a handler name starts again at Seq 1 and must
+// still move the gauge, while a late transition of the old breaker stays
+// ignored.
+func TestObserver_BreakerGaugeNewBreakerSameHandler(t *testing.T) {
+	ctx := context.Background()
+	reg := prometheus.NewRegistry()
+	o := NewObserver(reg)
+	tr := func(id uint64, to event.BreakerState, seq uint64) event.BreakerTransition {
+		return event.BreakerTransition{Handler: "h", To: to, Reason: event.BreakerReasonFailureThreshold, Seq: seq, BreakerID: id}
+	}
+	state := func() float64 { return testutil.ToFloat64(o.breakerState.WithLabelValues("h")) }
+
+	o.BreakerTransition(ctx, tr(1, event.BreakerOpen, 1))
+	o.BreakerTransition(ctx, tr(1, event.BreakerHalfOpen, 2))
+	o.BreakerTransition(ctx, tr(1, event.BreakerOpen, 3))
+	if got := state(); got != 1 {
+		t.Fatalf("state after breaker 1 ends open = %v, want 1", got)
+	}
+
+	o.BreakerTransition(ctx, tr(2, event.BreakerClosed, 1))
+	if got := state(); got != 0 {
+		t.Fatalf("state after breaker 2 Seq 1 closed = %v, want 0: the gauge froze on the old breaker", got)
+	}
+
+	o.BreakerTransition(ctx, tr(1, event.BreakerHalfOpen, 2)) // late, older Seq of breaker 1
+	if got := state(); got != 0 {
+		t.Fatalf("state after a late breaker 1 Seq 2 = %v, want 0 (ignored)", got)
+	}
+}
+
 func TestObserver_Namespace(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	o := NewObserver(reg, WithNamespace("shop"))

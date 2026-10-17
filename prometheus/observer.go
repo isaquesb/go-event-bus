@@ -118,7 +118,14 @@ type Observer struct {
 	// mu guards lastSeq and the breakerState write, so the Seq check and the
 	// gauge write are one step.
 	mu      sync.Mutex
-	lastSeq map[string]uint64
+	lastSeq map[breakerKey]uint64
+}
+
+// breakerKey scopes Seq: it increases per handler breaker of one CircuitBreaker
+// instance, so the order guard is keyed by the handler and the breaker id.
+type breakerKey struct {
+	handler string
+	breaker uint64
 }
 
 // NewObserver declares the whole metric set on reg and returns the Observer. A
@@ -174,7 +181,7 @@ func NewObserver(reg prometheus.Registerer, opts ...Option) *Observer {
 			"Stale idempotency in-progress markers that were taken over.", "handler"),
 		internalErrors: counter("eventbus_internal_errors_total",
 			"Errors inside the library that no handler sees.", "component", "op"),
-		lastSeq: make(map[string]uint64),
+		lastSeq: make(map[breakerKey]uint64),
 	}
 }
 
@@ -228,8 +235,10 @@ func (o *Observer) HandlerDone(_ context.Context, r event.HandlerResult) {
 }
 
 // BreakerTransition counts the transition and sets eventbus_breaker_state. The
-// gauge is last-writer-wins by Seq per handler: an older Seq delivered late
-// never overwrites a newer state.
+// gauge is last-writer-wins by Seq per breaker instance (handler and BreakerID):
+// an older Seq of the same breaker delivered late never overwrites a newer
+// state, and a rebuilt breaker that reuses a handler name starts a new order and
+// is followed. The gauge itself is labeled by handler only.
 func (o *Observer) BreakerTransition(_ context.Context, t event.BreakerTransition) {
 	o.breakerTransitions.WithLabelValues(t.Handler, string(t.From), string(t.To), string(t.Reason)).Inc()
 
@@ -247,9 +256,10 @@ func (o *Observer) BreakerTransition(_ context.Context, t event.BreakerTransitio
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if last, ok := o.lastSeq[t.Handler]; ok && t.Seq <= last {
+	key := breakerKey{handler: t.Handler, breaker: t.BreakerID}
+	if last, ok := o.lastSeq[key]; ok && t.Seq <= last {
 		return
 	}
-	o.lastSeq[t.Handler] = t.Seq
+	o.lastSeq[key] = t.Seq
 	o.breakerState.WithLabelValues(t.Handler).Set(v)
 }
