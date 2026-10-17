@@ -444,12 +444,7 @@ func (b *Bus) Subscribe(
 	policy := deliveryPolicy{maxDeliver: cfg.MaxDeliver, backOff: backOff}
 	cc, err := c.Consume(
 		b.msgHandler(ctx, handlerName, handler, policy),
-		jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
-			slog.Warn("consumer error",
-				"handler", handlerName,
-				"error", err,
-			)
-		}),
+		jetstream.ConsumeErrHandler(b.consumeErr(ctx, handlerName, subject)),
 	)
 	if err != nil {
 		return err
@@ -467,6 +462,19 @@ func (b *Bus) Subscribe(
 	b.mu.Unlock()
 
 	return nil
+}
+
+// consumeErr is the error handler of a consumer's Consume loop: it receives the
+// errors nats.go raises while pulling messages (heartbeat loss, a deleted
+// consumer, a broken connection).
+func (b *Bus) consumeErr(_ context.Context, handlerName, subject string) func(jetstream.ConsumeContext, error) {
+	return func(_ jetstream.ConsumeContext, err error) {
+		slog.Warn("consumer error",
+			"handler", handlerName,
+			"subject", subject,
+			"error", err,
+		)
+	}
 }
 
 // RegisterSubscribers registers multiple subscribers at once.
