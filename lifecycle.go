@@ -117,7 +117,7 @@ func (l *Lifecycle) Admit(ctx context.Context) (release func(), err error) {
 		l.mu.Unlock()
 		return nil, ErrBusClosed
 	}
-	if l.closed && !(nested && l.inflight > 0) {
+	if l.closed && (!nested || l.inflight <= 0) {
 		l.mu.Unlock()
 		return nil, ErrBusClosed
 	}
