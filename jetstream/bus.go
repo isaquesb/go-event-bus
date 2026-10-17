@@ -610,8 +610,11 @@ func (b *Bus) delivery(msg jetstream.Msg, policy deliveryPolicy) event.Delivery 
 // without waiting for AckWait and a poison message cannot spin. A message that
 // Settle already dead-lettered or reported as terminal is instead ended with
 // TermWithReason on a non-final delivery, so it never runs again and is never
-// dead-lettered twice. The recover never dead-letters and never calls the
-// reason-less Term.
+// dead-lettered twice. On the final delivery a message not yet dead-lettered or
+// reported is instead reported through the bus OnErr (nil event,
+// *event.PanicError) and ended with TermWithReason, because the server would not
+// redeliver it. The recover never dead-letters and never calls the reason-less
+// Term.
 func (b *Bus) msgHandler(
 	ctx context.Context,
 	handlerName string,
@@ -642,11 +645,18 @@ func (b *Bus) msgHandler(
 			}
 			acted = true
 			d := b.delivery(msg, policy)
+			pe := &event.PanicError{Value: r, Stack: stack}
 			var aerr error
-			if guard.ended && !d.Final() {
+			switch {
+			case d.Final() && !guard.ended:
+				// The server will not redeliver: report, then end the message.
+				b.reportPanicOnFinal(ctx, msg, handlerName, d, pe)
+				aerr = msg.TermWithReason(termReasonPanicOnFinal)
+			case guard.ended && !d.Final():
 				aerr = msg.TermWithReason(termReasonPanicAfterSettle)
-			} else {
-				pe := &event.PanicError{Value: r, Stack: stack}
+			default:
+				// A non-final delivery with no settlement, or the final
+				// delivery after settlement.
 				aerr = msg.NakWithDelay(b.delayFor(pe, d, policy.backOff))
 			}
 			if aerr != nil {
@@ -724,6 +734,12 @@ func (b *Bus) msgHandler(
 // callback panicked after Settle dead-lettered or reported it.
 const termReasonPanicAfterSettle = "panic: recovered after settlement"
 
+// termReasonPanicOnFinal is the TermWithReason text of a message whose callback
+// panicked outside the handler on its final delivery, before Settle
+// dead-lettered or reported it. The server would not redeliver it, so the bus
+// reports it through OnErr and ends it.
+const termReasonPanicOnFinal = "panic: recovered on the final delivery before settlement"
+
 // settleGuard records, for one message, whether Settle got past the point of no
 // return: the bus DLQ publish returned nil, or Settle began reporting the
 // terminal outcome. Only two calls set ended: the Publish of the wrapper from
@@ -732,10 +748,11 @@ const termReasonPanicAfterSettle = "panic: recovered after settlement"
 // OnErr method, so every reporting callback runs with ended already true, and
 // so does the chain-dead-lettered path.
 //
-// msgHandler's recover reads ended: a message that was dead-lettered or
-// reported must not be redelivered, since that would rerun the handler, write a
-// second DLQ record and report the outcome again. It is used on the delivery
-// goroutine only, so it needs no lock.
+// msgHandler's recover reads ended in two places: the non-final Term after
+// settlement, and the final-delivery report-and-Term before settlement. A
+// message that was dead-lettered or reported must not be redelivered, since that
+// would rerun the handler, write a second DLQ record and report the outcome
+// again. It is used on the delivery goroutine only, so it needs no lock.
 type settleGuard struct {
 	ended bool
 }
@@ -771,6 +788,29 @@ func (w guardedPublisher) Publish(ctx context.Context, rec event.DLQRecord) erro
 		w.g.ended = true
 	}
 	return err
+}
+
+// reportPanicOnFinal reports a panic outside the handler through the bus OnErr.
+// It is called only from the msgHandler recover, on the final delivery, when
+// Settle did not dead-letter or report the message. The bus OnErr gets a nil
+// event and the *event.PanicError, and is called at most once on this path,
+// because settleGuard.onErr sets ended before it forwards. The call has its own
+// recover: a panicking OnErr is logged and cannot escape the msgHandler recover
+// or skip the TermWithReason that follows.
+func (b *Bus) reportPanicOnFinal(ctx context.Context, msg jetstream.Msg, handlerName string, d event.Delivery, pe *event.PanicError) {
+	if b.onErr == nil {
+		return
+	}
+	defer func() {
+		if value := recover(); value != nil {
+			slog.ErrorContext(ctx, "eventbus: panic in OnErr while reporting a panic on the final delivery",
+				"handler", handlerName,
+				"subject", msg.Subject(),
+				"panic", fmt.Sprint(value),
+			)
+		}
+	}()
+	b.onErr(event.WithDelivery(ctx, d), nil, pe, handlerName)
 }
 
 // handBack gives an unstarted message back to the server with Nak while the bus
