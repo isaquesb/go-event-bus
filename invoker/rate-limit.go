@@ -42,6 +42,10 @@ func NewRateLimiter(
 	}
 }
 
+// RateLimiter rejects events over their rate with ErrRateLimited. A failing
+// store is returned as is and reported to the Observer in the context as a
+// StoreError{Store: "rate_limit", Op: "allow"}; a rejected event emits no
+// diagnostic signal, because it is a HandlerDone outcome.
 type RateLimiter struct {
 	store RateLimitStore
 	cfg   RateLimitConfig
@@ -73,6 +77,13 @@ func (i *RateLimiter) Invoke(
 		i.cfg.Burst,
 	)
 	if err != nil {
+		event.ObserverFromContext(ctx).StoreError(ctx, event.StoreErrorInfo{
+			Handler: handler,
+			Event:   evt.Name(),
+			Store:   "rate_limit",
+			Op:      "allow",
+			Err:     err,
+		})
 		return err
 	}
 

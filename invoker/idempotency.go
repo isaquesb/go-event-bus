@@ -8,14 +8,6 @@ import (
 	"time"
 )
 
-/**
-Expose:
-idempotency_hits_total{event,handler}
-idempotency_inflight_total
-idempotency_completed_total
-idempotency_expired_locks_total
-*/
-
 type IdempotencyStatus string
 
 const (
@@ -66,9 +58,30 @@ func NewIdempotency(
 	}
 }
 
+// Idempotency skips a handler that already completed for the same key.
+//
+// Diagnostics reach the Observer in the context: a store failure is a
+// StoreError{Store: "idempotency"} with Op get, put_processing, put_completed,
+// put_failed or put_dead_lettered, and taking over a processing record older
+// than ProcessingTTL is an IdempotencyStale. A duplicate (ErrDuplicate) and an
+// execution in progress (ErrInProgress) emit no diagnostic signal: they are
+// HandlerDone outcomes.
 type Idempotency struct {
 	store IdempotencyStore
 	cfg   IdempotencyConfig
+}
+
+// idempotencyStore is the Store label of the idempotency StoreError signals.
+const idempotencyStore = "idempotency"
+
+func (i *Idempotency) storeError(ctx context.Context, evt event.Event, handler, op string, err error) {
+	event.ObserverFromContext(ctx).StoreError(ctx, event.StoreErrorInfo{
+		Handler: handler,
+		Event:   evt.Name(),
+		Store:   idempotencyStore,
+		Op:      op,
+		Err:     err,
+	})
 }
 
 func (i *Idempotency) Invoke(
@@ -88,6 +101,7 @@ func (i *Idempotency) Invoke(
 
 	rec, exists, err := i.store.Get(ctx, key)
 	if err != nil {
+		i.storeError(ctx, evt, handlerName, "get", err)
 		return err
 	}
 
@@ -103,7 +117,12 @@ func (i *Idempotency) Invoke(
 				return event.ErrInProgress
 			}
 
-			// stale lock → continuar
+			// Stale lock: take it over and run.
+			event.ObserverFromContext(ctx).IdempotencyStale(ctx, event.IdempotencyStaleInfo{
+				Handler: handlerName,
+				Event:   evt.Name(),
+				Age:     time.Since(rec.StartedAt),
+			})
 
 		case StatusDeadLettered, StatusFailed:
 			// dead_lettered and failed records are not completions: fall
@@ -115,29 +134,32 @@ func (i *Idempotency) Invoke(
 		Status:    StatusProcessing,
 		StartedAt: time.Now(),
 	}); err != nil {
+		i.storeError(ctx, evt, handlerName, "put_processing", err)
 		return err
 	}
 
 	err = handle(ctx)
 
 	now := time.Now()
-	status := StatusCompleted
+	status, op := StatusCompleted, "put_completed"
 
 	switch {
 	case err == nil:
 	case errors.Is(err, event.ErrDeadLettered):
-		status = StatusDeadLettered
+		status, op = StatusDeadLettered, "put_dead_lettered"
 	default:
-		status = StatusFailed
+		status, op = StatusFailed, "put_failed"
 	}
 
 	// A failing final Put does not change the handler result; it only leaves
-	// the processing record to expire. Its StoreError signal arrives in 10-08.
-	_ = i.store.Put(ctx, key, IdempotencyRecord{
+	// the processing record to expire, and is reported as a StoreError.
+	if perr := i.store.Put(ctx, key, IdempotencyRecord{
 		Status:    status,
 		StartedAt: rec.StartedAt,
 		EndedAt:   &now,
-	})
+	}); perr != nil {
+		i.storeError(ctx, evt, handlerName, op, perr)
+	}
 
 	return err
 }
