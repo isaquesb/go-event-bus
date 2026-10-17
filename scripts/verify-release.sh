@@ -2,6 +2,7 @@
 # Consumer-view release verification (D-20, D-27).
 #
 # Usage: scripts/verify-release.sh [--wait MINUTES] [--ref GIT_REF] [--no-probe] VERSION [MODULE ...]
+#        scripts/verify-release.sh --print-probe root|prometheus
 #
 #   VERSION   vMAJOR.MINOR.PATCH, e.g. v0.3.0
 #   MODULE    root, invoker, json, nats, jetstream, redis, telemetry, prometheus, examples
@@ -15,8 +16,16 @@
 #                   `git archive GIT_REF` and wired in with a directory replace, so VERSION is never
 #                   requested from the proxy; its in-repo dependencies still resolve from the proxy,
 #                   which proves that the tagged go.mod requires published versions.
-#   --no-probe      Skip the behavioral probe for root (NewLocalBus with a nil Invoker, two-value
-#                   EmitSync).
+#   --no-probe      Skip both behavioral probes.
+#   --print-probe root|prometheus
+#                   Print the main.go of a probe to stdout and exit 0 (needs no VERSION).
+#
+# Behavioral probes (they only pass on v0.4.0 code, never on v0.3.0):
+#   root        NewLocalBus with a nil Invoker, an Observer and a MemoryDLQ; two-value EmitSync; a
+#               terminal error (ErrSendToDLQ) yields exactly one Failure with Outcome dead_lettered
+#               and one DLQ record.
+#   prometheus  NewObserver on a fresh registry, one HandlerDone, and the family
+#               eventbus_handler_total gathered with one metric of value 1.
 #
 # Each module is checked in its own fresh temp module under GOWORK=off with the default GOPROXY and
 # GOSUMDB (what `go get` users receive). Direct VCS fetching is never used: the moved root v0.1.0
@@ -39,9 +48,160 @@ die() {
   exit 2
 }
 
+# The v0.4.0 behavioral probe for root: a program that only compiles and passes against v0.4.0
+# (Observer, MemoryDLQ, the Failure signal), so a PASS proves users receive v0.4.0 code and not
+# v0.3.0. Writes main.go in the current directory.
+write_probe() {
+  cat >main.go <<'EOF'
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+
+	event "github.com/isaquesb/go-event-bus"
+)
+
+type probeOK struct{}
+
+func (probeOK) Name() string { return "probe.ok" }
+
+type probeFail struct{}
+
+func (probeFail) Name() string { return "probe.fail" }
+
+// recorder embeds event.NopObserver and keeps every Failure signal.
+type recorder struct {
+	event.NopObserver
+	mu       sync.Mutex
+	failures []event.FailureContext
+}
+
+func (r *recorder) Failure(_ context.Context, f event.FailureContext) {
+	r.mu.Lock()
+	r.failures = append(r.failures, f)
+	r.mu.Unlock()
+}
+
+func fail(args ...any) {
+	fmt.Fprintln(os.Stderr, args...)
+	os.Exit(1)
+}
+
+func main() {
+	rec := &recorder{}
+	dlq := event.NewMemoryDLQ()
+	// Invoker left nil on purpose: releases without the passthrough default panic here.
+	bus := event.NewLocalBus(event.LocalBusOptions{Observer: rec, DLQPublisher: dlq})
+	ctx := context.Background()
+
+	called := false
+	if err := bus.Subscribe(ctx, "probe.ok", func(context.Context, event.Event) error {
+		called = true
+		return nil
+	}); err != nil {
+		fail("subscribe probe.ok:", err)
+	}
+	if err := bus.Subscribe(ctx, "probe.fail", func(context.Context, event.Event) error {
+		return fmt.Errorf("probe: %w", event.ErrSendToDLQ)
+	}); err != nil {
+		fail("subscribe probe.fail:", err)
+	}
+
+	// Two-value EmitSync: releases before the SyncBus alignment do not compile.
+	got, err := bus.EmitSync(ctx, probeOK{})
+	if err != nil || got == nil {
+		fail("EmitSync(probe.ok) returned", got, err)
+	}
+	if !called {
+		fail("handler was not invoked")
+	}
+
+	// A dead-lettered failure is handled: EmitSync returns nil.
+	if _, err := bus.EmitSync(ctx, probeFail{}); err != nil {
+		fail("EmitSync(probe.fail) returned", err)
+	}
+	if n := dlq.Len(); n != 1 {
+		fail("dlq.Len() =", n, "want 1")
+	}
+	rec.mu.Lock()
+	n := len(rec.failures)
+	var outcome event.Outcome
+	if n > 0 {
+		outcome = rec.failures[n-1].Outcome
+	}
+	rec.mu.Unlock()
+	if n != 1 {
+		fail("Failure calls =", n, "want 1")
+	}
+	if outcome != event.OutcomeDeadLettered {
+		fail("Failure outcome =", outcome, "want", event.OutcomeDeadLettered)
+	}
+	if err := bus.Close(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		fail("close:", err)
+	}
+	fmt.Println("probe ok")
+}
+EOF
+}
+
+# The prometheus probe: NewObserver on a fresh registry, one HandlerDone, and the family
+# eventbus_handler_total with one metric of value 1. The Observer exists only from v0.4.0.
+# Writes main.go in the current directory.
+write_probe_prometheus() {
+  cat >main.go <<'EOF'
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	event "github.com/isaquesb/go-event-bus"
+	eventbusprom "github.com/isaquesb/go-event-bus/prometheus"
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+func main() {
+	reg := prometheus.NewRegistry()
+	obs := eventbusprom.NewObserver(reg)
+	obs.HandlerDone(context.Background(), event.HandlerResult{
+		Handler:  "probe",
+		Event:    "probe.evt",
+		Outcome:  event.OutcomeOK,
+		Duration: time.Millisecond,
+	})
+	families, err := reg.Gather()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gather:", err)
+		os.Exit(1)
+	}
+	for _, mf := range families {
+		if mf.GetName() != "eventbus_handler_total" {
+			continue
+		}
+		ms := mf.GetMetric()
+		if len(ms) != 1 || ms[0].GetCounter().GetValue() != 1 {
+			fmt.Fprintln(os.Stderr, "eventbus_handler_total: want one metric of value 1, got", len(ms))
+			os.Exit(1)
+		}
+		fmt.Println("probe ok")
+		return
+	}
+	fmt.Fprintln(os.Stderr, "family eventbus_handler_total not found")
+	os.Exit(1)
+}
+EOF
+}
+
 WAIT_MIN=0
 REF=""
 PROBE=1
+PRINT_PROBE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --wait)
@@ -58,11 +218,30 @@ while [ $# -gt 0 ]; do
       PROBE=0
       shift
       ;;
+    --print-probe)
+      [ $# -ge 2 ] || die "--print-probe needs root or prometheus"
+      case "$2" in
+        root | prometheus) PRINT_PROBE="$2" ;;
+        *) die "--print-probe expects root or prometheus, got: $2" ;;
+      esac
+      shift 2
+      ;;
     -h | --help) usage ;;
     --*) die "unknown option: $1" ;;
     *) break ;;
   esac
 done
+
+if [ -n "$PRINT_PROBE" ]; then
+  PROBE_DIR="$(mktemp -d)"
+  (
+    cd "$PROBE_DIR"
+    if [ "$PRINT_PROBE" = root ]; then write_probe; else write_probe_prometheus; fi
+    cat main.go
+  )
+  rm -rf "$PROBE_DIR"
+  exit 0
+fi
 
 [ $# -ge 1 ] || usage
 VERSION="$1"
@@ -211,50 +390,6 @@ write_blank_import() {
   printf 'package main\n\nimport _ "%s"\n\nfunc main() {}\n' "$1" >main.go
 }
 
-write_probe() {
-  cat >main.go <<'EOF'
-package main
-
-import (
-	"context"
-	"fmt"
-	"os"
-
-	event "github.com/isaquesb/go-event-bus"
-)
-
-type probeEvt struct{}
-
-func (probeEvt) Name() string { return "probe.evt" }
-
-func main() {
-	// nil Invoker on purpose: releases without the passthrough default panic here.
-	bus := event.NewLocalBus(event.LocalBusOptions{})
-	ctx := context.Background()
-	called := false
-	err := bus.Subscribe(ctx, "probe.evt", func(context.Context, event.Event) error {
-		called = true
-		return nil
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "subscribe:", err)
-		os.Exit(1)
-	}
-	// Two-value EmitSync: releases before the SyncBus alignment do not compile.
-	got, err := bus.EmitSync(ctx, probeEvt{})
-	if err != nil || got == nil {
-		fmt.Fprintln(os.Stderr, "EmitSync returned", got, err)
-		os.Exit(1)
-	}
-	if !called {
-		fmt.Fprintln(os.Stderr, "handler was not invoked")
-		os.Exit(1)
-	}
-	fmt.Println("probe ok")
-}
-EOF
-}
-
 # check_module NAME: prints PASS/FAIL, exit status 0 only on PASS. Runs in a subshell.
 check_module() (
   local name="$1" path dir tmp log reasons="" stale listing
@@ -307,10 +442,19 @@ check_module() (
     reasons="$reasons go list -m all failed;"
   fi
 
+  # The probes run only here, after the module resolved (go get in normal mode, the replaced tree
+  # with --ref), so an unpublished version is never requested from the proxy.
   if [ "$name" = root ] && [ "$PROBE" -eq 1 ]; then
     write_probe
     if ! timeout 180 go run . >>"$log" 2>&1; then
-      reasons="$reasons behavioral probe failed (NewLocalBus nil Invoker / two-value EmitSync);"
+      reasons="$reasons behavioral probe failed (v0.4.0 root probe);"
+    fi
+  fi
+  if [ "$name" = prometheus ] && [ "$PROBE" -eq 1 ]; then
+    write_probe_prometheus
+    go mod tidy >>"$log" 2>&1 || true
+    if ! timeout 180 go run . >>"$log" 2>&1; then
+      reasons="$reasons behavioral probe failed (prometheus probe);"
     fi
   fi
 
