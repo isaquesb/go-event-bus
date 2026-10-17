@@ -81,12 +81,28 @@ func (c *mockConsumer) Consume(jetstream.MessageHandler, ...jetstream.PullConsum
 	return &mockConsumeCtx{}, nil
 }
 
-// mockConsumeCtx implements jetstream.ConsumeContext.
-type mockConsumeCtx struct{}
+// mockConsumeCtx implements jetstream.ConsumeContext. Drain and Stop complete
+// immediately: they close the channel Closed returns, once.
+type mockConsumeCtx struct {
+	mu     sync.Mutex
+	closed chan struct{}
+	once   sync.Once
+}
 
-func (c *mockConsumeCtx) Stop()                   {}
-func (c *mockConsumeCtx) Drain()                  {}
-func (c *mockConsumeCtx) Closed() <-chan struct{} { return make(chan struct{}) }
+// closedCh returns the lazily created closed channel.
+func (c *mockConsumeCtx) closedCh() chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed == nil {
+		c.closed = make(chan struct{})
+	}
+	return c.closed
+}
+
+func (c *mockConsumeCtx) finish()                 { c.once.Do(func() { close(c.closedCh()) }) }
+func (c *mockConsumeCtx) Stop()                   { c.finish() }
+func (c *mockConsumeCtx) Drain()                  { c.finish() }
+func (c *mockConsumeCtx) Closed() <-chan struct{} { return c.closedCh() }
 
 // subscriberWithOpts implements event.SubscribeOptionsProvider.
 type subscriberWithOpts struct {

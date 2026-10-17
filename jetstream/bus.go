@@ -94,6 +94,10 @@ type BusOptions struct {
 	// stored but whose acknowledgement was lost. The zero value is 3 attempts
 	// with a 100 ms to 1 s jittered backoff and a 2 s per-attempt timeout.
 	PublishRetry PublishRetryPolicy
+
+	// ShutdownTimeout is the bound Close applies to Shutdown. Values at or
+	// below 0 mean event.DefaultShutdownTimeout.
+	ShutdownTimeout time.Duration
 }
 
 type Bus struct {
@@ -426,6 +430,9 @@ func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber)
 	}
 	return nil
 }
+
+// Shutdown is a stub until the GREEN step.
+func (b *Bus) Shutdown(ctx context.Context) error { return nil }
 
 // Close gracefully drains all consumers and waits for in-flight messages.
 func (b *Bus) Close() error {
