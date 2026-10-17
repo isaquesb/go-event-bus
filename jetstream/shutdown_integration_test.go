@@ -19,10 +19,10 @@ type shOrder struct {
 
 func (e *shOrder) Name() string { return "sh.order" }
 
-// shSetup creates a stream, a bus with the given OnErr and a subscription of fn
+// shSetup creates a stream, a bus with the given Observer and a subscription of fn
 // on base+".order". It returns the bus, the stream, the consumer name and the
 // subject.
-func shSetup(t *testing.T, js jetstream.JetStream, onErr func(context.Context, event.Event, error, string), fn event.HandleFn) (bus *Bus, stream, consumer, subject string) {
+func shSetup(t *testing.T, js jetstream.JetStream, obs event.Observer, fn event.HandleFn) (bus *Bus, stream, consumer, subject string) {
 	t.Helper()
 	base := uniqueName(t, "sh")
 	stream = newStream(t, js, base+".>")
@@ -35,7 +35,7 @@ func shSetup(t *testing.T, js jetstream.JetStream, onErr func(context.Context, e
 	bus = NewBus(js, reg, BusOptions{
 		CircuitOpenDelay: time.Second,
 		RateLimitDelay:   time.Second,
-		OnErr:            onErr,
+		Observer:         obs,
 	})
 	t.Cleanup(func() { _ = bus.Close() })
 
@@ -111,14 +111,8 @@ func TestIntegration_ShutdownBoundedWithBlockedHandler(t *testing.T) {
 func TestIntegration_HandlerPanicDoesNotCrash(t *testing.T) {
 	_, js := connect(t)
 
-	reported := make(chan error, 4)
-	onErr := func(_ context.Context, _ event.Event, err error, _ string) {
-		select {
-		case reported <- err:
-		default:
-		}
-	}
-	bus, stream, consumer, subject := shSetup(t, js, onErr, func(context.Context, event.Event) error {
+	reported := make(chan event.FailureContext, 4)
+	bus, stream, consumer, subject := shSetup(t, js, &joRecorder{ch: reported}, func(context.Context, event.Event) error {
 		panic("sh: handler exploded")
 	})
 
@@ -129,12 +123,12 @@ func TestIntegration_HandlerPanicDoesNotCrash(t *testing.T) {
 	}
 
 	select {
-	case err := <-reported:
-		if !errors.Is(err, event.ErrHandlerPanic) {
-			t.Errorf("OnErr err = %v, want ErrHandlerPanic", err)
+	case f := <-reported:
+		if !errors.Is(f.Cause, event.ErrHandlerPanic) {
+			t.Errorf("Failure cause = %v, want ErrHandlerPanic", f.Cause)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("OnErr did not receive the panic within 5s")
+		t.Fatal("Observer.Failure did not receive the panic within 5s")
 	}
 
 	info := waitConsumerInfo(t, js, stream, consumer, func(ci *jetstream.ConsumerInfo) bool {

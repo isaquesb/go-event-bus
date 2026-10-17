@@ -60,13 +60,13 @@ func itReplaySetup(t *testing.T) *itReplayEnv {
 	t.Cleanup(cancel)
 	env.ctx = ctx
 
-	dlq := NewDLQ(js, nil, prefix)
+	dlq := NewDLQ(js, prefix)
 	reg := itRegistry()
 	bus := NewBus(js, reg, BusOptions{
 		Invoker: invoker.NewChain(
-			invoker.NewIdempotency(env.store, invoker.IdempotencyConfig{}, nil),
-			invoker.NewDLQ(dlq, nil),
-			invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 1}, nil),
+			invoker.NewIdempotency(env.store, invoker.IdempotencyConfig{}),
+			invoker.NewDLQ(dlq),
+			invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 1}),
 		),
 		CircuitOpenDelay: time.Second,
 		RateLimitDelay:   time.Second,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -40,8 +39,8 @@ func rbEmit(t *testing.T, bus *Bus, js *mdJS) []byte {
 func TestJetStreamBus_PanicDeadLetteredThenTermed(t *testing.T) {
 	js := &mdJS{}
 	dlq := event.NewMemoryDLQ()
-	var errs dispErrCounter
-	bus := newMdBus(js, newMdRegistry("rb.order"), BusOptions{DLQPublisher: dlq, OnErr: errs.onErr})
+	errs := &joRecorder{}
+	bus := newMdBus(js, newMdRegistry("rb.order"), BusOptions{DLQPublisher: dlq, Observer: errs})
 	payload := rbEmit(t, bus, js)
 
 	msg := &mdMsg{data: payload, numDelivered: 1}
@@ -65,19 +64,19 @@ func TestJetStreamBus_PanicDeadLetteredThenTermed(t *testing.T) {
 		t.Error("DLQ record has no panic stack header")
 	}
 
-	if n := errs.calls.Load(); n != 1 {
-		t.Fatalf("OnErr calls = %d, want 1", n)
+	if n := errs.failureCount(); n != 1 {
+		t.Fatalf("Failure calls = %d, want 1", n)
 	}
-	last := errs.lastErr()
+	last := errs.lastCause()
 	if !errors.Is(last, event.ErrDeadLettered) || !errors.Is(last, event.ErrHandlerPanic) {
-		t.Errorf("OnErr err = %v, want to match ErrDeadLettered and ErrHandlerPanic", last)
+		t.Errorf("Failure cause = %v, want to match ErrDeadLettered and ErrHandlerPanic", last)
 	}
 }
 
 func TestJetStreamBus_PanicWithoutPublisherDropped(t *testing.T) {
 	js := &mdJS{}
-	var errs dispErrCounter
-	bus := newMdBus(js, newMdRegistry("rb.order"), BusOptions{OnErr: errs.onErr})
+	errs := &joRecorder{}
+	bus := newMdBus(js, newMdRegistry("rb.order"), BusOptions{Observer: errs})
 	payload := rbEmit(t, bus, js)
 
 	msg := &mdMsg{data: payload, numDelivered: 1}
@@ -92,11 +91,11 @@ func TestJetStreamBus_PanicWithoutPublisherDropped(t *testing.T) {
 	if got.acks != 0 || got.naks != 0 || got.plainTerms != 0 {
 		t.Errorf("snapshot = %+v, want only a TermWithReason", got)
 	}
-	if n := errs.calls.Load(); n != 1 {
-		t.Fatalf("OnErr calls = %d, want 1", n)
+	if n := errs.failureCount(); n != 1 {
+		t.Fatalf("Failure calls = %d, want 1", n)
 	}
-	if last := errs.lastErr(); !errors.Is(last, event.ErrHandlerPanic) {
-		t.Errorf("OnErr err = %v, want to match ErrHandlerPanic", last)
+	if last := errs.lastCause(); !errors.Is(last, event.ErrHandlerPanic) {
+		t.Errorf("Failure cause = %v, want to match ErrHandlerPanic", last)
 	}
 }
 
@@ -180,26 +179,6 @@ type rbJS struct {
 
 func (j *rbJS) CreateOrUpdateConsumer(context.Context, string, jetstream.ConsumerConfig) (jetstream.Consumer, error) {
 	return j.cons, nil
-}
-
-// rbErrs records every OnErr call.
-type rbErrs struct {
-	mu   sync.Mutex
-	evts []event.Event
-	errs []error
-}
-
-func (r *rbErrs) onErr(_ context.Context, evt event.Event, err error, _ string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.evts = append(r.evts, evt)
-	r.errs = append(r.errs, err)
-}
-
-func (r *rbErrs) snapshot() ([]event.Event, []error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return slices.Clone(r.evts), slices.Clone(r.errs)
 }
 
 // rbGate is a channel closed at most once.
@@ -366,20 +345,20 @@ func TestJetStreamBus_NestedEmitDuringDrainAccepted(t *testing.T) {
 
 func TestJetStreamBus_ShutdownDeadlineInterrupts(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		delivered uint64
-		wantOnErr int
+		name         string
+		delivered    uint64
+		wantFailures int
 	}{
 		{"non-final delivery", 1, 0},
 		{"final delivery", 3, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				var errs rbErrs
+				errs := &joRecorder{}
 				dlq := event.NewMemoryDLQ()
 				cause := make(chan error, 1)
 				started := make(chan struct{}, 1)
-				bus, cons, _, payload := rbShutdownBus(t, BusOptions{DLQPublisher: dlq, OnErr: errs.onErr},
+				bus, cons, _, payload := rbShutdownBus(t, BusOptions{DLQPublisher: dlq, Observer: errs},
 					func(ctx context.Context, _ event.Event) error {
 						started <- struct{}{}
 						<-ctx.Done()
@@ -412,11 +391,11 @@ func TestJetStreamBus_ShutdownDeadlineInterrupts(t *testing.T) {
 					t.Errorf("DLQ records = %d, want 0 (an interrupted message is never dead-lettered)", dlq.Len())
 				}
 				_, errList := errs.snapshot()
-				if len(errList) != tc.wantOnErr {
-					t.Fatalf("OnErr calls = %d, want %d", len(errList), tc.wantOnErr)
+				if len(errList) != tc.wantFailures {
+					t.Fatalf("Failure calls = %d, want %d", len(errList), tc.wantFailures)
 				}
-				if tc.wantOnErr == 1 && !errors.Is(errList[0], event.ErrShutdownInterrupted) {
-					t.Errorf("OnErr err = %v, want ErrShutdownInterrupted", errList[0])
+				if tc.wantFailures == 1 && !errors.Is(errList[0], event.ErrShutdownInterrupted) {
+					t.Errorf("Failure cause = %v, want ErrShutdownInterrupted", errList[0])
 				}
 			})
 		})
@@ -425,19 +404,19 @@ func TestJetStreamBus_ShutdownDeadlineInterrupts(t *testing.T) {
 
 func TestJetStreamBus_HandBackFinalDeliveryReported(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		delivered uint64
-		wantOnErr int
+		name         string
+		delivered    uint64
+		wantFailures int
 	}{
 		{"non-final delivery", 1, 0},
 		{"final delivery", 3, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				var errs rbErrs
+				errs := &joRecorder{}
 				dlq := event.NewMemoryDLQ()
 				ran := false
-				bus, cons, _, payload := rbShutdownBus(t, BusOptions{DLQPublisher: dlq, OnErr: errs.onErr},
+				bus, cons, _, payload := rbShutdownBus(t, BusOptions{DLQPublisher: dlq, Observer: errs},
 					func(context.Context, event.Event) error {
 						ran = true
 						return nil
@@ -460,15 +439,15 @@ func TestJetStreamBus_HandBackFinalDeliveryReported(t *testing.T) {
 					t.Errorf("DLQ records = %d, want 0", dlq.Len())
 				}
 				evts, errList := errs.snapshot()
-				if len(errList) != tc.wantOnErr {
-					t.Fatalf("OnErr calls = %d, want %d", len(errList), tc.wantOnErr)
+				if len(errList) != tc.wantFailures {
+					t.Fatalf("Failure calls = %d, want %d", len(errList), tc.wantFailures)
 				}
-				if tc.wantOnErr == 1 {
+				if tc.wantFailures == 1 {
 					if evts[0] != nil {
-						t.Errorf("OnErr evt = %v, want nil", evts[0])
+						t.Errorf("Failure event = %v, want nil", evts[0])
 					}
 					if !errors.Is(errList[0], event.ErrShutdownInterrupted) {
-						t.Errorf("OnErr err = %v, want ErrShutdownInterrupted", errList[0])
+						t.Errorf("Failure cause = %v, want ErrShutdownInterrupted", errList[0])
 					}
 				}
 
@@ -522,58 +501,15 @@ func TestJetStreamBus_CloseWithImmediateDrain(t *testing.T) {
 
 // --- callback panic recovery (WR-01) ---
 
-// wrRecord is one captured log record.
-type wrRecord struct {
-	level slog.Level
-	attrs map[string]string
-}
+// wrPanicObserver is a raw Observer (not wrapped in event.MultiObserver, which
+// would contain the panic) that records every signal, including the Failure it
+// is about to panic in. It stands for a bus whose observer misbehaves: the
+// msgHandler recover must still end the message.
+type wrPanicObserver struct{ *joRecorder }
 
-// wrLogs is a slog.Handler that captures every record.
-type wrLogs struct {
-	mu   sync.Mutex
-	recs []wrRecord
-}
-
-func (l *wrLogs) Enabled(context.Context, slog.Level) bool { return true }
-func (l *wrLogs) WithAttrs([]slog.Attr) slog.Handler       { return l }
-func (l *wrLogs) WithGroup(string) slog.Handler            { return l }
-
-func (l *wrLogs) Handle(_ context.Context, r slog.Record) error {
-	rec := wrRecord{level: r.Level, attrs: map[string]string{"msg": r.Message}}
-	r.Attrs(func(a slog.Attr) bool {
-		rec.attrs[a.Key] = a.Value.String()
-		return true
-	})
-	l.mu.Lock()
-	l.recs = append(l.recs, rec)
-	l.mu.Unlock()
-	return nil
-}
-
-func (l *wrLogs) snapshot() []wrRecord {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return slices.Clone(l.recs)
-}
-
-// panicAt returns the attrs["panic"] of the Error-level recovered-panic record.
-func (l *wrLogs) panicAt() (string, bool) {
-	for _, r := range l.snapshot() {
-		if r.level == slog.LevelError && r.attrs["msg"] == "eventbus: panic in message handler recovered" {
-			return r.attrs["panic"], true
-		}
-	}
-	return "", false
-}
-
-// wrInstallLogs captures the default logger and restores it on cleanup.
-func wrInstallLogs(t *testing.T) *wrLogs {
-	t.Helper()
-	logs := &wrLogs{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(logs))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	return logs
+func (o wrPanicObserver) Failure(ctx context.Context, f event.FailureContext) {
+	o.joRecorder.Failure(ctx, f)
+	panic("wr: observer boom")
 }
 
 // wrPanicRegistry panics in Decode; Encode and EncodeWith are promoted.
@@ -603,15 +539,25 @@ func wrPanicEventRegistry() *mdRegistry {
 	return reg
 }
 
-func wrOnErrPanics(context.Context, event.Event, error, string) { panic("wr: onerr boom") }
-
 func wrFails(context.Context, event.Event) error { return errors.New("wr: failed") }
 
 func wrPermanent(context.Context, event.Event) error { return dispPermanent{} }
 
+// wrBus builds the bus under test over reg, recording into rec. A raw bus gets
+// wrPanicObserver in place of the MultiObserver NewBus installs, so the observer
+// panic reaches the msgHandler recover.
+func wrBus(js *mdJS, reg event.Registry, opts BusOptions, rec *joRecorder, raw bool) *Bus {
+	opts.Observer = rec
+	bus := newMdBus(js, reg, opts)
+	if raw {
+		bus.observer = wrPanicObserver{rec}
+	}
+	return bus
+}
+
 // TestJetStreamBus_CallbackPanicRecoveredAndNaked covers the hand-back with
 // NakWithDelay: a non-final delivery with no settlement, and the final delivery
-// after settlement (the bus OnErr row). The final delivery without settlement is
+// after settlement (the observer row). The final delivery without settlement is
 // reported and termed instead, see
 // TestJetStreamBus_CallbackPanicOnFinalDeliveryReported.
 func TestJetStreamBus_CallbackPanicRecoveredAndNaked(t *testing.T) {
@@ -620,14 +566,16 @@ func TestJetStreamBus_CallbackPanicRecoveredAndNaked(t *testing.T) {
 		delivered uint64
 		wantDelay time.Duration
 		wantPanic string
+		raw       bool
 		reg       func() event.Registry
 		opts      BusOptions
 		fn        event.HandleFn
 	}{
 		{
-			name: "bus OnErr", delivered: 3, wantDelay: 20 * time.Millisecond, wantPanic: "wr: onerr boom",
-			reg:  func() event.Registry { return newMdRegistry("rb.order") },
-			opts: BusOptions{OnErr: wrOnErrPanics}, fn: wrFails,
+			name: "observer Failure", delivered: 3, wantDelay: 20 * time.Millisecond, wantPanic: "wr: observer boom",
+			raw: true,
+			reg: func() event.Registry { return newMdRegistry("rb.order") },
+			fn:  wrFails,
 		},
 		{
 			name: "DLQ publisher, first delivery", delivered: 1, wantDelay: 10 * time.Millisecond, wantPanic: "wr: dlq boom",
@@ -641,13 +589,13 @@ func TestJetStreamBus_CallbackPanicRecoveredAndNaked(t *testing.T) {
 		},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			logs := wrInstallLogs(t)
 			synctest.Test(t, func(t *testing.T) {
 				js := &mdJS{}
+				rec := &joRecorder{}
 				// The payload is emitted through a plain registry; the bus under
 				// test decodes with the row's registry.
 				payload := rbEmit(t, newMdBus(js, newMdRegistry("rb.order"), BusOptions{}), js)
-				bus := newMdBus(js, row.reg(), row.opts)
+				bus := wrBus(js, row.reg(), row.opts, rec, row.raw)
 
 				msg := &mdMsg{data: payload, numDelivered: row.delivered}
 				bus.msgHandler(context.Background(), "h", row.fn, rbPolicy())(msg)
@@ -659,8 +607,8 @@ func TestJetStreamBus_CallbackPanicRecoveredAndNaked(t *testing.T) {
 				if got.naks != 0 || got.acks != 0 || got.plainTerms != 0 || len(got.termReasons) != 0 {
 					t.Errorf("snapshot = %+v, want only one NakWithDelay", got)
 				}
-				if p, ok := logs.panicAt(); !ok || p != row.wantPanic {
-					t.Errorf("panic record = %q (found %v), want %q", p, ok, row.wantPanic)
+				if !joPanicReported(rec, row.wantPanic) {
+					t.Errorf("no InternalError with Op panic and value %q, got %+v", row.wantPanic, rec.internalErrors())
 				}
 
 				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -675,54 +623,58 @@ func TestJetStreamBus_CallbackPanicRecoveredAndNaked(t *testing.T) {
 
 // TestJetStreamBus_CallbackPanicOnFinalDeliveryReported covers G-09-1: a panic
 // outside the handler on the final delivery, before Settle dead-lettered or
-// reported the message, reaches the bus OnErr once and ends the message with
-// TermWithReason. The server would not redeliver it, so a hand-back would lose it.
-// The decode rows also stand for an upcaster panic, since upcasters run inside
-// registry.Decode.
+// reported the message, reaches Observer.Failure once (outcome dropped, reason
+// panic, nil event) and ends the message with TermWithReason. The server would
+// not redeliver it, so a hand-back would lose it. The decode rows also stand for
+// an upcaster panic, since upcasters run inside registry.Decode.
 func TestJetStreamBus_CallbackPanicOnFinalDeliveryReported(t *testing.T) {
-	const reportPanicMsg = "eventbus: panic in OnErr while reporting a panic on the final delivery"
 	for _, row := range []struct {
-		name           string
-		wantPanic      string
-		reg            func() event.Registry
-		opts           func(errs *rbErrs) BusOptions
-		fn             event.HandleFn
-		wantOnErr      int
-		wantOnErrPanic string
+		name         string
+		wantPanic    string
+		raw          bool
+		nop          bool
+		reg          func() event.Registry
+		opts         BusOptions
+		fn           event.HandleFn
+		wantFailures int
+		wantObserver string // a second panic, raised by the observer itself
 	}{
 		{
-			name: "decode", wantPanic: "wr: decode boom", wantOnErr: 1,
-			reg:  func() event.Registry { return wrPanicRegistry{newMdRegistry("rb.order")} },
-			opts: func(e *rbErrs) BusOptions { return BusOptions{OnErr: e.onErr} },
-			fn:   func(context.Context, event.Event) error { t.Error("handler ran although Decode panicked"); return nil },
+			name: "decode", wantPanic: "wr: decode boom", wantFailures: 1,
+			reg: func() event.Registry { return wrPanicRegistry{newMdRegistry("rb.order")} },
+			fn:  func(context.Context, event.Event) error { t.Error("handler ran although Decode panicked"); return nil },
 		},
 		{
-			name: "DLQ publisher", wantPanic: "wr: dlq boom", wantOnErr: 1,
+			name: "DLQ publisher", wantPanic: "wr: dlq boom", wantFailures: 1,
 			reg:  func() event.Registry { return newMdRegistry("rb.order") },
-			opts: func(e *rbErrs) BusOptions { return BusOptions{DLQPublisher: wrPanicDLQ{}, OnErr: e.onErr} },
+			opts: BusOptions{DLQPublisher: wrPanicDLQ{}},
 			fn:   wrFails,
 		},
 		{
-			name: "decode, OnErr panics while reporting", wantPanic: "wr: decode boom", wantOnErr: 0,
-			wantOnErrPanic: "wr: onerr boom",
-			reg:            func() event.Registry { return wrPanicRegistry{newMdRegistry("rb.order")} },
-			opts:           func(*rbErrs) BusOptions { return BusOptions{OnErr: wrOnErrPanics} },
-			fn:             func(context.Context, event.Event) error { t.Error("handler ran although Decode panicked"); return nil },
+			name: "decode, observer panics while reporting", wantPanic: "wr: decode boom", wantFailures: 1,
+			wantObserver: "wr: observer boom", raw: true,
+			reg: func() event.Registry { return wrPanicRegistry{newMdRegistry("rb.order")} },
+			fn:  func(context.Context, event.Event) error { t.Error("handler ran although Decode panicked"); return nil },
 		},
 		{
-			name: "decode, no OnErr", wantPanic: "wr: decode boom", wantOnErr: 0,
-			reg:  func() event.Registry { return wrPanicRegistry{newMdRegistry("rb.order")} },
-			opts: func(*rbErrs) BusOptions { return BusOptions{} },
-			fn:   func(context.Context, event.Event) error { t.Error("handler ran although Decode panicked"); return nil },
+			name: "decode, NopObserver", wantPanic: "wr: decode boom", nop: true,
+			reg: func() event.Registry { return wrPanicRegistry{newMdRegistry("rb.order")} },
+			fn:  func(context.Context, event.Event) error { t.Error("handler ran although Decode panicked"); return nil },
 		},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			logs := wrInstallLogs(t)
 			synctest.Test(t, func(t *testing.T) {
-				errs := &rbErrs{}
 				js := &mdJS{}
+				rec := &joRecorder{}
 				payload := rbEmit(t, newMdBus(js, newMdRegistry("rb.order"), BusOptions{}), js)
-				bus := newMdBus(js, row.reg(), row.opts(errs))
+				var bus *Bus
+				if row.nop {
+					opts := row.opts
+					opts.Observer = event.NopObserver{}
+					bus = newMdBus(js, row.reg(), opts)
+				} else {
+					bus = wrBus(js, row.reg(), row.opts, rec, row.raw)
+				}
 
 				// numDelivered equals rbPolicy().maxDeliver: the final delivery.
 				msg := &mdMsg{data: payload, numDelivered: 3}
@@ -735,39 +687,38 @@ func TestJetStreamBus_CallbackPanicOnFinalDeliveryReported(t *testing.T) {
 				if got.naks != 0 || got.acks != 0 || got.plainTerms != 0 || len(got.nakDelays) != 0 {
 					t.Errorf("snapshot = %+v, want only one TermWithReason", got)
 				}
-				if p, ok := logs.panicAt(); !ok || p != row.wantPanic {
-					t.Errorf("panic record = %q (found %v), want %q", p, ok, row.wantPanic)
+				if !row.nop && !joPanicReported(rec, row.wantPanic) {
+					t.Errorf("no InternalError with Op panic and value %q, got %+v", row.wantPanic, rec.internalErrors())
 				}
 
-				evts, errList := errs.snapshot()
-				if len(errList) != row.wantOnErr {
-					t.Fatalf("OnErr calls = %d, want %d", len(errList), row.wantOnErr)
+				fails := rec.failures()
+				if len(fails) != row.wantFailures {
+					t.Fatalf("Failure calls = %d, want %d", len(fails), row.wantFailures)
 				}
-				if row.wantOnErr == 1 {
-					if evts[0] != nil {
-						t.Errorf("OnErr evt = %v, want nil", evts[0])
+				if row.wantFailures == 1 {
+					f := fails[0]
+					if f.Event != nil {
+						t.Errorf("Failure event = %v, want nil", f.Event)
+					}
+					if f.Outcome != event.OutcomeDropped || f.Reason != event.ReasonPanic {
+						t.Errorf("Failure outcome/reason = %q/%q, want %q/%q", f.Outcome, f.Reason, event.OutcomeDropped, event.ReasonPanic)
 					}
 					var pe *event.PanicError
-					if !errors.As(errList[0], &pe) {
-						t.Fatalf("OnErr err = %v, want a *event.PanicError", errList[0])
+					if !errors.As(f.Cause, &pe) {
+						t.Fatalf("Failure cause = %v, want a *event.PanicError", f.Cause)
 					}
 					if fmt.Sprint(pe.Value) != row.wantPanic {
 						t.Errorf("PanicError value = %v, want %q", pe.Value, row.wantPanic)
 					}
-					if !errors.Is(errList[0], event.ErrHandlerPanic) {
-						t.Errorf("OnErr err = %v, want to match ErrHandlerPanic", errList[0])
+					if !errors.Is(f.Cause, event.ErrHandlerPanic) {
+						t.Errorf("Failure cause = %v, want to match ErrHandlerPanic", f.Cause)
+					}
+					if f.Delivery.Count != 3 || f.Delivery.System != "nats" || f.Delivery.Raw != nil {
+						t.Errorf("Failure delivery = %+v, want Count 3, System nats, nil Raw", f.Delivery)
 					}
 				}
-				if row.wantOnErrPanic != "" {
-					found := false
-					for _, r := range logs.snapshot() {
-						if r.level == slog.LevelError && r.attrs["msg"] == reportPanicMsg && r.attrs["panic"] == row.wantOnErrPanic {
-							found = true
-						}
-					}
-					if !found {
-						t.Errorf("no Error record %q with panic=%q", reportPanicMsg, row.wantOnErrPanic)
-					}
+				if row.wantObserver != "" && !joPanicReported(rec, row.wantObserver) {
+					t.Errorf("no InternalError with Op panic and value %q, got %+v", row.wantObserver, rec.internalErrors())
 				}
 
 				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -782,49 +733,32 @@ func TestJetStreamBus_CallbackPanicOnFinalDeliveryReported(t *testing.T) {
 
 func TestJetStreamBus_CallbackPanicAfterSettleTermed(t *testing.T) {
 	for _, row := range []struct {
-		name      string
-		wantPanic string
-		reg       func() event.Registry
-		opts      func(dlq *event.MemoryDLQ) BusOptions
-		fn        event.HandleFn
-		wantDLQ   int
-		wantAttrs map[string]string
+		name        string
+		wantDLQ     int
+		wantOutcome event.Outcome
+		reg         func() event.Registry
+		fn          event.HandleFn
 	}{
 		{
-			name: "dead-lettered, bus OnErr", wantPanic: "wr: onerr boom", wantDLQ: 1,
-			reg:  func() event.Registry { return newMdRegistry("rb.order") },
-			opts: func(d *event.MemoryDLQ) BusOptions { return BusOptions{DLQPublisher: d, OnErr: wrOnErrPanics} },
-			fn:   wrPermanent,
+			name: "dead-lettered, observer Failure", wantDLQ: 1, wantOutcome: event.OutcomeDeadLettered,
+			reg: func() event.Registry { return newMdRegistry("rb.order") },
+			fn:  wrPermanent,
 		},
 		{
-			name: "dead-lettered, event OnErr", wantPanic: "wr: event onerr boom", wantDLQ: 1,
-			reg:  func() event.Registry { return wrPanicEventRegistry() },
-			opts: func(d *event.MemoryDLQ) BusOptions { return BusOptions{DLQPublisher: d} },
-			fn:   wrPermanent,
-		},
-		{
-			name: "chain dead-lettered, bus OnErr", wantPanic: "wr: onerr boom", wantDLQ: 0,
-			reg:  func() event.Registry { return newMdRegistry("rb.order") },
-			opts: func(d *event.MemoryDLQ) BusOptions { return BusOptions{DLQPublisher: d, OnErr: wrOnErrPanics} },
+			name: "chain dead-lettered, observer Failure", wantDLQ: 0, wantOutcome: event.OutcomeDeadLettered,
+			reg: func() event.Registry { return newMdRegistry("rb.order") },
 			fn: func(context.Context, event.Event) error {
 				return &event.DeadLetteredError{Cause: dispPermanent{}, Reason: event.ReasonTerminal}
 			},
 		},
-		{
-			name: "dropped, bus OnErr", wantPanic: "wr: onerr boom", wantDLQ: 0,
-			reg:       func() event.Registry { return newMdRegistry("rb.order") },
-			opts:      func(*event.MemoryDLQ) BusOptions { return BusOptions{OnErr: wrOnErrPanics} },
-			fn:        wrPermanent,
-			wantAttrs: map[string]string{"outcome": "dropped"},
-		},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			logs := wrInstallLogs(t)
 			synctest.Test(t, func(t *testing.T) {
 				js := &mdJS{}
 				payload := rbEmit(t, newMdBus(js, newMdRegistry("rb.order"), BusOptions{}), js)
 				dlq := event.NewMemoryDLQ()
-				bus := newMdBus(js, row.reg(), row.opts(dlq))
+				rec := &joRecorder{}
+				bus := wrBus(js, row.reg(), BusOptions{DLQPublisher: dlq}, rec, true)
 
 				msg := &mdMsg{data: payload, numDelivered: 1}
 				bus.msgHandler(context.Background(), "h", row.fn, rbPolicy())(msg)
@@ -839,19 +773,12 @@ func TestJetStreamBus_CallbackPanicAfterSettleTermed(t *testing.T) {
 				if dlq.Len() != row.wantDLQ {
 					t.Errorf("DLQ records = %d, want %d", dlq.Len(), row.wantDLQ)
 				}
-				if p, ok := logs.panicAt(); !ok || p != row.wantPanic {
-					t.Errorf("panic record = %q (found %v), want %q", p, ok, row.wantPanic)
+				if !joPanicReported(rec, "wr: observer boom") {
+					t.Errorf("no InternalError with Op panic and value wr: observer boom, got %+v", rec.internalErrors())
 				}
-				for k, v := range row.wantAttrs {
-					found := false
-					for _, r := range logs.snapshot() {
-						if r.attrs[k] == v {
-							found = true
-						}
-					}
-					if !found {
-						t.Errorf("no log record with %s=%q", k, v)
-					}
+				fails := rec.failures()
+				if len(fails) != 1 || fails[0].Outcome != row.wantOutcome {
+					t.Errorf("Failure calls = %+v, want exactly one with outcome %q", fails, row.wantOutcome)
 				}
 
 				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -862,6 +789,63 @@ func TestJetStreamBus_CallbackPanicAfterSettleTermed(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestJetStreamBus_DroppedThenObserverPanicTermed is the dropped row of the
+// after-settlement panic: no publisher, so Settle ends the message as dropped and
+// the observer panics on the Failure.
+func TestJetStreamBus_DroppedThenObserverPanicTermed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		js := &mdJS{}
+		payload := rbEmit(t, newMdBus(js, newMdRegistry("rb.order"), BusOptions{}), js)
+		rec := &joRecorder{}
+		bus := wrBus(js, newMdRegistry("rb.order"), BusOptions{}, rec, true)
+
+		msg := &mdMsg{data: payload, numDelivered: 1}
+		bus.msgHandler(context.Background(), "h", wrPermanent, rbPolicy())(msg)
+
+		got := msg.snapshot()
+		if want := []string{termReasonPanicAfterSettle}; !slices.Equal(got.termReasons, want) {
+			t.Errorf("termReasons = %q, want %q", got.termReasons, want)
+		}
+		fails := rec.failures()
+		if len(fails) != 1 || fails[0].Outcome != event.OutcomeDropped {
+			t.Errorf("Failure calls = %+v, want exactly one with outcome dropped", fails)
+		}
+		if !joPanicReported(rec, "wr: observer boom") {
+			t.Errorf("no InternalError with Op panic and value wr: observer boom, got %+v", rec.internalErrors())
+		}
+	})
+}
+
+// TestJetStreamBus_EventOnErrPanicContained: a panic in the event's own OnErr
+// method is contained by Settle (InternalError, Component event), so the
+// message still gets its normal disposition and no recover is needed.
+func TestJetStreamBus_EventOnErrPanicContained(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		js := &mdJS{}
+		payload := rbEmit(t, newMdBus(js, newMdRegistry("rb.order"), BusOptions{}), js)
+		dlq := event.NewMemoryDLQ()
+		rec := &joRecorder{}
+		bus := wrBus(js, wrPanicEventRegistry(), BusOptions{DLQPublisher: dlq}, rec, false)
+
+		msg := &mdMsg{data: payload, numDelivered: 1}
+		bus.msgHandler(context.Background(), "h", wrPermanent, rbPolicy())(msg)
+
+		got := msg.snapshot()
+		if want := []string{"dead_lettered: terminal"}; !slices.Equal(got.termReasons, want) {
+			t.Errorf("termReasons = %q, want %q", got.termReasons, want)
+		}
+		if dlq.Len() != 1 {
+			t.Errorf("DLQ records = %d, want 1", dlq.Len())
+		}
+		if !joPanicReported(rec, "wr: event onerr boom") {
+			t.Errorf("no InternalError with Op panic and value wr: event onerr boom, got %+v", rec.internalErrors())
+		}
+		if n := rec.failureCount(); n != 1 {
+			t.Errorf("Failure calls = %d, want 1", n)
+		}
+	})
 }
 
 // wrGatedMsg is an mdMsg whose NakWithDelay and TermWithReason announce
@@ -905,19 +889,18 @@ func TestJetStreamBus_RecoverActsBeforeShutdownReturns(t *testing.T) {
 		delivered     uint64
 		wantNakDelays []time.Duration
 		wantTerms     []string
-		wantOnErr     int
+		wantFailures  int64
 	}{
 		{"non-final: NakWithDelay", 1, []time.Duration{time.Second}, nil, 0},
-		{"final: OnErr and TermWithReason", 3, nil, []string{termReasonPanicOnFinal}, 1},
+		{"final: Failure and TermWithReason", 3, nil, []string{termReasonPanicOnFinal}, 1},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			logs := wrInstallLogs(t)
 			synctest.Test(t, func(t *testing.T) {
-				errs := &rbErrs{}
+				errs := &joRecorder{}
 				handlerGate := newRbGate()
 				defer handlerGate.open()
 				started := make(chan struct{}, 1)
-				bus, cons, _, payload := rbShutdownBus(t, BusOptions{DLQPublisher: wrPanicDLQ{}, OnErr: errs.onErr},
+				bus, cons, _, payload := rbShutdownBus(t, BusOptions{DLQPublisher: wrPanicDLQ{}, Observer: errs},
 					func(context.Context, event.Event) error {
 						started <- struct{}{}
 						<-handlerGate.ch
@@ -956,8 +939,8 @@ func TestJetStreamBus_RecoverActsBeforeShutdownReturns(t *testing.T) {
 				if _, stops := cons.cc.counts(); stops != 0 {
 					t.Errorf("Stop calls = %d before the recover acted, want 0", stops)
 				}
-				if _, errList := errs.snapshot(); len(errList) != row.wantOnErr {
-					t.Errorf("OnErr calls = %d while the action is pending, want %d", len(errList), row.wantOnErr)
+				if n := errs.failureCount(); n != row.wantFailures {
+					t.Errorf("Failure calls = %d while the action is pending, want %d", n, row.wantFailures)
 				}
 
 				msg.gate.open()
@@ -973,8 +956,8 @@ func TestJetStreamBus_RecoverActsBeforeShutdownReturns(t *testing.T) {
 				if got.naks != 0 || got.acks != 0 || got.plainTerms != 0 {
 					t.Errorf("snapshot = %+v, want no plain Nak, Ack or Term", got)
 				}
-				if p, ok := logs.panicAt(); !ok || p != "wr: dlq boom" {
-					t.Errorf("panic record = %q (found %v), want wr: dlq boom", p, ok)
+				if !joPanicReported(errs, "wr: dlq boom") {
+					t.Errorf("no InternalError with Op panic and value wr: dlq boom, got %+v", errs.internalErrors())
 				}
 				if drains, stops := cons.cc.counts(); drains != 1 || stops != 0 {
 					t.Errorf("Drain/Stop calls = %d/%d, want 1/0", drains, stops)
@@ -984,10 +967,11 @@ func TestJetStreamBus_RecoverActsBeforeShutdownReturns(t *testing.T) {
 	}
 }
 
-func TestJetStreamBus_HandBackOnErrPanicNakedOnce(t *testing.T) {
-	logs := wrInstallLogs(t)
+func TestJetStreamBus_HandBackObserverPanicNakedOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		bus, cons, _, payload := rbShutdownBus(t, BusOptions{OnErr: wrOnErrPanics}, noopHandler)
+		rec := &joRecorder{}
+		bus, cons, _, payload := rbShutdownBus(t, BusOptions{Observer: rec}, noopHandler)
+		bus.observer = wrPanicObserver{rec}
 		defer cons.cc.finish()
 
 		res := rbShutdown(bus, context.Background())
@@ -1000,8 +984,8 @@ func TestJetStreamBus_HandBackOnErrPanicNakedOnce(t *testing.T) {
 		if got.naks != 1 || got.acks != 0 || got.plainTerms != 0 || len(got.termReasons) != 0 || len(got.nakDelays) != 0 {
 			t.Errorf("snapshot = %+v, want exactly one plain Nak", got)
 		}
-		if p, ok := logs.panicAt(); !ok || p != "wr: onerr boom" {
-			t.Errorf("panic record = %q (found %v), want wr: onerr boom", p, ok)
+		if !joPanicReported(rec, "wr: observer boom") {
+			t.Errorf("no InternalError with Op panic and value wr: observer boom, got %+v", rec.internalErrors())
 		}
 
 		cons.cc.finish()

@@ -40,24 +40,6 @@ func dispRegistry(name string) *mdRegistry {
 	return r
 }
 
-// dispErrCounter counts OnErr calls and keeps the last error.
-type dispErrCounter struct {
-	calls atomic.Int64
-	last  atomic.Value // error
-}
-
-func (c *dispErrCounter) onErr(_ context.Context, _ event.Event, err error, _ string) {
-	c.calls.Add(1)
-	c.last.Store(&err)
-}
-
-func (c *dispErrCounter) lastErr() error {
-	if p, ok := c.last.Load().(*error); ok {
-		return *p
-	}
-	return nil
-}
-
 // dispEmit emits a dispEvent through bus and returns the recorded payload.
 func dispEmit(t *testing.T, bus *Bus, js *mdJS, name string) []byte {
 	t.Helper()
@@ -72,8 +54,8 @@ func TestJetStreamBus_FinalDeliveryTerminalDeadLetteredThenTermed(t *testing.T) 
 	dispEventOnErr.Store(0)
 	js := &mdJS{}
 	dlq := event.NewMemoryDLQ()
-	var errs dispErrCounter
-	bus := newMdBus(js, dispRegistry(name), BusOptions{DLQPublisher: dlq, OnErr: errs.onErr})
+	errs := &joRecorder{}
+	bus := newMdBus(js, dispRegistry(name), BusOptions{DLQPublisher: dlq, Observer: errs})
 	payload := dispEmit(t, bus, js, name)
 
 	msg := &mdMsg{data: payload, numDelivered: 3}
@@ -104,14 +86,14 @@ func TestJetStreamBus_FinalDeliveryTerminalDeadLetteredThenTermed(t *testing.T) 
 	if got.acks != 0 || got.naks != 0 || len(got.nakDelays) != 0 || got.plainTerms != 0 {
 		t.Errorf("snapshot = %+v, want only a TermWithReason", got)
 	}
-	if n := errs.calls.Load(); n != 1 {
-		t.Errorf("bus OnErr calls = %d, want 1", n)
+	if n := errs.failureCount(); n != 1 {
+		t.Errorf("Failure calls = %d, want 1", n)
 	}
-	if !errors.Is(errs.lastErr(), event.ErrDeadLettered) {
-		t.Errorf("bus OnErr error = %v, want it to match event.ErrDeadLettered", errs.lastErr())
+	if !errors.Is(errs.lastCause(), event.ErrDeadLettered) {
+		t.Errorf("bus Failure cause = %v, want it to match event.ErrDeadLettered", errs.lastCause())
 	}
 	if n := dispEventOnErr.Load(); n != 1 {
-		t.Errorf("event OnErr calls = %d, want 1 (D-16)", n)
+		t.Errorf("event Failure calls = %d, want 1 (D-16)", n)
 	}
 }
 
@@ -167,19 +149,19 @@ func dispWantDelay(t *testing.T, msg *mdMsg, want time.Duration) {
 }
 
 func TestJetStreamBus_NonFinalTransientUsesBackOff(t *testing.T) {
-	var errs dispErrCounter
+	errs := &joRecorder{}
 	boom := errors.New("boom")
 	policy := deliveryPolicy{maxDeliver: 4, backOff: dispBackOff}
 	for _, tc := range []struct {
 		delivered uint64
 		want      time.Duration
 	}{{1, 10 * time.Millisecond}, {2, 20 * time.Millisecond}, {3, 40 * time.Millisecond}} {
-		bus, js := dispBus(BusOptions{DLQPublisher: event.NewMemoryDLQ(), OnErr: errs.onErr})
+		bus, js := dispBus(BusOptions{DLQPublisher: event.NewMemoryDLQ(), Observer: errs})
 		msg := dispRun(t, context.Background(), bus, js, tc.delivered, policy, boom)
 		dispWantDelay(t, msg, tc.want)
 	}
-	if n := errs.calls.Load(); n != 0 {
-		t.Errorf("OnErr calls = %d, want 0 on intermediate deliveries (D-16)", n)
+	if n := errs.failureCount(); n != 0 {
+		t.Errorf("Failure calls = %d, want 0 on intermediate deliveries (D-16)", n)
 	}
 }
 
@@ -191,14 +173,14 @@ func TestJetStreamBus_BackOffClampedToLast(t *testing.T) {
 }
 
 func TestJetStreamBus_UnlimitedDeliveriesNeverTerm(t *testing.T) {
-	var errs dispErrCounter
+	errs := &joRecorder{}
 	dlq := event.NewMemoryDLQ()
-	bus, js := dispBus(BusOptions{DLQPublisher: dlq, OnErr: errs.onErr})
+	bus, js := dispBus(BusOptions{DLQPublisher: dlq, Observer: errs})
 	policy := deliveryPolicy{maxDeliver: 0, backOff: dispBackOff[:1]}
 	msg := dispRun(t, context.Background(), bus, js, 9, policy, errors.New("boom"))
 	dispWantDelay(t, msg, 10*time.Millisecond)
-	if dlq.Len() != 0 || errs.calls.Load() != 0 {
-		t.Errorf("records=%d OnErr=%d, want 0 and 0: unlimited deliveries are never final", dlq.Len(), errs.calls.Load())
+	if dlq.Len() != 0 || errs.failureCount() != 0 {
+		t.Errorf("records=%d Failure=%d, want 0 and 0: unlimited deliveries are never final", dlq.Len(), errs.failureCount())
 	}
 }
 
@@ -248,9 +230,9 @@ func TestJetStreamBus_FinalRateLimitedDeadLettered(t *testing.T) {
 }
 
 func TestJetStreamBus_DuplicateAcked(t *testing.T) {
-	var errs dispErrCounter
+	errs := &joRecorder{}
 	dlq := event.NewMemoryDLQ()
-	bus, js := dispBus(BusOptions{DLQPublisher: dlq, OnErr: errs.onErr})
+	bus, js := dispBus(BusOptions{DLQPublisher: dlq, Observer: errs})
 	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
 	msg := dispRun(t, context.Background(), bus, js, 3, policy, fmt.Errorf("seen: %w", event.ErrDuplicate))
 
@@ -258,16 +240,16 @@ func TestJetStreamBus_DuplicateAcked(t *testing.T) {
 	if got.acks != 1 || got.naks != 0 || len(got.nakDelays) != 0 || len(got.termReasons) != 0 {
 		t.Errorf("snapshot = %+v, want a single Ack", got)
 	}
-	if errs.calls.Load() != 0 || dlq.Len() != 0 {
-		t.Errorf("OnErr=%d records=%d, want 0 and 0", errs.calls.Load(), dlq.Len())
+	if errs.failureCount() != 0 || dlq.Len() != 0 {
+		t.Errorf("Failure=%d records=%d, want 0 and 0", errs.failureCount(), dlq.Len())
 	}
 }
 
 func TestJetStreamBus_ChainDeadLetteredAcked(t *testing.T) {
-	var errs dispErrCounter
+	errs := &joRecorder{}
 	dlq := event.NewMemoryDLQ()
 	chainErr := &event.DeadLetteredError{Cause: errors.New("boom"), Reason: event.ReasonRetriesExhausted}
-	bus, js := dispBus(BusOptions{Invoker: dispInvoker{err: chainErr}, DLQPublisher: dlq, OnErr: errs.onErr})
+	bus, js := dispBus(BusOptions{Invoker: dispInvoker{err: chainErr}, DLQPublisher: dlq, Observer: errs})
 	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
 	msg := dispRun(t, context.Background(), bus, js, 2, policy, nil)
 
@@ -278,8 +260,8 @@ func TestJetStreamBus_ChainDeadLetteredAcked(t *testing.T) {
 	if dlq.Len() != 0 {
 		t.Errorf("bus publisher records = %d, want 0: the chain already dead-lettered it", dlq.Len())
 	}
-	if n := errs.calls.Load(); n != 1 {
-		t.Errorf("OnErr calls = %d, want 1", n)
+	if n := errs.failureCount(); n != 1 {
+		t.Errorf("Failure calls = %d, want 1", n)
 	}
 }
 
@@ -288,20 +270,20 @@ func TestJetStreamBus_ChainDeadLetterFailedNaks(t *testing.T) {
 	for _, tc := range []struct {
 		delivered uint64
 		want      time.Duration
-		onErr     int64
+		fails     int64
 	}{{1, 10 * time.Millisecond, 0}, {3, 20 * time.Millisecond, 1}} {
-		var errs dispErrCounter
+		errs := &joRecorder{}
 		dlq := event.NewMemoryDLQ()
 		chainErr := &event.DeadLetterFailedError{
 			Cause:      errors.New("boom"),
 			Reason:     event.ReasonRetriesExhausted,
 			PublishErr: errors.New("broker down"),
 		}
-		bus, js := dispBus(BusOptions{Invoker: dispInvoker{err: chainErr}, DLQPublisher: dlq, OnErr: errs.onErr})
+		bus, js := dispBus(BusOptions{Invoker: dispInvoker{err: chainErr}, DLQPublisher: dlq, Observer: errs})
 		msg := dispRun(t, context.Background(), bus, js, tc.delivered, policy, nil)
 		dispWantDelay(t, msg, tc.want)
-		if n := errs.calls.Load(); n != tc.onErr {
-			t.Errorf("delivery %d: OnErr calls = %d, want %d", tc.delivered, n, tc.onErr)
+		if n := errs.failureCount(); n != tc.fails {
+			t.Errorf("delivery %d: Failure calls = %d, want %d", tc.delivered, n, tc.fails)
 		}
 		if dlq.Len() != 0 {
 			t.Errorf("delivery %d: bus publisher records = %d, want 0", tc.delivered, dlq.Len())
@@ -313,40 +295,40 @@ func TestJetStreamBus_BackstopPublishFailureNeverTerms(t *testing.T) {
 	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
 
 	t.Run("non-final", func(t *testing.T) {
-		var errs dispErrCounter
+		errs := &joRecorder{}
 		pub := &dispFailingPublisher{}
-		bus, js := dispBus(BusOptions{DLQPublisher: pub, OnErr: errs.onErr})
+		bus, js := dispBus(BusOptions{DLQPublisher: pub, Observer: errs})
 		msg := dispRun(t, context.Background(), bus, js, 1, policy, dispPermanent{})
 		if n := pub.calls.Load(); n != 1 {
 			t.Errorf("Publish calls = %d, want 1", n)
 		}
 		dispWantDelay(t, msg, 10*time.Millisecond)
-		if errs.calls.Load() != 0 {
-			t.Errorf("OnErr calls = %d, want 0 on a non-final delivery", errs.calls.Load())
+		if errs.failureCount() != 0 {
+			t.Errorf("Failure calls = %d, want 0 on a non-final delivery", errs.failureCount())
 		}
 	})
 
 	t.Run("final", func(t *testing.T) {
-		var errs dispErrCounter
+		errs := &joRecorder{}
 		pub := &dispFailingPublisher{}
-		bus, js := dispBus(BusOptions{DLQPublisher: pub, OnErr: errs.onErr})
+		bus, js := dispBus(BusOptions{DLQPublisher: pub, Observer: errs})
 		msg := dispRun(t, context.Background(), bus, js, 3, policy, dispPermanent{})
 		if n := pub.calls.Load(); n != 3 {
 			t.Errorf("Publish calls = %d, want 3 (bounded in-process retry)", n)
 		}
 		dispWantDelay(t, msg, 20*time.Millisecond)
-		if n := errs.calls.Load(); n != 1 {
-			t.Fatalf("OnErr calls = %d, want 1", n)
+		if n := errs.failureCount(); n != 1 {
+			t.Fatalf("Failure calls = %d, want 1", n)
 		}
-		if !errors.Is(errs.lastErr(), event.ErrDeadLetterFailed) {
-			t.Errorf("OnErr error = %v, want it to match event.ErrDeadLetterFailed", errs.lastErr())
+		if !errors.Is(errs.lastCause(), event.ErrDeadLetterFailed) {
+			t.Errorf("Failure cause = %v, want it to match event.ErrDeadLetterFailed", errs.lastCause())
 		}
 	})
 }
 
 func TestJetStreamBus_NoPublisherDropped(t *testing.T) {
-	var errs dispErrCounter
-	bus, js := dispBus(BusOptions{OnErr: errs.onErr})
+	errs := &joRecorder{}
+	bus, js := dispBus(BusOptions{Observer: errs})
 	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
 	failure := &dispPermanentPtr{}
 	msg := dispRun(t, context.Background(), bus, js, 1, policy, failure)
@@ -358,11 +340,11 @@ func TestJetStreamBus_NoPublisherDropped(t *testing.T) {
 	if got.acks != 0 || got.naks != 0 || len(got.nakDelays) != 0 {
 		t.Errorf("snapshot = %+v, want only a TermWithReason", got)
 	}
-	if n := errs.calls.Load(); n != 1 {
-		t.Fatalf("OnErr calls = %d, want 1", n)
+	if n := errs.failureCount(); n != 1 {
+		t.Fatalf("Failure calls = %d, want 1", n)
 	}
-	if errs.lastErr() != error(failure) {
-		t.Errorf("OnErr error = %v, want the identical handler error", errs.lastErr())
+	if errs.lastCause() != error(failure) {
+		t.Errorf("Failure cause = %v, want the identical handler error", errs.lastCause())
 	}
 }
 
@@ -376,11 +358,11 @@ func TestJetStreamBus_InterruptedPlainNak(t *testing.T) {
 	policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
 	for _, tc := range []struct {
 		delivered uint64
-		onErr     int64
+		fails     int64
 	}{{1, 0}, {3, 1}} {
-		var errs dispErrCounter
+		errs := &joRecorder{}
 		dlq := event.NewMemoryDLQ()
-		bus, js := dispBus(BusOptions{DLQPublisher: dlq, OnErr: errs.onErr})
+		bus, js := dispBus(BusOptions{DLQPublisher: dlq, Observer: errs})
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		msg := dispRun(t, ctx, bus, js, tc.delivered, policy, ctx.Err())
@@ -392,8 +374,8 @@ func TestJetStreamBus_InterruptedPlainNak(t *testing.T) {
 		if dlq.Len() != 0 {
 			t.Errorf("delivery %d: records = %d, want 0: an interruption is never dead-lettered", tc.delivered, dlq.Len())
 		}
-		if n := errs.calls.Load(); n != tc.onErr {
-			t.Errorf("delivery %d: OnErr calls = %d, want %d", tc.delivered, n, tc.onErr)
+		if n := errs.failureCount(); n != tc.fails {
+			t.Errorf("delivery %d: Failure calls = %d, want %d", tc.delivered, n, tc.fails)
 		}
 	}
 }
@@ -419,23 +401,22 @@ func (r dispDecodeRegistry) Decode(ctx context.Context, _ []byte) (context.Conte
 }
 
 // dispDecodeRun feeds the bytes "raw-bytes" to a bus whose registry fails with
-// cause, and reports whether the handler ran and what OnErr saw.
+// cause, and reports whether the handler ran and what the Observer saw.
 type dispDecodeResult struct {
 	msg        *mdMsg
 	handlerRan bool
-	onErrCalls int64
-	onErrEvt   atomic.Value // holds *event.Event
+	rec        *joRecorder
 }
 
 func dispDecodeRun(t *testing.T, cause error, pub event.DLQPublisher, delivered uint64, policy deliveryPolicy) *dispDecodeResult {
 	t.Helper()
-	res := &dispDecodeResult{msg: &mdMsg{data: []byte("raw-bytes"), numDelivered: delivered, subject: "s.decode"}}
+	res := &dispDecodeResult{
+		msg: &mdMsg{data: []byte("raw-bytes"), numDelivered: delivered, subject: "s.decode"},
+		rec: &joRecorder{},
+	}
 	bus := newMdBus(&mdJS{}, dispDecodeRegistry{err: &event.DecodeError{Err: cause}}, BusOptions{
 		DLQPublisher: pub,
-		OnErr: func(_ context.Context, evt event.Event, _ error, _ string) {
-			atomic.AddInt64(&res.onErrCalls, 1)
-			res.onErrEvt.Store(&evt)
-		},
+		Observer:     res.rec,
 	})
 	bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
 		res.handlerRan = true
@@ -445,13 +426,6 @@ func dispDecodeRun(t *testing.T, cause error, pub event.DLQPublisher, delivered 
 		t.Fatalf("plain Term called %d times, the bus must only use TermWithReason", got.plainTerms)
 	}
 	return res
-}
-
-func (r *dispDecodeResult) onErrEvent() event.Event {
-	if p, ok := r.onErrEvt.Load().(*event.Event); ok {
-		return *p
-	}
-	return nil
 }
 
 func TestJetStreamBus_DecodeFailureDeadLetteredBeforeTerm(t *testing.T) {
@@ -482,8 +456,14 @@ func TestJetStreamBus_DecodeFailureDeadLetteredBeforeTerm(t *testing.T) {
 			if got.acks != 0 || got.naks != 0 || len(got.nakDelays) != 0 {
 				t.Errorf("snapshot = %+v, want only a TermWithReason", got)
 			}
-			if n := atomic.LoadInt64(&res.onErrCalls); n != 1 || res.onErrEvent() != nil {
-				t.Errorf("OnErr calls=%d evt=%v, want one call with a nil event", n, res.onErrEvent())
+			if n := res.rec.failureCount(); n != 1 || res.rec.lastEvent() != nil {
+				t.Errorf("Failure calls=%d evt=%v, want one call with a nil event", n, res.rec.lastEvent())
+			}
+			if f := res.rec.failures()[0]; f.Outcome != event.OutcomeDecodeFailed && f.Outcome != event.OutcomeDeadLettered {
+				t.Errorf("Failure outcome = %q, want a decode-failure outcome", f.Outcome)
+			}
+			if n := len(res.rec.decodeFailures()); n != 1 {
+				t.Errorf("DecodeFailed calls = %d, want 1", n)
 			}
 			if res.handlerRan {
 				t.Error("handler ran for an undecodable message")
@@ -513,19 +493,11 @@ func TestJetStreamBus_EmptyBodyDecodeFailureDeadLettered(t *testing.T) {
 				subject:      "s.empty",
 				headers:      map[string][]string{"tenant": {"acme"}, "Nats-Msg-Id": {"m-empty"}},
 			}
-			var (
-				onErrCalls int64
-				onErrEvt   atomic.Value // holds *event.Event
-				onErrErr   atomic.Value // holds *error
-				handlerRan bool
-			)
+			var handlerRan bool
+			rec := &joRecorder{}
 			bus := newMdBus(&mdJS{}, dispDecodeRegistry{err: &event.DecodeError{Err: event.ErrMalformedEnvelope}}, BusOptions{
-				DLQPublisher: NewDLQ(js, nil, ""),
-				OnErr: func(_ context.Context, evt event.Event, err error, _ string) {
-					atomic.AddInt64(&onErrCalls, 1)
-					onErrEvt.Store(&evt)
-					onErrErr.Store(&err)
-				},
+				DLQPublisher: NewDLQ(js, ""),
+				Observer:     rec,
 			})
 			policy := deliveryPolicy{maxDeliver: 3, backOff: dispBackOff[:2]}
 			bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
@@ -567,15 +539,14 @@ func TestJetStreamBus_EmptyBodyDecodeFailureDeadLettered(t *testing.T) {
 			if got.acks != 0 || got.naks != 0 || len(got.nakDelays) != 0 || got.plainTerms != 0 {
 				t.Errorf("snapshot = %+v, want only a TermWithReason", got)
 			}
-			if n := atomic.LoadInt64(&onErrCalls); n != 1 {
-				t.Fatalf("OnErr calls = %d, want 1", n)
+			if n := rec.failureCount(); n != 1 {
+				t.Fatalf("Failure calls = %d, want 1", n)
 			}
-			if p, _ := onErrEvt.Load().(*event.Event); p == nil || *p != nil {
-				t.Errorf("OnErr event = %v, want nil", p)
+			if evt := rec.lastEvent(); evt != nil {
+				t.Errorf("Failure event = %v, want nil", evt)
 			}
-			if p, _ := onErrErr.Load().(*error); p == nil ||
-				!errors.Is(*p, event.ErrDeadLettered) || !errors.Is(*p, event.ErrMalformedEnvelope) {
-				t.Errorf("OnErr error = %v, want ErrDeadLettered and ErrMalformedEnvelope", p)
+			if cause := rec.lastCause(); !errors.Is(cause, event.ErrDeadLettered) || !errors.Is(cause, event.ErrMalformedEnvelope) {
+				t.Errorf("Failure cause = %v, want ErrDeadLettered and ErrMalformedEnvelope", cause)
 			}
 			if handlerRan {
 				t.Error("handler ran for an undecodable message")
@@ -591,8 +562,8 @@ func TestJetStreamBus_UnknownVersionWaitsForFinal(t *testing.T) {
 		dlq := event.NewMemoryDLQ()
 		res := dispDecodeRun(t, event.ErrUnknownVersion, dlq, 1, policy)
 		dispWantDelay(t, res.msg, 10*time.Millisecond)
-		if dlq.Len() != 0 || atomic.LoadInt64(&res.onErrCalls) != 0 {
-			t.Errorf("records=%d OnErr=%d, want 0 and 0 while a redelivery follows", dlq.Len(), atomic.LoadInt64(&res.onErrCalls))
+		if dlq.Len() != 0 || res.rec.failureCount() != 0 {
+			t.Errorf("records=%d Failure=%d, want 0 and 0 while a redelivery follows", dlq.Len(), res.rec.failureCount())
 		}
 	})
 

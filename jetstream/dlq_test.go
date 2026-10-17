@@ -10,7 +10,6 @@ import (
 	"time"
 
 	event "github.com/isaquesb/go-event-bus"
-	"github.com/isaquesb/go-event-bus/invoker"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -73,7 +72,7 @@ func dlqtRecord() event.DLQRecord {
 
 func TestDLQ_PublishesRawVerbatimWithFailureHeaders(t *testing.T) {
 	js := &dlqtJS{}
-	d := NewDLQ(js, nil, "")
+	d := NewDLQ(js, "")
 
 	rec := dlqtRecord()
 	if err := d.Publish(context.Background(), rec); err != nil {
@@ -122,7 +121,7 @@ func TestDLQ_PublishesRawVerbatimWithFailureHeaders(t *testing.T) {
 
 func TestDLQ_DefaultPrefix(t *testing.T) {
 	js := &dlqtJS{}
-	d := NewDLQ(js, nil, "")
+	d := NewDLQ(js, "")
 	if DefaultDLQPrefix != "dlq." {
 		t.Fatalf("DefaultDLQPrefix = %q", DefaultDLQPrefix)
 	}
@@ -136,7 +135,7 @@ func TestDLQ_DefaultPrefix(t *testing.T) {
 
 func TestDLQ_CustomPrefix(t *testing.T) {
 	js := &dlqtJS{}
-	d := NewDLQ(js, nil, "legacy.")
+	d := NewDLQ(js, "legacy.")
 	if err := d.Publish(context.Background(), dlqtRecord()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
@@ -147,7 +146,7 @@ func TestDLQ_CustomPrefix(t *testing.T) {
 
 func TestDLQ_NoMessageIDOnPublish(t *testing.T) {
 	js := &dlqtJS{}
-	d := NewDLQ(js, nil, "")
+	d := NewDLQ(js, "")
 	if err := d.Publish(context.Background(), dlqtRecord()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
@@ -161,34 +160,10 @@ func TestDLQ_NoMessageIDOnPublish(t *testing.T) {
 	}
 }
 
-// dlqtMetrics counts counter increments by name.
-type dlqtMetrics struct {
-	mu     sync.Mutex
-	counts map[string]int64
-}
-
-func (m *dlqtMetrics) IncCounter(name string, v int64, _ invoker.Labels) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.counts == nil {
-		m.counts = map[string]int64{}
-	}
-	m.counts[name] += v
-}
-
-func (m *dlqtMetrics) ObserveHistogram(string, float64, invoker.Labels) {}
-func (m *dlqtMetrics) SetGauge(string, float64, invoker.Labels)         {}
-
-func (m *dlqtMetrics) get(name string) int64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.counts[name]
-}
-
 func TestDLQ_LocalBusRecordEncodedWithRegistry(t *testing.T) {
 	js := &dlqtJS{}
 	reg := newMdRegistry("orders.created")
-	d := NewDLQ(js, nil, "", WithDLQRegistry(reg))
+	d := NewDLQ(js, "", WithDLQRegistry(reg))
 
 	evt := &mdEvent{name: "orders.created", EventID: "m-1", Payload: "p"}
 	ctx := event.WithMetadata(context.Background(), event.Metadata{ID: "m-1", Name: "orders.created"})
@@ -227,7 +202,7 @@ func TestDLQ_LocalBusRecordEncodedWithRegistry(t *testing.T) {
 
 func TestDLQ_NoEnvelopeWithoutRegistry(t *testing.T) {
 	js := &dlqtJS{}
-	d := NewDLQ(js, nil, "")
+	d := NewDLQ(js, "")
 	rec := event.DLQRecord{Evt: &mdEvent{name: "orders.created"}, Subject: "orders.created"}
 	err := d.Publish(context.Background(), rec)
 	if !errors.Is(err, ErrNoEnvelope) {
@@ -306,7 +281,7 @@ func TestDLQ_DecodeFailureEmptyBodyPublishedVerbatim(t *testing.T) {
 			if tc.registry != nil {
 				opts = append(opts, WithDLQRegistry(tc.registry))
 			}
-			d := NewDLQ(js, nil, "", opts...)
+			d := NewDLQ(js, "", opts...)
 
 			err := d.Publish(context.Background(), tc.rec)
 			if errors.Is(err, ErrNoEnvelope) {
@@ -341,7 +316,7 @@ func TestDLQ_DecodeFailureEmptyBodyPublishedVerbatim(t *testing.T) {
 
 func TestDLQ_MaxPayloadFallsBackToMinimalHeaders(t *testing.T) {
 	js := &dlqtJS{errs: []error{nats.ErrMaxPayload}}
-	d := NewDLQ(js, nil, "")
+	d := NewDLQ(js, "")
 	rec := dlqtRecord()
 	rec.Cause = errors.New(strings.Repeat("c", 600))
 	rec.Execution = event.Execution{Handler: "h", StartedAt: time.Date(2026, 10, 16, 11, 59, 0, 0, time.UTC)}
@@ -384,8 +359,7 @@ func TestDLQ_MaxPayloadFallsBackToMinimalHeaders(t *testing.T) {
 
 func TestDLQ_MaxPayloadTwiceReturnsError(t *testing.T) {
 	js := &dlqtJS{errs: []error{nats.ErrMaxPayload, nats.ErrMaxPayload}}
-	m := &dlqtMetrics{}
-	d := NewDLQ(js, m, "")
+	d := NewDLQ(js, "")
 	err := d.Publish(context.Background(), dlqtRecord())
 	if !errors.Is(err, nats.ErrMaxPayload) {
 		t.Fatalf("err = %v, want nats.ErrMaxPayload", err)
@@ -393,14 +367,11 @@ func TestDLQ_MaxPayloadTwiceReturnsError(t *testing.T) {
 	if js.calls() != 2 {
 		t.Errorf("publish calls = %d, want 2", js.calls())
 	}
-	if got := m.get("dlq_publish_error_total"); got != 1 {
-		t.Errorf("dlq_publish_error_total = %v, want 1 (once per failed Publish call)", got)
-	}
 }
 
 func TestDLQ_LongCauseTruncated(t *testing.T) {
 	js := &dlqtJS{}
-	d := NewDLQ(js, nil, "")
+	d := NewDLQ(js, "")
 	rec := dlqtRecord()
 	rec.Cause = errors.New(strings.Repeat("x", 5000))
 	if err := d.Publish(context.Background(), rec); err != nil {
@@ -417,7 +388,7 @@ func TestDLQ_LongCauseTruncated(t *testing.T) {
 
 func TestDLQ_StaleFailureHeadersReplaced(t *testing.T) {
 	js := &dlqtJS{}
-	d := NewDLQ(js, nil, "")
+	d := NewDLQ(js, "")
 	rec := dlqtRecord()
 	rec.Headers["Eventbus-Dlq-Reason"] = []string{"stale"}
 	rec.Headers["eventbus-dlq-handler"] = []string{"old"}
@@ -434,24 +405,5 @@ func TestDLQ_StaleFailureHeadersReplaced(t *testing.T) {
 	}
 	if got := h.Get("Eventbus-Trace"); got != "keep-me" {
 		t.Errorf("other Eventbus-* header = %q, want kept verbatim", got)
-	}
-}
-
-func TestDLQ_Metrics(t *testing.T) {
-	m := &dlqtMetrics{}
-	js := &dlqtJS{errs: []error{nil, errors.New("down")}}
-	d := NewDLQ(js, m, "")
-
-	if err := d.Publish(context.Background(), dlqtRecord()); err != nil {
-		t.Fatalf("first Publish: %v", err)
-	}
-	if err := d.Publish(context.Background(), dlqtRecord()); err == nil {
-		t.Fatal("second Publish: want error")
-	}
-	if got := m.get("dlq_published_total"); got != 1 {
-		t.Errorf("dlq_published_total = %v, want 1", got)
-	}
-	if got := m.get("dlq_publish_error_total"); got != 1 {
-		t.Errorf("dlq_publish_error_total = %v, want 1", got)
 	}
 }

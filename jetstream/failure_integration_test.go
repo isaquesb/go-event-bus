@@ -45,19 +45,17 @@ func TestIntegration_ChainDeadLetterVerbatimRecord(t *testing.T) {
 	prefix, dlqStream := itNewDLQStream(t, js)
 	consumer := uniqueName(t, "C")
 
-	dlq := NewDLQ(js, nil, prefix)
-	onErr := make(chan error, 8)
+	dlq := NewDLQ(js, prefix)
+	fails := make(chan event.FailureContext, 8)
 	bus := NewBus(js, itRegistry(), BusOptions{
 		Invoker: invoker.NewChain(
-			invoker.NewDLQ(dlq, nil),
-			invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 2, BaseDelay: 5 * time.Millisecond, MaxDelay: 10 * time.Millisecond}, nil),
+			invoker.NewDLQ(dlq),
+			invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 2, BaseDelay: 5 * time.Millisecond, MaxDelay: 10 * time.Millisecond}),
 		),
 		CircuitOpenDelay: time.Second,
 		RateLimitDelay:   time.Second,
 		DLQPublisher:     dlq,
-		OnErr: func(_ context.Context, _ event.Event, err error, _ string) {
-			onErr <- err
-		},
+		Observer:         &joRecorder{ch: fails},
 	})
 	t.Cleanup(func() { _ = bus.Close() })
 
@@ -123,18 +121,18 @@ func TestIntegration_ChainDeadLetterVerbatimRecord(t *testing.T) {
 	})
 
 	select {
-	case err := <-onErr:
-		if !errors.Is(err, event.ErrDeadLettered) {
-			t.Errorf("OnErr error = %v, want it to match event.ErrDeadLettered", err)
+	case f := <-fails:
+		if !errors.Is(f.Cause, event.ErrDeadLettered) {
+			t.Errorf("Failure cause = %v, want it to match event.ErrDeadLettered", f.Cause)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("OnErr was not called within 5s")
+		t.Fatal("Observer.Failure was not called within 5s")
 	}
 
 	time.Sleep(300 * time.Millisecond)
 	select {
-	case err := <-onErr:
-		t.Errorf("OnErr called a second time: %v", err)
+	case f := <-fails:
+		t.Errorf("Observer.Failure called a second time: %v", f.Cause)
 	default:
 	}
 	select {
@@ -165,7 +163,7 @@ func TestIntegration_TermWithReasonOnlyAfterDLQPublish(t *testing.T) {
 		Invoker:          invoker.NewChain(),
 		CircuitOpenDelay: time.Second,
 		RateLimitDelay:   time.Second,
-		DLQPublisher:     NewDLQ(js, nil, prefix),
+		DLQPublisher:     NewDLQ(js, prefix),
 	})
 	t.Cleanup(func() { _ = bus.Close() })
 
@@ -227,16 +225,14 @@ func TestIntegration_DLQPublishFailureNakNeverTerm(t *testing.T) {
 	consumer := uniqueName(t, "C")
 
 	// No stream captures this prefix, so every DLQ publish fails.
-	dlq := NewDLQ(js, nil, uniqueName(t, "nostream")+".")
-	onErr := make(chan error, 8)
+	dlq := NewDLQ(js, uniqueName(t, "nostream")+".")
+	fails := make(chan event.FailureContext, 8)
 	bus := NewBus(js, itRegistry(), BusOptions{
 		Invoker:          invoker.NewChain(),
 		CircuitOpenDelay: time.Second,
 		RateLimitDelay:   time.Second,
 		DLQPublisher:     dlq,
-		OnErr: func(_ context.Context, _ event.Event, err error, _ string) {
-			onErr <- err
-		},
+		Observer:         &joRecorder{ch: fails},
 	})
 	t.Cleanup(func() { _ = bus.Close() })
 
@@ -279,12 +275,12 @@ func TestIntegration_DLQPublishFailureNakNeverTerm(t *testing.T) {
 	// The final delivery reports the lost dead-letter once. It runs after the
 	// handler (bounded in-process DLQ retries), so wait for it.
 	select {
-	case err := <-onErr:
-		if !errors.Is(err, event.ErrDeadLetterFailed) {
-			t.Errorf("OnErr error = %v, want it to match event.ErrDeadLetterFailed", err)
+	case f := <-fails:
+		if !errors.Is(f.Cause, event.ErrDeadLetterFailed) {
+			t.Errorf("Failure cause = %v, want it to match event.ErrDeadLetterFailed", f.Cause)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("OnErr was not called on the final delivery")
+		t.Fatal("Observer.Failure was not called on the final delivery")
 	}
 
 	// The server abandons the message after MaxDeliver and says so.
@@ -302,8 +298,8 @@ func TestIntegration_DLQPublishFailureNakNeverTerm(t *testing.T) {
 	default:
 	}
 	select {
-	case err := <-onErr:
-		t.Errorf("OnErr called more than once: %v", err)
+	case f := <-fails:
+		t.Errorf("Observer.Failure called more than once: %v", f.Cause)
 	default:
 	}
 }
@@ -329,11 +325,11 @@ func TestIntegration_FinalDeliveryDeadLetterWithBackOff(t *testing.T) {
 	consumer := uniqueName(t, "C")
 
 	const backOff = 150 * time.Millisecond
-	dlq := NewDLQ(js, nil, prefix)
+	dlq := NewDLQ(js, prefix)
 	bus := NewBus(js, itRegistry(), BusOptions{
 		Invoker: invoker.NewChain(
-			invoker.NewDLQ(dlq, nil),
-			invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 2, BaseDelay: 5 * time.Millisecond, MaxDelay: 10 * time.Millisecond}, nil),
+			invoker.NewDLQ(dlq),
+			invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 2, BaseDelay: 5 * time.Millisecond, MaxDelay: 10 * time.Millisecond}),
 		),
 		CircuitOpenDelay: time.Second,
 		RateLimitDelay:   time.Second,
@@ -454,12 +450,12 @@ func TestIntegration_InProgressRecordNotAcked(t *testing.T) {
 		t.Fatalf("seed idempotency store: %v", err)
 	}
 
-	dlq := NewDLQ(js, nil, prefix)
+	dlq := NewDLQ(js, prefix)
 	bus := NewBus(js, itRegistry(), BusOptions{
 		Invoker: invoker.NewChain(
-			invoker.NewIdempotency(store, invoker.IdempotencyConfig{ProcessingTTL: time.Hour}, nil),
-			invoker.NewDLQ(dlq, nil),
-			invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 1}, nil),
+			invoker.NewIdempotency(store, invoker.IdempotencyConfig{ProcessingTTL: time.Hour}),
+			invoker.NewDLQ(dlq),
+			invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 1}),
 		),
 		CircuitOpenDelay: time.Second,
 		RateLimitDelay:   time.Second,
@@ -517,12 +513,6 @@ func TestIntegration_InProgressRecordNotAcked(t *testing.T) {
 	}
 }
 
-// itEmptyBodyReport is one OnErr report of the empty-body test.
-type itEmptyBodyReport struct {
-	evt event.Event
-	err error
-}
-
 // TestIntegration_EmptyBodyDecodeFailureDeadLettered proves on the real server
 // that an undecodable message with an empty body is dead-lettered with an empty
 // body instead of being lost at MaxDeliver (08-REVIEW CR-02): the DLQ record is
@@ -538,15 +528,13 @@ func TestIntegration_EmptyBodyDecodeFailureDeadLettered(t *testing.T) {
 	prefix, dlqStream := itNewDLQStream(t, js)
 	consumer := uniqueName(t, "C")
 
-	reports := make(chan itEmptyBodyReport, 8)
+	reports := make(chan event.FailureContext, 8)
 	bus := NewBus(js, itRegistry(), BusOptions{
 		Invoker:          invoker.NewChain(),
 		CircuitOpenDelay: time.Second,
 		RateLimitDelay:   time.Second,
-		DLQPublisher:     NewDLQ(js, nil, prefix),
-		OnErr: func(_ context.Context, evt event.Event, err error, _ string) {
-			reports <- itEmptyBodyReport{evt: evt, err: err}
-		},
+		DLQPublisher:     NewDLQ(js, prefix),
+		Observer:         &joRecorder{ch: reports},
 	})
 	t.Cleanup(func() { _ = bus.Close() })
 
@@ -569,20 +557,20 @@ func TestIntegration_EmptyBodyDecodeFailureDeadLettered(t *testing.T) {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	nextReport := func() itEmptyBodyReport {
+	nextReport := func() event.FailureContext {
 		t.Helper()
 		select {
 		case r := <-reports:
-			if r.evt != nil {
-				t.Errorf("OnErr event = %v, want nil", r.evt)
+			if r.Event != nil {
+				t.Errorf("Failure event = %v, want nil", r.Event)
 			}
-			if !errors.Is(r.err, event.ErrDeadLettered) || !errors.Is(r.err, event.ErrMalformedEnvelope) {
-				t.Errorf("OnErr error = %v, want ErrDeadLettered and ErrMalformedEnvelope", r.err)
+			if !errors.Is(r.Cause, event.ErrDeadLettered) || !errors.Is(r.Cause, event.ErrMalformedEnvelope) {
+				t.Errorf("Failure cause = %v, want ErrDeadLettered and ErrMalformedEnvelope", r.Cause)
 			}
 			return r
 		case <-time.After(5 * time.Second):
-			t.Fatal("OnErr was not called within 5s")
-			return itEmptyBodyReport{}
+			t.Fatal("Observer.Failure was not called within 5s")
+			return event.FailureContext{}
 		}
 	}
 

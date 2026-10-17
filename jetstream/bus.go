@@ -65,7 +65,18 @@ type BusOptions struct {
 	// called directly (invoker.NewChain()).
 	Invoker event.Invoker
 
-	OnErr func(ctx context.Context, evt event.Event, err error, handler string)
+	// Observer receives every signal of the bus: the Failure of each terminal
+	// outcome (exactly once across redeliveries, never on an intermediate
+	// NakWithDelay), HandlerDone, DecodeFailed, DLQPublishFailed and
+	// InternalError. It is configured once here and travels in the handler ctx.
+	// Nil means event.NewSlogObserver(nil), so failures are never silent;
+	// event.NopObserver{} silences the bus. The bus wraps it with
+	// event.MultiObserver, which isolates its panics.
+	Observer event.Observer
+
+	// TracerProvider creates the producer spans of Emit. Nil means the global
+	// provider (otel.GetTracerProvider), resolved at call time.
+	TracerProvider trace.TracerProvider
 
 	// CircuitOpenDelay is the delay before redelivery when circuit breaker is open.
 	// This should roughly match the circuit breaker's OpenTimeout.
@@ -106,12 +117,17 @@ var _ event.Shutdowner = (*Bus)(nil)
 type Bus struct {
 	js       jsBackend
 	registry event.Registry
-	onErr    func(ctx context.Context, evt event.Event, err error, handler string)
 	invoker  event.Invoker
 	idGen    func() string
 	inherit  []string
 	dlq      event.DLQPublisher
 	pubRetry PublishRetryPolicy
+
+	// observer is the configured bus Observer, installed in every handler ctx.
+	// nil (a struct-literal bus) means event.NopObserver{}, see obs.
+	observer event.Observer
+	// tp creates the producer spans; nil means the global provider.
+	tp trace.TracerProvider
 
 	shutdownTimeout time.Duration
 
@@ -161,12 +177,17 @@ func NewBus(
 	if opts.ShutdownTimeout <= 0 {
 		opts.ShutdownTimeout = event.DefaultShutdownTimeout
 	}
+	obs := opts.Observer
+	if obs == nil {
+		obs = event.NewSlogObserver(nil)
+	}
 	return &Bus{
 		pubRetry:         opts.PublishRetry.normalized(),
 		shutdownTimeout:  opts.ShutdownTimeout,
 		js:               js,
 		registry:         registry,
-		onErr:            opts.OnErr,
+		observer:         event.MultiObserver(obs),
+		tp:               opts.TracerProvider,
 		invoker:          opts.Invoker,
 		circuitOpenDelay: opts.CircuitOpenDelay,
 		rateLimitDelay:   opts.RateLimitDelay,
@@ -563,10 +584,46 @@ type deliveryPolicy struct {
 	backOff []time.Duration
 }
 
+// obs returns the bus Observer, event.NopObserver{} for a struct-literal bus
+// built without one.
+func (b *Bus) obs() event.Observer {
+	if b.observer == nil {
+		return event.NopObserver{}
+	}
+	return b.observer
+}
+
+// internalError reports an error inside the adapter as an InternalError signal.
+func (b *Bus) internalError(ctx context.Context, op, handler, subject string, err error) {
+	b.obs().InternalError(ctx, event.InternalErrorInfo{
+		Component: event.ComponentTransport,
+		Op:        op,
+		Handler:   handler,
+		Subject:   subject,
+		Err:       err,
+	})
+}
+
+// msgScope installs the bus Observer and a fresh FailureScope on ctx. Every
+// delivery gets its own scope, so the exactly-once guard of one delivery never
+// leaks into another, and the observer overwrites one inherited from a bus the
+// handler ctx came from. A non-nil g sees every Failure on its way to the bus
+// Observer, see guardObserver.
+func (b *Bus) msgScope(ctx context.Context, g *settleGuard) context.Context {
+	var o event.Observer = b.obs()
+	if g != nil {
+		o = guardObserver{Observer: o, g: g}
+	}
+	ctx = event.WithObserver(ctx, o)
+	ctx, _ = event.WithFailureScope(ctx)
+	return ctx
+}
+
 // delivery describes msg as a delivery attempt. The count comes from the
 // message metadata, so no Consumer.Info round trip is needed.
-func (b *Bus) delivery(msg jetstream.Msg, policy deliveryPolicy) event.Delivery {
+func (b *Bus) delivery(ctx context.Context, msg jetstream.Msg, policy deliveryPolicy) event.Delivery {
 	d := event.Delivery{
+		System:  "nats",
 		Count:   1,
 		Max:     policy.maxDeliver,
 		Subject: msg.Subject(),
@@ -575,10 +632,9 @@ func (b *Bus) delivery(msg jetstream.Msg, policy deliveryPolicy) event.Delivery 
 	}
 	md, err := msg.Metadata()
 	if err != nil {
-		slog.Warn("eventbus: message metadata unavailable, treating as first delivery",
-			"subject", d.Subject,
-			"error", err,
-		)
+		// The delivery is treated as the first one: the count is a lower bound.
+		b.internalError(ctx, event.OpConsume, "", d.Subject,
+			fmt.Errorf("jetstream: message metadata unavailable, treating as first delivery: %w", err))
 		return d
 	}
 	if md.NumDelivered > 0 {
@@ -603,19 +659,23 @@ func (b *Bus) delivery(msg jetstream.Msg, policy deliveryPolicy) event.Delivery 
 //   - TermWithReason: only after the DLQ publish succeeded, or when no
 //     DLQPublisher is configured (dropped)
 //
-// A panic outside the handler (Decode, Settle, the bus OnErr, the event's
-// OnErr, the DLQ publisher) is recovered, logged at Error and never reaches the
-// nats.go delivery goroutine. When no broker action happened yet the message is
-// handed back with NakWithDelay on the BackOff schedule, so it is redelivered
-// without waiting for AckWait and a poison message cannot spin. A message that
-// Settle already dead-lettered or reported as terminal is instead ended with
+// The bus Observer and a fresh FailureScope are installed on the handler ctx
+// before Decode, so Settle reports each terminal outcome to Observer.Failure
+// exactly once and never on an intermediate NakWithDelay.
+//
+// A panic outside the handler (Decode, Settle, the DLQ publisher) is recovered,
+// reported as an InternalError signal (Op panic) and never reaches the nats.go
+// delivery goroutine. When no broker action happened yet the message is handed
+// back with NakWithDelay on the BackOff schedule, so it is redelivered without
+// waiting for AckWait and a poison message cannot spin. A message that Settle
+// already dead-lettered or reported as terminal is instead ended with
 // TermWithReason on a non-final delivery, so it never runs again and is never
 // dead-lettered twice. On the final delivery a message not yet dead-lettered or
-// reported is instead reported through the bus OnErr (nil event,
-// *event.PanicError) and ended with TermWithReason, because the server would not
-// redeliver it. The recover never dead-letters and never calls the reason-less
-// Term. Its broker action happens while the message is still counted in flight,
-// so Shutdown does not return before it.
+// reported is instead reported to Observer.Failure (outcome dropped, reason
+// panic, nil event, *event.PanicError) and ended with TermWithReason, because
+// the server would not redeliver it. The recover never dead-letters and never
+// calls the reason-less Term. Its broker action happens while the message is
+// still counted in flight, so Shutdown does not return before it.
 func (b *Bus) msgHandler(
 	ctx context.Context,
 	handlerName string,
@@ -641,25 +701,23 @@ func (b *Bus) msgHandler(
 				return
 			}
 			stack := debug.Stack()
-			slog.ErrorContext(ctx, "eventbus: panic in message handler recovered",
-				"handler", handlerName,
-				"subject", msg.Subject(),
-				"panic", fmt.Sprint(r),
-				"stack", string(stack),
-			)
+			pe := &event.PanicError{Value: r, Stack: stack}
+			b.internalError(ctx, event.OpPanic, handlerName, msg.Subject(), pe)
 			if acted {
 				return
 			}
 			acted = true
-			d := b.delivery(msg, policy)
-			pe := &event.PanicError{Value: r, Stack: stack}
+			d := b.delivery(ctx, msg, policy)
 			var aerr error
+			op := event.OpNak
 			switch {
 			case d.Final() && !guard.ended:
 				// The server will not redeliver: report, then end the message.
-				b.reportPanicOnFinal(ctx, msg, handlerName, d, pe)
+				b.reportPanicOnFinal(ctx, handlerName, d, pe)
+				op = event.OpTerm
 				aerr = msg.TermWithReason(termReasonPanicOnFinal)
 			case guard.ended && !d.Final():
+				op = event.OpTerm
 				aerr = msg.TermWithReason(termReasonPanicAfterSettle)
 			default:
 				// A non-final delivery with no settlement, or the final
@@ -667,11 +725,7 @@ func (b *Bus) msgHandler(
 				aerr = msg.NakWithDelay(b.delayFor(pe, d, policy.backOff))
 			}
 			if aerr != nil {
-				slog.Warn("eventbus: handing back message after a panic failed, the broker may redeliver it",
-					"handler", handlerName,
-					"subject", d.Subject,
-					"error", aerr,
-				)
+				b.internalError(ctx, op, handlerName, d.Subject, aerr)
 			}
 		}()
 
@@ -684,11 +738,14 @@ func (b *Bus) msgHandler(
 		// hctx keeps the Subscribe ctx values and cancellation and is also
 		// cancelled, with cause ErrShutdownInterrupted, when Shutdown gives up.
 		// It is the SubscriptionCtx of every Settle call, so a deadline
-		// cancellation is an interruption (Nak), never a dead-letter.
+		// cancellation is an interruption (Nak), never a dead-letter. The bus
+		// Observer and the delivery's FailureScope are installed before Decode, so
+		// Decode, the handler and Settle all see them.
 		hctx, stop := b.life.HandlerContext(ctx, false)
 		defer stop()
+		hctx = b.msgScope(hctx, guard)
 
-		d := b.delivery(msg, policy)
+		d := b.delivery(hctx, msg, policy)
 
 		msgCtx, evt, err := b.registry.Decode(hctx, msg.Data())
 		if err != nil {
@@ -702,7 +759,6 @@ func (b *Bus) msgHandler(
 				Handler:         handlerName,
 				Err:             err,
 				Publisher:       guard.publisher(b.dlq),
-				OnErr:           guard.onErr(b.onErr),
 			})
 			acted = true
 			b.apply(msg, handlerName, s, err, d, policy)
@@ -723,7 +779,6 @@ func (b *Bus) msgHandler(
 			Handler:         handlerName,
 			Err:             err,
 			Publisher:       guard.publisher(b.dlq),
-			OnErr:           guard.onErr(b.onErr),
 		})
 		acted = true
 		b.apply(msg, handlerName, s, err, d, policy)
@@ -737,16 +792,16 @@ const termReasonPanicAfterSettle = "panic: recovered after settlement"
 // termReasonPanicOnFinal is the TermWithReason text of a message whose callback
 // panicked outside the handler on its final delivery, before Settle
 // dead-lettered or reported it. The server would not redeliver it, so the bus
-// reports it through OnErr and ends it.
+// reports it to Observer.Failure and ends it.
 const termReasonPanicOnFinal = "panic: recovered on the final delivery before settlement"
 
 // settleGuard records, for one message, whether Settle got past the point of no
 // return: the bus DLQ publish returned nil, or Settle began reporting the
 // terminal outcome. Only two calls set ended: the Publish of the wrapper from
-// publisher and the callback from onErr. Settle calls in.OnErr only from its
-// terminal report, after any dead-letter publish and before the event's own
-// OnErr method, so every reporting callback runs with ended already true, and
-// so does the chain-dead-lettered path.
+// publisher and the Failure of the guardObserver that msgScope installs. Settle
+// calls Observer.Failure only from its terminal report, after any dead-letter
+// publish and before the event's own OnErr method, so every reporting callback
+// runs with ended already true, and so does the chain-dead-lettered path.
 //
 // msgHandler's recover reads ended in two places: the non-final Term after
 // settlement, and the final-delivery report-and-Term before settlement. A
@@ -766,17 +821,6 @@ func (g *settleGuard) publisher(p event.DLQPublisher) event.DLQPublisher {
 	return guardedPublisher{p: p, g: g}
 }
 
-// onErr returns a never-nil callback that sets ended and then calls f when f is
-// non-nil.
-func (g *settleGuard) onErr(f func(ctx context.Context, evt event.Event, err error, handler string)) func(ctx context.Context, evt event.Event, err error, handler string) {
-	return func(ctx context.Context, evt event.Event, err error, handler string) {
-		g.ended = true
-		if f != nil {
-			f(ctx, evt, err, handler)
-		}
-	}
-}
-
 type guardedPublisher struct {
 	p event.DLQPublisher
 	g *settleGuard
@@ -790,27 +834,47 @@ func (w guardedPublisher) Publish(ctx context.Context, rec event.DLQRecord) erro
 	return err
 }
 
-// reportPanicOnFinal reports a panic outside the handler through the bus OnErr.
-// It is called only from the msgHandler recover, on the final delivery, when
-// Settle did not dead-letter or report the message. The bus OnErr gets a nil
-// event and the *event.PanicError, and is called at most once on this path,
-// because settleGuard.onErr sets ended before it forwards. The call has its own
-// recover: a panicking OnErr is logged and cannot escape the msgHandler recover
-// or skip the TermWithReason that follows.
-func (b *Bus) reportPanicOnFinal(ctx context.Context, msg jetstream.Msg, handlerName string, d event.Delivery, pe *event.PanicError) {
-	if b.onErr == nil {
-		return
-	}
+// guardObserver forwards every signal to the bus Observer and sets ended before
+// it forwards a Failure, so the flag is true even when the observer panics.
+type guardObserver struct {
+	event.Observer
+	g *settleGuard
+}
+
+func (o guardObserver) Failure(ctx context.Context, f event.FailureContext) {
+	o.g.ended = true
+	o.Observer.Failure(ctx, f)
+}
+
+// reportPanicOnFinal reports a panic outside the handler to Observer.Failure:
+// outcome dropped (the message is ended without a dead-letter record), reason
+// panic, no event, the *event.PanicError as cause. It is called only from the
+// msgHandler recover, on the final delivery, when Settle did not dead-letter or
+// report the message, so the Failure fires at most once. The call has its own
+// recover: a panicking observer (a bus built as a struct literal, as the
+// production observer is wrapped in event.MultiObserver) cannot escape the
+// msgHandler recover or skip the TermWithReason that follows.
+func (b *Bus) reportPanicOnFinal(ctx context.Context, handlerName string, d event.Delivery, pe *event.PanicError) {
 	defer func() {
 		if value := recover(); value != nil {
-			slog.ErrorContext(ctx, "eventbus: panic in OnErr while reporting a panic on the final delivery",
-				"handler", handlerName,
-				"subject", msg.Subject(),
-				"panic", fmt.Sprint(value),
-			)
+			func() {
+				defer func() { _ = recover() }()
+				b.internalError(ctx, event.OpPanic, handlerName, d.Subject,
+					&event.PanicError{Value: value, Stack: debug.Stack()})
+			}()
 		}
 	}()
-	b.onErr(event.WithDelivery(ctx, d), nil, pe, handlerName)
+	d.Raw = nil
+	fctx := event.WithDelivery(ctx, d)
+	b.obs().Failure(fctx, event.FailureContext{
+		Handler:  handlerName,
+		Outcome:  event.OutcomeDropped,
+		Reason:   event.ReasonPanic,
+		Cause:    pe,
+		Invoker:  event.FailingInvokerOf(pe),
+		Delivery: d,
+		At:       time.Now().UTC(),
+	})
 }
 
 // handBack gives an unstarted message back to the server with Nak while the bus
@@ -820,9 +884,11 @@ func (b *Bus) reportPanicOnFinal(ctx context.Context, msg jetstream.Msg, handler
 // Each hand-back consumes one delivery, the accepted D-27 cost. On the final
 // delivery the server will not redeliver, so the hand-back is reported once as
 // interrupted: Settle sees a cancelled subscription context, never publishes
-// and calls OnErr with a nil event. The Nak has already happened by then.
+// and reports to Observer.Failure with a nil event. The Nak has already happened
+// by then.
 func (b *Bus) handBack(ctx context.Context, msg jetstream.Msg, handlerName string, policy deliveryPolicy) {
-	d := b.delivery(msg, policy)
+	hctx := b.msgScope(ctx, nil)
+	d := b.delivery(hctx, msg, policy)
 	if err := msg.Nak(); err != nil {
 		slog.Warn("eventbus: handing back message failed, the broker may redeliver it",
 			"handler", handlerName,
@@ -833,15 +899,14 @@ func (b *Bus) handBack(ctx context.Context, msg jetstream.Msg, handlerName strin
 	if !d.Final() {
 		return
 	}
-	cctx, cancel := context.WithCancelCause(ctx)
+	cctx, cancel := context.WithCancelCause(hctx)
 	cancel(event.ErrShutdownInterrupted)
-	event.Settle(event.WithDelivery(ctx, d), event.SettleInput{
+	event.Settle(event.WithDelivery(hctx, d), event.SettleInput{
 		SubscriptionCtx: cctx,
 		Evt:             nil,
 		Handler:         handlerName,
 		Err:             fmt.Errorf("%w: %w", event.ErrShutdownInterrupted, context.Canceled),
 		Publisher:       b.dlq,
-		OnErr:           b.onErr,
 	})
 }
 

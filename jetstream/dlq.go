@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	event "github.com/isaquesb/go-event-bus"
-	"github.com/isaquesb/go-event-bus/invoker"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -36,7 +35,6 @@ type dlqBackend interface {
 // and consumers of the DLQ stream must tolerate that.
 type DLQ struct {
 	js       dlqBackend
-	metrics  invoker.MetricProvider
 	prefix   string
 	registry event.Registry
 }
@@ -46,16 +44,17 @@ var _ event.DLQPublisher = (*DLQ)(nil)
 // DLQOption configures a DLQ.
 type DLQOption func(*DLQ)
 
-// NewDLQ returns a DLQ that publishes through js. A nil metrics is a no-op
-// provider and an empty prefix is DefaultDLQPrefix.
-func NewDLQ(js dlqBackend, metrics invoker.MetricProvider, prefix string, opts ...DLQOption) *DLQ {
-	if metrics == nil {
-		metrics = &invoker.NoopProvider{}
-	}
+// NewDLQ returns a DLQ that publishes through js. An empty prefix is
+// DefaultDLQPrefix.
+//
+// The publisher counts nothing itself: dead-letter successes and failures are
+// reported by event.PublishDeadLetter through the bus Observer
+// (Observer.DeadLettered and Observer.DLQPublishFailed).
+func NewDLQ(js dlqBackend, prefix string, opts ...DLQOption) *DLQ {
 	if prefix == "" {
 		prefix = DefaultDLQPrefix
 	}
-	d := &DLQ{js: js, metrics: metrics, prefix: prefix}
+	d := &DLQ{js: js, prefix: prefix}
 	for _, opt := range opts {
 		opt(d)
 	}
@@ -123,12 +122,7 @@ func (d *DLQ) Publish(ctx context.Context, rec event.DLQRecord) error {
 	if errors.Is(err, nats.ErrMaxPayload) {
 		err = d.send(ctx, subject, dlqMinimalHeaders(rec), data)
 	}
-	if err != nil {
-		d.metrics.IncCounter("dlq_publish_error_total", 1, invoker.Labels{})
-		return err
-	}
-	d.metrics.IncCounter("dlq_published_total", 1, invoker.Labels{})
-	return nil
+	return err
 }
 
 // send publishes one message with no publish options, so no message id is set.

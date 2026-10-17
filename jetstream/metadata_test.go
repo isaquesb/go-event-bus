@@ -257,6 +257,10 @@ func newMdBus(js jsBackend, reg event.Registry, opts BusOptions) *Bus {
 	if opts.Invoker == nil {
 		opts.Invoker = invoker.NewChain()
 	}
+	if opts.Observer == nil {
+		// Keep the default SlogObserver out of the test output.
+		opts.Observer = event.NopObserver{}
+	}
 	opts.CircuitOpenDelay = 1
 	opts.RateLimitDelay = 1
 	return NewBus(js, reg, opts)
@@ -330,12 +334,10 @@ func TestJetStreamBus_Emit_RegistryWithoutEnvelopeEncoder(t *testing.T) {
 	}
 }
 
-func TestJetStreamBus_OnErrReceivesMessageContext(t *testing.T) {
-	var onErrCtx context.Context
+func TestJetStreamBus_FailureReceivesMessageContext(t *testing.T) {
+	rec := &joRecorder{}
 	js := &mdJS{}
-	bus := newMdBus(js, newMdRegistry("order.created"), BusOptions{
-		OnErr: func(ctx context.Context, _ event.Event, _ error, _ string) { onErrCtx = ctx },
-	})
+	bus := newMdBus(js, newMdRegistry("order.created"), BusOptions{Observer: rec})
 
 	if err := bus.Emit(context.Background(), &mdEvent{name: "order.created"}, event.WithID("id-err")); err != nil {
 		t.Fatalf("Emit: %v", err)
@@ -347,12 +349,15 @@ func TestJetStreamBus_OnErrReceivesMessageContext(t *testing.T) {
 		return errors.New("boom")
 	}, deliveryPolicy{maxDeliver: 1})(msg)
 
-	if onErrCtx == nil {
-		t.Fatal("OnErr was not called")
+	if rec.failureCount() != 1 {
+		t.Fatalf("Failure calls = %d, want 1", rec.failureCount())
 	}
-	md, ok := event.MetadataFromContext(onErrCtx)
+	md, ok := event.MetadataFromContext(rec.failureCtx(0))
 	if !ok || md.ID != "id-err" {
-		t.Errorf("OnErr ctx metadata = %+v ok=%v, want ID id-err", md, ok)
+		t.Errorf("Failure ctx metadata = %+v ok=%v, want ID id-err", md, ok)
+	}
+	if f := rec.failures()[0]; f.Metadata.ID != "id-err" {
+		t.Errorf("FailureContext.Metadata.ID = %q, want id-err", f.Metadata.ID)
 	}
 	got := msg.snapshot()
 	if got.naks != 0 || got.plainTerms != 0 || got.acks != 0 || len(got.nakDelays) != 0 {
@@ -364,17 +369,9 @@ func TestJetStreamBus_OnErrReceivesMessageContext(t *testing.T) {
 }
 
 func TestJetStreamBus_DecodeFailureDroppedWithoutDLQ(t *testing.T) {
-	var (
-		onErrCalls int
-		onErrEvt   event.Event = &mdEvent{}
-		fnCalled   bool
-	)
-	bus := newMdBus(&mdJS{}, newMdRegistry("order.created"), BusOptions{
-		OnErr: func(_ context.Context, evt event.Event, _ error, _ string) {
-			onErrCalls++
-			onErrEvt = evt
-		},
-	})
+	var fnCalled bool
+	rec := &joRecorder{}
+	bus := newMdBus(&mdJS{}, newMdRegistry("order.created"), BusOptions{Observer: rec})
 
 	msg := &mdMsg{data: []byte("not json"), numDelivered: 1}
 	bus.msgHandler(context.Background(), "h", func(context.Context, event.Event) error {
@@ -389,8 +386,11 @@ func TestJetStreamBus_DecodeFailureDroppedWithoutDLQ(t *testing.T) {
 	if got.acks != 0 || got.naks != 0 || got.plainTerms != 0 || len(got.nakDelays) != 0 {
 		t.Errorf("snapshot = %+v, want only a TermWithReason", got)
 	}
-	if onErrCalls != 1 || onErrEvt != nil {
-		t.Errorf("OnErr calls=%d evt=%v, want one call with a nil event (the silent Term is gone)", onErrCalls, onErrEvt)
+	if rec.failureCount() != 1 || rec.lastEvent() != nil {
+		t.Errorf("Failure calls=%d evt=%v, want one call with a nil event (the silent Term is gone)", rec.failureCount(), rec.lastEvent())
+	}
+	if f := rec.failures()[0]; f.Outcome != event.OutcomeDecodeFailed {
+		t.Errorf("Failure outcome = %q, want %q", f.Outcome, event.OutcomeDecodeFailed)
 	}
 	if fnCalled {
 		t.Error("handler was called for an undecodable message")
