@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -552,6 +553,16 @@ func (b *Bus) delivery(msg jetstream.Msg, policy deliveryPolicy) event.Delivery 
 //     dead-letter publish
 //   - TermWithReason: only after the DLQ publish succeeded, or when no
 //     DLQPublisher is configured (dropped)
+//
+// A panic outside the handler (Decode, Settle, the bus OnErr, the event's
+// OnErr, the DLQ publisher) is recovered, logged at Error and never reaches the
+// nats.go delivery goroutine. When no broker action happened yet the message is
+// handed back with NakWithDelay on the BackOff schedule, so it is redelivered
+// without waiting for AckWait and a poison message cannot spin. A message that
+// Settle already dead-lettered or reported as terminal is instead ended with
+// TermWithReason on a non-final delivery, so it never runs again and is never
+// dead-lettered twice. The recover never dead-letters and never calls the
+// reason-less Term.
 func (b *Bus) msgHandler(
 	ctx context.Context,
 	handlerName string,
@@ -559,12 +570,53 @@ func (b *Bus) msgHandler(
 	policy deliveryPolicy,
 ) jetstream.MessageHandler {
 	return func(msg jetstream.Msg) {
+		// acted is set immediately before every broker action, so the recover
+		// below never acts on a message twice. guard records whether Settle got
+		// past the point of no return. The recover is registered before Track,
+		// so the deferred release and stop run first while it unwinds.
+		acted := false
+		guard := &settleGuard{}
+		defer func() {
+			r := recover()
+			if r == nil {
+				return
+			}
+			stack := debug.Stack()
+			slog.ErrorContext(ctx, "eventbus: panic in message handler recovered",
+				"handler", handlerName,
+				"subject", msg.Subject(),
+				"panic", fmt.Sprint(r),
+				"stack", string(stack),
+			)
+			if acted {
+				return
+			}
+			acted = true
+			d := b.delivery(msg, policy)
+			var aerr error
+			if guard.ended && !d.Final() {
+				aerr = msg.TermWithReason(termReasonPanicAfterSettle)
+			} else {
+				pe := &event.PanicError{Value: r, Stack: stack}
+				aerr = msg.NakWithDelay(b.delayFor(pe, d, policy.backOff))
+			}
+			if aerr != nil {
+				slog.Warn("eventbus: handing back message after a panic failed, the broker may redeliver it",
+					"handler", handlerName,
+					"subject", d.Subject,
+					"error", aerr,
+				)
+			}
+		}()
+
 		if b.life.Closing() {
+			acted = true
 			b.handBack(ctx, msg, handlerName, policy)
 			return
 		}
 		release, ok := b.life.Track()
 		if !ok {
+			acted = true
 			b.handBack(ctx, msg, handlerName, policy)
 			return
 		}
@@ -590,9 +642,10 @@ func (b *Bus) msgHandler(
 				Evt:             nil,
 				Handler:         handlerName,
 				Err:             err,
-				Publisher:       b.dlq,
-				OnErr:           b.onErr,
+				Publisher:       guard.publisher(b.dlq),
+				OnErr:           guard.onErr(b.onErr),
 			})
+			acted = true
 			b.apply(msg, handlerName, s, err, d, policy)
 			return
 		}
@@ -610,11 +663,65 @@ func (b *Bus) msgHandler(
 			Evt:             evt,
 			Handler:         handlerName,
 			Err:             err,
-			Publisher:       b.dlq,
-			OnErr:           b.onErr,
+			Publisher:       guard.publisher(b.dlq),
+			OnErr:           guard.onErr(b.onErr),
 		})
+		acted = true
 		b.apply(msg, handlerName, s, err, d, policy)
 	}
+}
+
+// termReasonPanicAfterSettle is the TermWithReason text of a message whose
+// callback panicked after Settle dead-lettered or reported it.
+const termReasonPanicAfterSettle = "panic: recovered after settlement"
+
+// settleGuard records, for one message, whether Settle got past the point of no
+// return: the bus DLQ publish returned nil, or Settle began reporting the
+// terminal outcome. Only two calls set ended: the Publish of the wrapper from
+// publisher and the callback from onErr. Settle calls in.OnErr only from its
+// terminal report, after any dead-letter publish and before the event's own
+// OnErr method, so every reporting callback runs with ended already true, and
+// so does the chain-dead-lettered path.
+//
+// msgHandler's recover reads ended: a message that was dead-lettered or
+// reported must not be redelivered, since that would rerun the handler, write a
+// second DLQ record and report the outcome again. It is used on the delivery
+// goroutine only, so it needs no lock.
+type settleGuard struct {
+	ended bool
+}
+
+// publisher wraps p so a successful Publish sets ended. A nil p stays nil:
+// Settle's dropped branch keys on a nil Publisher.
+func (g *settleGuard) publisher(p event.DLQPublisher) event.DLQPublisher {
+	if p == nil {
+		return nil
+	}
+	return guardedPublisher{p: p, g: g}
+}
+
+// onErr returns a never-nil callback that sets ended and then calls f when f is
+// non-nil.
+func (g *settleGuard) onErr(f func(ctx context.Context, evt event.Event, err error, handler string)) func(ctx context.Context, evt event.Event, err error, handler string) {
+	return func(ctx context.Context, evt event.Event, err error, handler string) {
+		g.ended = true
+		if f != nil {
+			f(ctx, evt, err, handler)
+		}
+	}
+}
+
+type guardedPublisher struct {
+	p event.DLQPublisher
+	g *settleGuard
+}
+
+func (w guardedPublisher) Publish(ctx context.Context, rec event.DLQRecord) error {
+	err := w.p.Publish(ctx, rec)
+	if err == nil {
+		w.g.ended = true
+	}
+	return err
 }
 
 // handBack gives an unstarted message back to the server with Nak while the bus
