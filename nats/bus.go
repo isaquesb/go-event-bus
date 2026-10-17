@@ -376,7 +376,7 @@ func (b *Bus) Subscribe(
 
 		msgCtx, evt, err := b.reg.Decode(hctx, msg.Data)
 		if err != nil {
-			_, _ = b.settleDecode(hctx, msg, handlerName, err)
+			_, _ = b.settleDecode(hctx, msgCtx, msg, handlerName, err)
 			return
 		}
 
@@ -446,7 +446,7 @@ func (b *Bus) SubscribeSync(
 
 		msgCtx, evt, err := b.reg.Decode(hctx, msg.Data)
 		if err != nil {
-			s, derr := b.settleDecode(hctx, msg, handlerName, err)
+			s, derr := b.settleDecode(hctx, msgCtx, msg, handlerName, err)
 			b.replyError(hctx, msg, handlerName, settleReason(s, derr), derr)
 			replied = true
 			return
@@ -598,9 +598,18 @@ func (b *Bus) settle(ctx, msgCtx context.Context, evt event.Event, handlerName s
 // settleDecode settles a decode failure, which has no event and no handler run.
 // It returns the settlement and the error as classified (always a
 // *event.DecodeError).
-func (b *Bus) settleDecode(ctx context.Context, msg *nats.Msg, handlerName string, err error) (event.Settlement, error) {
+//
+// ctx is the subscription (handler) ctx and stays the SubscriptionCtx, so
+// interruption detection is unchanged. msgCtx is the ctx Registry.Decode
+// returned: once the envelope parsed it carries the Metadata and the extracted
+// span, so the settlement keeps the event id, the correlation id and the trace
+// of the undecodable message. A nil msgCtx falls back to ctx.
+func (b *Bus) settleDecode(ctx, msgCtx context.Context, msg *nats.Msg, handlerName string, err error) (event.Settlement, error) {
+	if msgCtx == nil {
+		msgCtx = ctx
+	}
 	err = event.WrapDecodeError(err)
-	dctx := event.WithDelivery(ctx, deliveryOf(msg))
+	dctx := event.WithDelivery(msgCtx, deliveryOf(msg))
 	return b.settle(ctx, dctx, nil, handlerName, err), err
 }
 

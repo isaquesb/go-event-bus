@@ -788,8 +788,16 @@ func (b *Bus) msgHandler(
 			// A decode failure has no event and no handler run. Settle
 			// dead-letters the raw bytes (permanent failures) or retries until
 			// the final delivery (ErrUnknownVersion), never a silent Term.
+			//
+			// Settle runs on the ctx Decode returned: once the envelope parsed it
+			// carries the Metadata (event id, correlation id) and the extracted
+			// span, so FailureContext and the DLQ record identify the message.
+			// SubscriptionCtx stays hctx, so interruption detection is unchanged.
+			if msgCtx == nil {
+				msgCtx = hctx
+			}
 			err = event.WrapDecodeError(err)
-			s := event.Settle(event.WithDelivery(hctx, d), event.SettleInput{
+			s := event.Settle(event.WithDelivery(msgCtx, d), event.SettleInput{
 				SubscriptionCtx: hctx,
 				Evt:             nil,
 				Handler:         handlerName,
@@ -797,7 +805,7 @@ func (b *Bus) msgHandler(
 				Publisher:       guard.publisher(b.dlq),
 			})
 			acted = true
-			b.apply(hctx, msg, handlerName, s, err, d, policy)
+			b.apply(msgCtx, msg, handlerName, s, err, d, policy)
 			return
 		}
 
