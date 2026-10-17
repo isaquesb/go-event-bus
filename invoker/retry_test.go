@@ -15,7 +15,7 @@ func TestRetry_Success(t *testing.T) {
 		MaxAttempts: 3,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
@@ -36,7 +36,7 @@ func TestRetry_RetryOnFailure(t *testing.T) {
 		MaxAttempts: 3,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
@@ -60,7 +60,7 @@ func TestRetry_ExhaustedRetries(t *testing.T) {
 		MaxAttempts: 3,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	persistentErr := errors.New("persistent error")
@@ -93,7 +93,7 @@ func TestRetry_PermanentErrorSendsToDLQ(t *testing.T) {
 		MaxAttempts: 5,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	inner := errors.New("permanent failure")
@@ -125,7 +125,7 @@ func TestRetry_RetryableError(t *testing.T) {
 		MaxAttempts: 3,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
@@ -149,7 +149,7 @@ func TestRetry_NoRetryForDuplicate(t *testing.T) {
 		MaxAttempts: 5,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
@@ -170,7 +170,7 @@ func TestRetry_NoRetryForRateLimited(t *testing.T) {
 		MaxAttempts: 5,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
@@ -191,7 +191,7 @@ func TestRetry_NoRetryForCircuitOpen(t *testing.T) {
 		MaxAttempts: 5,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
@@ -212,7 +212,7 @@ func TestRetry_NoRetryForContextCanceled(t *testing.T) {
 		MaxAttempts: 5,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
@@ -233,7 +233,7 @@ func TestRetry_ContextCancellationDuringBackoff(t *testing.T) {
 		MaxAttempts: 5,
 		BaseDelay:   time.Second, // Long delay
 		MaxDelay:    time.Second,
-	}, nil)
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -257,16 +257,14 @@ func TestRetry_ContextCancellationDuringBackoff(t *testing.T) {
 }
 
 func TestRetry_BackoffCapped(t *testing.T) {
-	metrics := &testMetricProvider{}
-
 	retry := invoker.NewRetry(invoker.RetryPolicy{
 		MaxAttempts: 10,
 		BaseDelay:   100 * time.Millisecond,
 		MaxDelay:    200 * time.Millisecond, // Cap at 200ms
-	}, metrics)
+	})
 
 	called := 0
-	_ = retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
+	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
 		called++
 		if called < 5 {
 			return errors.New("fail")
@@ -274,38 +272,8 @@ func TestRetry_BackoffCapped(t *testing.T) {
 		return nil
 	})
 
-	// Check that backoff was capped (all recorded backoffs should be <= 200ms)
-	for _, val := range metrics.histograms["eventbus_retry_backoff_ms"] {
-		if val > 200 {
-			t.Errorf("backoff exceeded max delay: %v", val)
-		}
-	}
-}
-
-func TestRetry_MetricsTracked(t *testing.T) {
-	metrics := &testMetricProvider{}
-
-	retry := invoker.NewRetry(invoker.RetryPolicy{
-		MaxAttempts: 3,
-		BaseDelay:   time.Millisecond,
-		MaxDelay:    10 * time.Millisecond,
-	}, metrics)
-
-	called := 0
-	_ = retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-		called++
-		if called < 3 {
-			return errors.New("fail")
-		}
-		return nil
-	})
-
-	if metrics.counters["eventbus_retry_attempt_total"] != 3 {
-		t.Errorf("expected 3 retry attempts, got %d", metrics.counters["eventbus_retry_attempt_total"])
-	}
-
-	if metrics.counters["eventbus_retry_success_total"] != 1 {
-		t.Errorf("expected 1 retry success, got %d", metrics.counters["eventbus_retry_success_total"])
+	if err != nil || called != 5 {
+		t.Errorf("expected success on the 5th attempt with a capped backoff, got called=%d err=%v", called, err)
 	}
 }
 
@@ -315,7 +283,7 @@ func retryNoRetryFor(t *testing.T, sentinel error) {
 		MaxAttempts: 5,
 		BaseDelay:   time.Millisecond,
 		MaxDelay:    10 * time.Millisecond,
-	}, nil)
+	})
 
 	called := 0
 	err := retry.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
@@ -344,7 +312,7 @@ func TestRetry_NoRetryForDeadLetterFailed(t *testing.T) {
 }
 
 func TestRetry_ZeroMaxAttemptsRunsOnce(t *testing.T) {
-	retry := invoker.NewRetry(invoker.RetryPolicy{}, nil)
+	retry := invoker.NewRetry(invoker.RetryPolicy{})
 
 	called := 0
 	cause := errors.New("fails")
@@ -378,32 +346,4 @@ func TestSentinelAliases_Identity(t *testing.T) {
 	if invoker.ErrSendToDLQ != event.ErrSendToDLQ {
 		t.Error("invoker.ErrSendToDLQ must be event.ErrSendToDLQ")
 	}
-}
-
-// testMetricProvider collects metrics for testing
-type testMetricProvider struct {
-	counters   map[string]int64
-	histograms map[string][]float64
-	gauges     map[string]float64
-}
-
-func (m *testMetricProvider) IncCounter(name string, n int64, labels invoker.Labels) {
-	if m.counters == nil {
-		m.counters = make(map[string]int64)
-	}
-	m.counters[name] += n
-}
-
-func (m *testMetricProvider) ObserveHistogram(name string, value float64, labels invoker.Labels) {
-	if m.histograms == nil {
-		m.histograms = make(map[string][]float64)
-	}
-	m.histograms[name] = append(m.histograms[name], value)
-}
-
-func (m *testMetricProvider) SetGauge(name string, value float64, labels invoker.Labels) {
-	if m.gauges == nil {
-		m.gauges = make(map[string]float64)
-	}
-	m.gauges[name] = value
 }

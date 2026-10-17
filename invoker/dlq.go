@@ -17,15 +17,8 @@ type DLQPublisher = event.DLQPublisher
 
 // NewDLQ returns the DLQ invoker. A nil publisher turns it into a pass-through,
 // and the transport backstop reports the failure.
-func NewDLQ(p DLQPublisher, metrics MetricProvider) *DLQ {
-	if metrics == nil {
-		metrics = &NoopProvider{}
-	}
-
-	return &DLQ{
-		publisher: p,
-		metrics:   metrics,
-	}
+func NewDLQ(p DLQPublisher) *DLQ {
+	return &DLQ{publisher: p}
 }
 
 // DLQ dead-letters a message when the shared disposition (event.Dispose) says
@@ -39,7 +32,6 @@ func NewDLQ(p DLQPublisher, metrics MetricProvider) *DLQ {
 // transports Ack), and a failed publish returns *event.DeadLetterFailedError.
 type DLQ struct {
 	publisher DLQPublisher
-	metrics   MetricProvider
 }
 
 // Invoke implements event.Invoker.
@@ -69,19 +61,8 @@ func (i *DLQ) Invoke(
 
 	rec := event.NewDLQRecord(ctx, evt, handler, err)
 	if perr := event.PublishDeadLetter(ctx, i.publisher, rec); perr != nil {
-		i.metrics.IncCounter(
-			"eventbus_dlq_publish_error_total",
-			1,
-			Labels{"handler": handler},
-		)
 		return &event.DeadLetterFailedError{Cause: err, Reason: rec.Reason, PublishErr: perr}
 	}
-
-	i.metrics.IncCounter(
-		"eventbus_dlq_published_total",
-		1,
-		Labels{"handler": handler},
-	)
 
 	return &event.DeadLetteredError{Cause: err, Reason: rec.Reason}
 }

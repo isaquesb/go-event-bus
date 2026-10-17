@@ -18,17 +18,17 @@ func (pcEvent) Name() string { return "pc.order" }
 // pcChain builds the documented order: DLQ outside Retry outside CircuitBreaker.
 func pcChain(pub event.DLQPublisher) *invoker.Chain {
 	return invoker.NewChain(
-		invoker.NewDLQ(pub, nil),
+		invoker.NewDLQ(pub),
 		invoker.NewRetry(invoker.RetryPolicy{
 			MaxAttempts: 3,
 			BaseDelay:   time.Millisecond,
 			MaxDelay:    2 * time.Millisecond,
-		}, nil),
+		}),
 		invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
 			FailureThreshold: 1,
 			SuccessThreshold: 1,
 			OpenTimeout:      time.Minute,
-		}, nil),
+		}),
 	)
 }
 

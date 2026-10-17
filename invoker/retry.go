@@ -105,20 +105,12 @@ func backoff(attempt int, base, max time.Duration) time.Duration {
 	return d
 }
 
-func NewRetry(p RetryPolicy, metrics MetricProvider) *Retry {
-	if metrics == nil {
-		metrics = &NoopProvider{}
-	}
-
-	return &Retry{
-		policy:  p,
-		metrics: metrics,
-	}
+func NewRetry(p RetryPolicy) *Retry {
+	return &Retry{policy: p}
 }
 
 type Retry struct {
-	policy  RetryPolicy
-	metrics MetricProvider
+	policy RetryPolicy
 }
 
 func (r *Retry) Invoke(
@@ -134,32 +126,14 @@ func (r *Retry) Invoke(
 	maxAttempts := max(r.policy.MaxAttempts, 1)
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		r.metrics.IncCounter(
-			"eventbus_retry_attempt_total",
-			1,
-			Labels{"handler": handler},
-		)
-
 		err := next(ctx)
 		if err == nil {
-			if attempt > 1 {
-				r.metrics.IncCounter(
-					"eventbus_retry_success_total",
-					1,
-					Labels{"handler": handler},
-				)
-			}
 			return nil
 		}
 
 		retry, terminal := classify(err)
 
 		if terminal {
-			r.metrics.IncCounter(
-				"eventbus_retry_terminal_total",
-				1,
-				Labels{"handler": handler},
-			)
 			return &event.FailureError{Cause: err, Reason: event.ReasonTerminal, Attempts: attempt}
 		}
 
@@ -175,24 +149,12 @@ func (r *Retry) Invoke(
 
 		delay := backoff(attempt-1, r.policy.BaseDelay, r.policy.MaxDelay)
 
-		r.metrics.ObserveHistogram(
-			"eventbus_retry_backoff_ms",
-			float64(delay.Milliseconds()),
-			Labels{"handler": handler},
-		)
-
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-
-	r.metrics.IncCounter(
-		"eventbus_retry_exhausted_total",
-		1,
-		Labels{"handler": handler},
-	)
 
 	return &event.FailureError{
 		Cause:    lastErr,

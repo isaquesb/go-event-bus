@@ -35,23 +35,16 @@ type RateLimitConfig struct {
 func NewRateLimiter(
 	store RateLimitStore,
 	cfg RateLimitConfig,
-	metrics MetricProvider,
 ) *RateLimiter {
-	if metrics == nil {
-		metrics = &NoopProvider{}
-	}
-
 	return &RateLimiter{
-		store:   store,
-		cfg:     cfg,
-		metrics: metrics,
+		store: store,
+		cfg:   cfg,
 	}
 }
 
 type RateLimiter struct {
-	store   RateLimitStore
-	cfg     RateLimitConfig
-	metrics MetricProvider
+	store RateLimitStore
+	cfg   RateLimitConfig
 }
 
 func (i *RateLimiter) Invoke(
@@ -80,33 +73,16 @@ func (i *RateLimiter) Invoke(
 		i.cfg.Burst,
 	)
 	if err != nil {
-		i.metrics.IncCounter(
-			"eventbus_ratelimit_error_total",
-			1,
-			Labels{"handler": handler},
-		)
 		return err
 	}
 
 	if !allowed {
-		i.metrics.IncCounter(
-			"eventbus_ratelimit_blocked_total",
-			1,
-			Labels{"handler": handler},
-		)
-
 		if i.cfg.OnLimit != nil {
 			i.cfg.OnLimit(ctx, evt, key)
 		}
 
 		return ErrRateLimited
 	}
-
-	i.metrics.IncCounter(
-		"eventbus_ratelimit_allowed_total",
-		1,
-		Labels{"handler": handler},
-	)
 
 	return next(ctx)
 }

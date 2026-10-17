@@ -3,19 +3,11 @@ package invoker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/isaquesb/go-event-bus"
-	"log/slog"
 	"sync"
 	"time"
 )
-
-/**
-Expose:
-circuit_state{handler=}
-circuit_open_total
-circuit_half_open_total
-circuit_blocked_total
-*/
 
 type circuitState int
 
@@ -118,16 +110,23 @@ type CircuitBreakerConfig struct {
 	FailureThreshold int
 	SuccessThreshold int
 	OpenTimeout      time.Duration
+
+	// OnStateChange, when set, is called for every state transition of every
+	// handler breaker. It runs after the breaker lock is released, on the
+	// goroutine of the message that caused the transition, with that message's
+	// context, and after the Observer carried by the context received the same
+	// event.BreakerTransition. It must not block: dispatch elsewhere when the
+	// work is slow. It may call State and Invoke on the same breaker. Calls from
+	// different goroutines may overlap; Seq, which increases by one per
+	// transition of a handler breaker, gives the order. A panic in the callback
+	// is recovered and reported as an InternalError signal; it never fails the
+	// message.
+	OnStateChange func(ctx context.Context, t event.BreakerTransition)
 }
 
-func NewCircuitBreaker(cfg CircuitBreakerConfig, metrics MetricProvider) *CircuitBreaker {
-	if metrics == nil {
-		metrics = &NoopProvider{}
-	}
-
+func NewCircuitBreaker(cfg CircuitBreakerConfig) *CircuitBreaker {
 	return &CircuitBreaker{
 		cfg:      cfg,
-		metrics:  metrics,
 		breakers: make(map[string]*handlerBreaker),
 	}
 }
@@ -152,8 +151,7 @@ func NewCircuitBreaker(cfg CircuitBreakerConfig, metrics MetricProvider) *Circui
 // probe still running after that is superseded by the next arrival and its
 // late completion is ignored. A zero OpenTimeout never expires the lease.
 type CircuitBreaker struct {
-	cfg     CircuitBreakerConfig
-	metrics MetricProvider
+	cfg CircuitBreakerConfig
 
 	mu       sync.Mutex
 	breakers map[string]*handlerBreaker
@@ -167,14 +165,9 @@ func (c *CircuitBreaker) Invoke(
 ) error {
 	b := c.breaker(handler)
 
-	tok, tr, ok := c.admit(b)
-	c.emitTransition(ctx, handler, tr)
+	tok, tr, state, ok := c.admit(b)
+	c.report(ctx, handler, tr, state)
 	if !ok {
-		c.metrics.IncCounter(
-			"eventbus_circuit_blocked_total",
-			1,
-			Labels{"handler": handler},
-		)
 		return ErrCircuitOpen
 	}
 
@@ -183,20 +176,23 @@ func (c *CircuitBreaker) Invoke(
 	done := false
 	defer func() {
 		if !done {
-			c.emitTransition(ctx, handler, c.record(b, tok, outcomeNeutral))
+			tr, state := c.record(b, tok, outcomeNeutral)
+			c.report(ctx, handler, tr, state)
 		}
 	}()
 
 	err := next(ctx)
 	done = true
 
-	c.emitTransition(ctx, handler, c.record(b, tok, c.classify(ctx, err)))
+	tr, state = c.record(b, tok, c.classify(ctx, err))
+	c.report(ctx, handler, tr, state)
 	return err
 }
 
 // admit decides under the breaker lock whether a call may run. The lock is
-// never held while next runs.
-func (c *CircuitBreaker) admit(b *handlerBreaker) (token, *transition, bool) {
+// never held while next runs. It also returns the breaker state after the
+// decision, captured under the lock.
+func (c *CircuitBreaker) admit(b *handlerBreaker) (token, *transition, circuitState, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -204,13 +200,13 @@ func (c *CircuitBreaker) admit(b *handlerBreaker) (token, *transition, bool) {
 	switch b.state {
 	case stateOpen:
 		if now.Sub(b.openedAt) < c.cfg.OpenTimeout {
-			return token{}, nil, false
+			return token{}, nil, b.state, false
 		}
 		b.successes = 0
 		tr := b.move(stateHalfOpen, reasonOpenTimeoutElapsed, now)
 		b.probing = true
 		b.probeAt = now
-		return token{gen: b.gen, probe: true}, tr, true
+		return token{gen: b.gen, probe: true}, tr, b.state, true
 
 	case stateHalfOpen:
 		if b.probing {
@@ -219,27 +215,28 @@ func (c *CircuitBreaker) admit(b *handlerBreaker) (token, *transition, bool) {
 			if c.cfg.OpenTimeout > 0 && now.Sub(b.probeAt) >= c.cfg.OpenTimeout {
 				b.gen++
 				b.probeAt = now
-				return token{gen: b.gen, probe: true}, nil, true
+				return token{gen: b.gen, probe: true}, nil, b.state, true
 			}
-			return token{}, nil, false
+			return token{}, nil, b.state, false
 		}
 		b.probing = true
 		b.probeAt = now
-		return token{gen: b.gen, probe: true}, nil, true
+		return token{gen: b.gen, probe: true}, nil, b.state, true
 	}
 
-	return token{gen: b.gen}, nil, true
+	return token{gen: b.gen}, nil, b.state, true
 }
 
 // record applies the outcome of a finished call under the breaker lock. A
 // completion from an older generation is ignored and never touches the probe
-// slot.
-func (c *CircuitBreaker) record(b *handlerBreaker, tok token, out outcome) *transition {
+// slot. It also returns the breaker state after the call, captured under the
+// lock.
+func (c *CircuitBreaker) record(b *handlerBreaker, tok token, out outcome) (*transition, circuitState) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if tok.gen != b.gen {
-		return nil
+		return nil, b.state
 	}
 
 	now := time.Now()
@@ -250,7 +247,7 @@ func (c *CircuitBreaker) record(b *handlerBreaker, tok token, out outcome) *tran
 			b.failures++
 			if b.failures >= c.cfg.FailureThreshold {
 				b.openedAt = now
-				return b.move(stateOpen, reasonFailureThreshold, now)
+				return b.move(stateOpen, reasonFailureThreshold, now), b.state
 			}
 		case outcomeSuccess:
 			b.failures = 0
@@ -258,24 +255,24 @@ func (c *CircuitBreaker) record(b *handlerBreaker, tok token, out outcome) *tran
 
 	case stateHalfOpen:
 		if !tok.probe {
-			return nil
+			return nil, b.state
 		}
 		b.probing = false
 		switch out {
 		case outcomeFailure:
 			b.openedAt = now
-			return b.move(stateOpen, reasonProbeFailed, now)
+			return b.move(stateOpen, reasonProbeFailed, now), b.state
 		case outcomeSuccess:
 			b.successes++
 			if b.successes >= c.cfg.SuccessThreshold {
 				b.failures = 0
 				b.successes = 0
-				return b.move(stateClosed, reasonProbeSucceeded, now)
+				return b.move(stateClosed, reasonProbeSucceeded, now), b.state
 			}
 		}
 	}
 
-	return nil
+	return nil, b.state
 }
 
 // classify decides how the result of next counts toward the breaker (D-12).
@@ -326,45 +323,82 @@ func (c *CircuitBreaker) classify(ctx context.Context, err error) outcome {
 	return outcomeFailure
 }
 
+// State returns the current state of the breaker for handler: closed for a
+// handler that never ran. It never creates a breaker and is safe to call from
+// OnStateChange.
+func (c *CircuitBreaker) State(handler string) event.BreakerState {
+	c.mu.Lock()
+	b, ok := c.breakers[handler]
+	c.mu.Unlock()
+	if !ok {
+		return event.BreakerClosed
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return breakerState(b.state)
+}
+
+func breakerState(s circuitState) event.BreakerState {
+	return event.BreakerState(s.String())
+}
+
+// report publishes what a call learned about the breaker once the lock is
+// released: the state into the FailureScope, then the transition, if any, to
+// the Observer and OnStateChange.
+func (c *CircuitBreaker) report(ctx context.Context, handler string, tr *transition, state circuitState) {
+	if scope, ok := event.FailureScopeFromContext(ctx); ok {
+		scope.SetBreaker(breakerState(state))
+	}
+	c.emitTransition(ctx, handler, tr)
+}
+
 // emitTransition reports a state change after the lock was released. It does
-// nothing for nil.
+// nothing for nil. A panic in the Observer or in OnStateChange is recovered
+// and reported as an InternalError; it never fails the message.
 func (c *CircuitBreaker) emitTransition(ctx context.Context, handler string, tr *transition) {
 	if tr == nil {
 		return
 	}
 
-	switch tr.to {
-	case stateHalfOpen:
-		c.metrics.IncCounter(
-			"eventbus_circuit_half_open_total",
-			1,
-			Labels{"handler": handler},
-		)
-	case stateOpen:
-		c.metrics.IncCounter(
-			"eventbus_circuit_open_total",
-			1,
-			Labels{"handler": handler},
-		)
+	t := event.BreakerTransition{
+		Handler:  handler,
+		From:     breakerState(tr.from),
+		To:       breakerState(tr.to),
+		Reason:   event.BreakerReason(tr.reason),
+		Failures: tr.failures,
+		At:       tr.at,
+		Seq:      tr.seq,
 	}
-	c.emitState(handler, tr.to)
 
-	slog.DebugContext(ctx, "eventbus: circuit breaker transition",
-		"handler", handler,
-		"from", tr.from.String(),
-		"to", tr.to.String(),
-		"reason", tr.reason,
-		"failures", tr.failures,
-		"seq", tr.seq,
-	)
+	c.guarded(ctx, handler, func() {
+		event.ObserverFromContext(ctx).BreakerTransition(ctx, t)
+	})
+	if c.cfg.OnStateChange != nil {
+		c.guarded(ctx, handler, func() {
+			c.cfg.OnStateChange(ctx, t)
+		})
+	}
 }
 
-func (c *CircuitBreaker) emitState(handler string, state circuitState) {
-	c.metrics.SetGauge(
-		"eventbus_circuit_state",
-		float64(state),
-		Labels{"handler": handler},
-	)
+// guarded runs fn and turns a panic into an InternalError signal.
+func (c *CircuitBreaker) guarded(ctx context.Context, handler string, fn func()) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		// The observer reporting the panic may panic as well; nothing may
+		// escape into the message path.
+		defer func() { _ = recover() }()
+		event.ObserverFromContext(ctx).InternalError(ctx, event.InternalErrorInfo{
+			Component: event.ComponentCircuitBreaker,
+			Op:        event.OpPanic,
+			Handler:   handler,
+			Err:       fmt.Errorf("circuit breaker callback panicked: %v", r),
+		})
+	}()
+	fn()
 }
 
 func (c *CircuitBreaker) breaker(handler string) *handlerBreaker {
@@ -377,8 +411,6 @@ func (c *CircuitBreaker) breaker(handler string) *handlerBreaker {
 
 	b := &handlerBreaker{state: stateClosed}
 	c.breakers[handler] = b
-
-	c.emitState(handler, stateClosed)
 
 	return b
 }

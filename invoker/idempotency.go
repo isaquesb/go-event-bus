@@ -55,28 +55,20 @@ type IdempotencyConfig struct {
 func NewIdempotency(
 	store IdempotencyStore,
 	cfg IdempotencyConfig,
-	metrics MetricProvider,
 ) *Idempotency {
-
 	if cfg.ProcessingTTL == 0 {
 		cfg.ProcessingTTL = 5 * time.Minute
 	}
 
-	if metrics == nil {
-		metrics = &NoopProvider{}
-	}
-
 	return &Idempotency{
-		store:   store,
-		cfg:     cfg,
-		metrics: metrics,
+		store: store,
+		cfg:   cfg,
 	}
 }
 
 type Idempotency struct {
-	store   IdempotencyStore
-	cfg     IdempotencyConfig
-	metrics MetricProvider
+	store IdempotencyStore
+	cfg   IdempotencyConfig
 }
 
 func (i *Idempotency) Invoke(
@@ -96,41 +88,21 @@ func (i *Idempotency) Invoke(
 
 	rec, exists, err := i.store.Get(ctx, key)
 	if err != nil {
-		i.metrics.IncCounter(
-			"eventbus_idempotency_error_total",
-			1,
-			Labels{"handler": handlerName, "stage": "get"},
-		)
 		return err
 	}
 
 	if exists {
 		switch rec.Status {
 		case StatusCompleted:
-			i.metrics.IncCounter(
-				"eventbus_idempotency_duplicate_total",
-				1,
-				Labels{"handler": handlerName, "reason": "completed"},
-			)
 			return ErrDuplicate
 
 		case StatusProcessing:
 			if time.Since(rec.StartedAt) < i.cfg.ProcessingTTL {
 				// Not a duplicate: another instance may have crashed mid-run.
 				// ErrInProgress is retried later, never Acked as done.
-				i.metrics.IncCounter(
-					"eventbus_idempotency_in_progress_total",
-					1,
-					Labels{"handler": handlerName},
-				)
 				return event.ErrInProgress
 			}
 
-			i.metrics.IncCounter(
-				"eventbus_idempotency_processing_stale_total",
-				1,
-				Labels{"handler": handlerName},
-			)
 			// stale lock → continuar
 
 		case StatusDeadLettered, StatusFailed:
@@ -143,53 +115,29 @@ func (i *Idempotency) Invoke(
 		Status:    StatusProcessing,
 		StartedAt: time.Now(),
 	}); err != nil {
-		i.metrics.IncCounter(
-			"eventbus_idempotency_error_total",
-			1,
-			Labels{"handler": handlerName, "stage": "put_processing"},
-		)
 		return err
 	}
-
-	i.metrics.IncCounter(
-		"eventbus_idempotency_lock_acquired_total",
-		1,
-		Labels{"handler": handlerName},
-	)
-
-	i.metrics.IncCounter(
-		"eventbus_idempotency_executed_total",
-		1,
-		Labels{"handler": handlerName},
-	)
 
 	err = handle(ctx)
 
 	now := time.Now()
 	status := StatusCompleted
-	stage := "put_completed"
 
 	switch {
 	case err == nil:
 	case errors.Is(err, event.ErrDeadLettered):
 		status = StatusDeadLettered
-		stage = "put_dead_lettered"
 	default:
 		status = StatusFailed
-		stage = "put_failed"
 	}
 
-	if putErr := i.store.Put(ctx, key, IdempotencyRecord{
+	// A failing final Put does not change the handler result; it only leaves
+	// the processing record to expire. Its StoreError signal arrives in 10-08.
+	_ = i.store.Put(ctx, key, IdempotencyRecord{
 		Status:    status,
 		StartedAt: rec.StartedAt,
 		EndedAt:   &now,
-	}); putErr != nil {
-		i.metrics.IncCounter(
-			"eventbus_idempotency_error_total",
-			1,
-			Labels{"handler": handlerName, "stage": stage},
-		)
-	}
+	})
 
 	return err
 }

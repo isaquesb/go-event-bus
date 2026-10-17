@@ -11,37 +11,39 @@ Example usage, in the documented order:
 	chain := invoker.NewChain(
 		// Observability
 		telemetry.NewTracerInvoker(tracer),
-		invoker.NewMetrics(metrics),
 
 		// Execution control
-		invoker.NewRateLimiter(limitConfig),
-		invoker.NewIdempotency(store, cfg, metrics),
+		invoker.NewRateLimiter(limitStore, limitConfig),
+		invoker.NewIdempotency(store, cfg),
 
 		// Failure handling: DLQ outside Retry
-		invoker.NewDLQ(dlqPublisher, metrics),
+		invoker.NewDLQ(dlqPublisher),
 
 		// Resilience
 		invoker.NewRetry(invoker.RetryPolicy{
 			MaxAttempts: 5,
 			BaseDelay:   100 * time.Millisecond,
 			MaxDelay:    5 * time.Second,
-		}, metrics),
+		}),
 
 		invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
 			FailureThreshold: 5,
 			SuccessThreshold: 2,
 			OpenTimeout:      30 * time.Second,
-		}, metrics),
+		}),
 	)
 
 	Tracer
-	 └─ Metrics
-	     └─ RateLimiter (may abort early)
-	         └─ Idempotency (may skip execution)
-	             └─ DLQ (dead-letters the final outcome)
-	                 └─ Retry (re-runs the handler)
-	                     └─ CircuitBreaker (is the system healthy?)
-	                         └─ Handler
+	 └─ RateLimiter (may abort early)
+	     └─ Idempotency (may skip execution)
+	         └─ DLQ (dead-letters the final outcome)
+	             └─ Retry (re-runs the handler)
+	                 └─ CircuitBreaker (is the system healthy?)
+	                     └─ Handler
+
+The Observer configured on the bus (BusOptions.Observer) receives every signal
+the invokers and the transport emit; there is no metrics invoker in the chain.
+Latency and outcome come from the HandlerDone signal.
 
 DLQ sits outside Retry so retries run first and only the final outcome is
 dead-lettered. Put inside Retry, it would dead-letter a recoverable transient

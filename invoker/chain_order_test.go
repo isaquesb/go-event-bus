@@ -14,17 +14,17 @@ import (
 // Retry outside CircuitBreaker.
 func coChain(pub invoker.DLQPublisher) *invoker.Chain {
 	return invoker.NewChain(
-		invoker.NewDLQ(pub, nil),
+		invoker.NewDLQ(pub),
 		invoker.NewRetry(invoker.RetryPolicy{
 			MaxAttempts: 3,
 			BaseDelay:   time.Millisecond,
 			MaxDelay:    2 * time.Millisecond,
-		}, nil),
+		}),
 		invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
 			FailureThreshold: 100,
 			SuccessThreshold: 1,
 			OpenTimeout:      time.Minute,
-		}, nil),
+		}),
 	)
 }
 
@@ -138,13 +138,13 @@ func TestChainOrder_LegacyOrderDeadLettersPrematurely(t *testing.T) {
 			MaxAttempts: 3,
 			BaseDelay:   time.Millisecond,
 			MaxDelay:    2 * time.Millisecond,
-		}, nil),
+		}),
 		invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
 			FailureThreshold: 100,
 			SuccessThreshold: 1,
 			OpenTimeout:      time.Minute,
-		}, nil),
-		invoker.NewDLQ(pub, nil),
+		}),
+		invoker.NewDLQ(pub),
 	)
 
 	err := legacy.Invoke(dqDelivery(1, 1), &testEvent{name: "test.event"}, "handler",
@@ -172,8 +172,8 @@ func (s coStub) Invoke(context.Context, event.Event, string, func(context.Contex
 func TestChainOrder_FlowControlDeadLetteredOnlyOnFinal(t *testing.T) {
 	pub := &dqPublisher{}
 	chain := invoker.NewChain(
-		invoker.NewDLQ(pub, nil),
-		invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}, nil),
+		invoker.NewDLQ(pub),
+		invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}),
 		coStub{err: event.ErrCircuitOpen},
 	)
 	evt := &testEvent{name: "test.event"}
@@ -210,9 +210,9 @@ func TestChainOrder_InProgressBypassesChainDLQ(t *testing.T) {
 		StartedAt: time.Now(),
 	})
 	chain := invoker.NewChain(
-		invoker.NewIdempotency(store, invoker.IdempotencyConfig{ProcessingTTL: time.Hour}, nil),
-		invoker.NewDLQ(pub, nil),
-		invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}, nil),
+		invoker.NewIdempotency(store, invoker.IdempotencyConfig{ProcessingTTL: time.Hour}),
+		invoker.NewDLQ(pub),
+		invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}),
 	)
 
 	called := false
@@ -236,9 +236,9 @@ func TestChainOrder_DeadLetteredThenReplayExecutes(t *testing.T) {
 	pub := &dqPublisher{}
 	store := invoker.NewMemoryIdempotencyStore()
 	chain := invoker.NewChain(
-		invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil),
-		invoker.NewDLQ(pub, nil),
-		invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}, nil),
+		invoker.NewIdempotency(store, invoker.IdempotencyConfig{}),
+		invoker.NewDLQ(pub),
+		invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}),
 	)
 	evt := &eventWithId{id: "evt-1", name: "test"}
 

@@ -34,7 +34,7 @@ func TestCircuitBreaker_HalfOpenOneProbe(t *testing.T) {
 		FailureThreshold: 1,
 		SuccessThreshold: 1,
 		OpenTimeout:      openTimeout,
-	}, nil)
+	})
 
 	if err := cbpInvoke(cb, cbpBoom); !errors.Is(err, cbpFail) {
 		t.Fatalf("opening call: got %v", err)
@@ -105,7 +105,7 @@ func TestCircuitBreaker_StaleGenerationIgnored(t *testing.T) {
 			FailureThreshold: 1,
 			SuccessThreshold: 1,
 			OpenTimeout:      time.Second,
-		}, nil)
+		})
 
 		started := make(chan struct{})
 		release := make(chan struct{})
@@ -232,7 +232,7 @@ func TestCircuitBreaker_ClassificationClosed(t *testing.T) {
 					FailureThreshold: 1,
 					SuccessThreshold: 1,
 					OpenTimeout:      time.Second,
-				}, nil)
+				})
 
 				cbpRun(cb, row)
 
@@ -259,7 +259,7 @@ func TestCircuitBreaker_ClassificationHalfOpen(t *testing.T) {
 					FailureThreshold: 1,
 					SuccessThreshold: 1,
 					OpenTimeout:      time.Second,
-				}, nil)
+				})
 
 				_ = cbpInvoke(cb, cbpBoom)
 				time.Sleep(2 * time.Second)
@@ -305,7 +305,7 @@ func TestCircuitBreaker_SequentialProbesUntilSuccessThreshold(t *testing.T) {
 			FailureThreshold: 1,
 			SuccessThreshold: 3,
 			OpenTimeout:      time.Second,
-		}, nil)
+		})
 
 		_ = cbpInvoke(cb, cbpBoom)
 		time.Sleep(2 * time.Second)
@@ -337,7 +337,7 @@ func TestCircuitBreaker_ProbeLeaseSupersedes(t *testing.T) {
 			FailureThreshold: 1,
 			SuccessThreshold: 1,
 			OpenTimeout:      time.Second,
-		}, nil)
+		})
 
 		_ = cbpInvoke(cb, cbpBoom)
 		time.Sleep(2 * time.Second)
@@ -372,7 +372,7 @@ func TestCircuitBreaker_ZeroOpenTimeoutNeverSupersedes(t *testing.T) {
 			FailureThreshold: 1,
 			SuccessThreshold: 1,
 			OpenTimeout:      0,
-		}, nil)
+		})
 
 		_ = cbpInvoke(cb, cbpBoom)
 
@@ -399,7 +399,7 @@ func TestCircuitBreaker_PanicInNextReleasesProbe(t *testing.T) {
 			FailureThreshold: 1,
 			SuccessThreshold: 1,
 			OpenTimeout:      time.Second,
-		}, nil)
+		})
 
 		_ = cbpInvoke(cb, cbpBoom)
 		time.Sleep(2 * time.Second)
