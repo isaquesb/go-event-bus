@@ -3,6 +3,7 @@ package event
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"strings"
 	"time"
 )
@@ -41,11 +42,68 @@ func EncodeHistoryHeader(history []Attempt, capBytes int) (string, bool) {
 	if len(history) == 0 {
 		return "", false
 	}
+	if capBytes < 2 {
+		capBytes = 2
+	}
 	parts := make([][]byte, len(history))
 	for i, a := range history {
-		parts[i] = marshalHistoryEntry(a, a.Err)
+		parts[i] = marshalHistoryEntry(a, sanitizeHistoryErr(a.Err))
 	}
-	return "[" + string(bytes.Join(parts, []byte(","))) + "]", false
+	// Walk from the newest entry back while the array still fits.
+	total := 2
+	first := len(parts)
+	for i := len(parts) - 1; i >= 0; i-- {
+		need := len(parts[i])
+		if first != len(parts) {
+			need++ // separating comma
+		}
+		if total+need > capBytes {
+			break
+		}
+		total += need
+		first = i
+	}
+	if first == len(parts) {
+		// Not even the newest attempt fits: shorten its err text, and as a
+		// last resort send an empty array.
+		newest := history[len(history)-1]
+		if e, ok := shrinkHistoryEntry(newest, capBytes-2); ok {
+			return "[" + string(e) + "]", true
+		}
+		return "[]", true
+	}
+	return "[" + string(bytes.Join(parts[first:], []byte(","))) + "]", first > 0
+}
+
+// sanitizeHistoryErr makes err text safe for a header: invalid UTF-8 and
+// control characters are replaced like TruncateHeader does, without a length
+// cut.
+func sanitizeHistoryErr(s string) string {
+	return TruncateHeader(s, math.MaxInt)
+}
+
+// shrinkHistoryEntry encodes a with the longest err that keeps the entry within
+// budget bytes. It reports false when even an empty err does not fit.
+func shrinkHistoryEntry(a Attempt, budget int) ([]byte, bool) {
+	empty := marshalHistoryEntry(a, "")
+	if len(empty) > budget {
+		return nil, false
+	}
+	errText := sanitizeHistoryErr(a.Err)
+	room := budget - len(empty)
+	if room > len(errText) {
+		room = len(errText)
+	}
+	for room > 0 {
+		e := marshalHistoryEntry(a, TruncateHeader(errText, room))
+		if len(e) <= budget {
+			return e, true
+		}
+		// JSON escaping made the text longer than its byte count; cut by the
+		// overshoot (at least one byte) and retry.
+		room -= len(e) - budget
+	}
+	return empty, true
 }
 
 // marshalHistoryEntry encodes one attempt with errText as its err field, using
