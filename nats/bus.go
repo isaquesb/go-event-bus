@@ -72,6 +72,12 @@ func NewNatsBus(
 	reg event.Registry,
 	opts BusOptions,
 ) *Bus {
+	return newBus(nc, reg, opts)
+}
+
+// newBus resolves the options and builds the Bus over the natsConn seam, so the
+// defaulting NewNatsBus applies is testable without a real connection.
+func newBus(nc natsConn, reg event.Registry, opts BusOptions) *Bus {
 	if opts.RequestTimeout <= 0 {
 		opts.RequestTimeout = 5 * time.Second
 	}

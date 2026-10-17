@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/isaquesb/go-event-bus"
+	natsgo "github.com/nats-io/nats.go"
 )
 
 // noRecorder is the recording Observer of the NATS tests: it embeds
@@ -173,5 +176,331 @@ func TestNatsSubscribe_FailureReachesObserverOnce(t *testing.T) {
 	}
 	if n := dlq.Len(); n != 1 {
 		t.Errorf("DLQ records = %d, want 1", n)
+	}
+}
+
+// --- exactly-once matrix ---
+
+// noWant is what one matrix row expects from the recorder.
+type noWant struct {
+	fails      int
+	outcome    event.Outcome // of the Failure, when fails > 0
+	reason     string        // of the Failure, when non-empty
+	hasEvent   bool          // the Failure carries the decoded event
+	handler    string        // of the Failure, when fails > 0
+	dones      int
+	doneResult event.Outcome // of the HandlerDone, when dones > 0
+	decodes    int
+	dlqFails   int
+	replyCode  string // Eventbus-Error reason of the sync reply, "" for none
+}
+
+type noRow struct {
+	name    string
+	reg     func() event.Registry
+	dlq     event.DLQPublisher
+	inv     event.Invoker
+	handler event.HandleFn
+	want    noWant
+}
+
+func noOK(context.Context, event.Event) error { return nil }
+
+func noPanic(context.Context, event.Event) error { panic("no: handler boom") }
+
+func noTerminalHandler(context.Context, event.Event) error { return &noTerminal{msg: "no: terminal"} }
+
+func noMatrixRows() []noRow {
+	return []noRow{
+		{
+			name: "success", handler: noOK,
+			want: noWant{dones: 1, doneResult: event.OutcomeOK},
+		},
+		{
+			name: "duplicate", handler: noOK, dlq: event.NewMemoryDLQ(), inv: fsInvoker{err: event.ErrDuplicate},
+			want: noWant{dones: 1, doneResult: event.OutcomeDuplicate, replyCode: event.ReasonDuplicate},
+		},
+		{
+			name: "dead lettered", handler: noTerminalHandler, dlq: event.NewMemoryDLQ(),
+			want: noWant{
+				fails: 1, outcome: event.OutcomeDeadLettered, reason: event.ReasonTerminal, hasEvent: true, handler: "h",
+				dones: 1, doneResult: event.OutcomeDeadLettered, replyCode: event.ReasonTerminal,
+			},
+		},
+		{
+			name: "dropped without publisher", handler: noTerminalHandler,
+			want: noWant{
+				fails: 1, outcome: event.OutcomeDropped, reason: event.ReasonTerminal, hasEvent: true, handler: "h",
+				dones: 1, doneResult: event.OutcomeDropped, replyCode: event.ReasonTerminal,
+			},
+		},
+		{
+			name: "dlq publish failed", handler: noTerminalHandler, dlq: &fsFailingPublisher{},
+			want: noWant{
+				fails: 1, outcome: event.OutcomeDLQPublishFailed, hasEvent: true, handler: "h",
+				dones: 1, doneResult: event.OutcomeFailed, dlqFails: 1, replyCode: event.ReasonTerminal,
+			},
+		},
+		{
+			name: "panic", handler: noPanic, dlq: event.NewMemoryDLQ(),
+			want: noWant{
+				fails: 1, outcome: event.OutcomeDeadLettered, reason: event.ReasonPanic, hasEvent: true, handler: "h",
+				dones: 1, doneResult: event.OutcomeDeadLettered, replyCode: event.ReasonPanic,
+			},
+		},
+		{
+			name: "decode failed", handler: noOK, dlq: event.NewMemoryDLQ(),
+			reg: func() event.Registry { return fsDecodeFailRegistry{} },
+			want: noWant{
+				fails: 1, outcome: event.OutcomeDecodeFailed, reason: event.ReasonDecodeUnknownEvent, handler: "h",
+				decodes: 1, replyCode: event.ReasonDecodeUnknownEvent,
+			},
+		},
+	}
+}
+
+// noRun delivers one message for row through Subscribe (sync false) or
+// SubscribeSync (sync true) and returns the recorder, the error of EmitSync and
+// the Eventbus-Error code of the reply.
+func noRun(t *testing.T, row noRow, sync bool) (*noRecorder, string) {
+	t.Helper()
+	conn := newFsLoopConn()
+	var reg event.Registry = newMdRegistry("no.order")
+	if row.reg != nil {
+		reg = row.reg()
+	}
+	rec := &noRecorder{}
+	bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: row.dlq, invoker: row.inv, observer: rec}
+
+	if sync {
+		if err := bus.SubscribeSync(context.Background(), "no.order", row.handler, event.WithHandlerName("h")); err != nil {
+			t.Fatalf("SubscribeSync: %v", err)
+		}
+		_, _ = bus.EmitSync(context.Background(), &mdEvent{name: "no.order", EventID: "no-1"})
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		if len(conn.replies) == 0 {
+			return rec, ""
+		}
+		return rec, conn.replies[len(conn.replies)-1].Header.Get(HeaderError)
+	}
+
+	if err := bus.Subscribe(context.Background(), "no.order", row.handler, event.WithHandlerName("h")); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	data := []byte("garbage-bytes")
+	if m, ok := reg.(*mdRegistry); ok {
+		data = fsRequestBytes(t, m, "no.order")
+	}
+	conn.deliver(t, "no.order", data)
+	return rec, ""
+}
+
+func TestNatsObserver_FailureMatrix(t *testing.T) {
+	for _, row := range noMatrixRows() {
+		for _, mode := range []struct {
+			name string
+			sync bool
+		}{{"Subscribe", false}, {"SubscribeSync", true}} {
+			t.Run(row.name+"/"+mode.name, func(t *testing.T) {
+				rec, code := noRun(t, row, mode.sync)
+				w := row.want
+
+				fails := rec.failures()
+				if len(fails) != w.fails {
+					t.Fatalf("Failure calls = %d, want %d (%+v)", len(fails), w.fails, fails)
+				}
+				if w.fails == 1 {
+					f := fails[0]
+					if f.Outcome != w.outcome {
+						t.Errorf("Failure outcome = %q, want %q", f.Outcome, w.outcome)
+					}
+					if w.reason != "" && f.Reason != w.reason {
+						t.Errorf("Failure reason = %q, want %q", f.Reason, w.reason)
+					}
+					if (f.Event != nil) != w.hasEvent {
+						t.Errorf("Failure event = %v, want non-nil %v", f.Event, w.hasEvent)
+					}
+					if f.Handler != w.handler {
+						t.Errorf("Failure handler = %q, want %q", f.Handler, w.handler)
+					}
+					if f.Cause == nil {
+						t.Error("Failure cause = nil")
+					}
+					if f.Delivery.System != "nats" || f.Delivery.Raw != nil {
+						t.Errorf("Failure delivery system/raw = %q/%q, want nats/nil", f.Delivery.System, f.Delivery.Raw)
+					}
+				}
+
+				dones := rec.handlerDones()
+				if len(dones) != w.dones {
+					t.Fatalf("HandlerDone calls = %d, want %d (%+v)", len(dones), w.dones, dones)
+				}
+				if w.dones == 1 && dones[0].Outcome != w.doneResult {
+					t.Errorf("HandlerDone outcome = %q, want %q", dones[0].Outcome, w.doneResult)
+				}
+
+				decodes := rec.decodeFailures()
+				if len(decodes) != w.decodes {
+					t.Fatalf("DecodeFailed calls = %d, want %d", len(decodes), w.decodes)
+				}
+				if w.decodes == 1 && (!decodes[0].Final || decodes[0].Delivery.Raw != nil) {
+					t.Errorf("DecodeFailed final/raw = %v/%q, want true/nil", decodes[0].Final, decodes[0].Delivery.Raw)
+				}
+
+				dlqFails := rec.dlqPublishFailures()
+				if len(dlqFails) != w.dlqFails {
+					t.Fatalf("DLQPublishFailed calls = %d, want %d", len(dlqFails), w.dlqFails)
+				}
+				if w.dlqFails == 1 && !dlqFails[0].Final {
+					t.Error("DLQPublishFailed.Final = false, want true on NATS Core")
+				}
+
+				if mode.sync && code != w.replyCode {
+					t.Errorf("sync reply %s = %q, want %q", HeaderError, code, w.replyCode)
+				}
+			})
+		}
+	}
+}
+
+// TestNatsObserver_InterruptedDeliveryReportedOnce covers a message delivered
+// after the forced shutdown cancel: one interrupted Failure with a nil event,
+// no HandlerDone, on Subscribe and SubscribeSync.
+func TestNatsObserver_InterruptedDeliveryReportedOnce(t *testing.T) {
+	for _, sync := range []bool{false, true} {
+		name := "Subscribe"
+		if sync {
+			name = "SubscribeSync"
+		}
+		t.Run(name, func(t *testing.T) {
+			conn := newFsLoopConn()
+			reg := newMdRegistry("no.late")
+			rec := &noRecorder{}
+			dlq := event.NewMemoryDLQ()
+			bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, observer: rec}
+			handler := func(context.Context, event.Event) error {
+				t.Error("handler ran for a rejected delivery")
+				return nil
+			}
+			var err error
+			if sync {
+				err = bus.SubscribeSync(context.Background(), "no.late", handler, event.WithHandlerName("h"))
+			} else {
+				err = bus.Subscribe(context.Background(), "no.late", handler, event.WithHandlerName("h"))
+			}
+			if err != nil {
+				t.Fatalf("subscribe: %v", err)
+			}
+			bus.life.BeginShutdown()
+			bus.life.Interrupt()
+
+			conn.mu.Lock()
+			cb := conn.handlers["no.late"]
+			conn.mu.Unlock()
+			msg := &natsgo.Msg{Subject: "no.late", Data: fsRequestBytes(t, reg, "no.late")}
+			if sync {
+				msg.Reply = fsInbox
+			}
+			cb(msg)
+
+			fails := rec.failures()
+			if len(fails) != 1 {
+				t.Fatalf("Failure calls = %d, want 1", len(fails))
+			}
+			if fails[0].Outcome != event.OutcomeInterrupted || fails[0].Event != nil {
+				t.Errorf("Failure outcome/event = %q/%v, want interrupted/nil", fails[0].Outcome, fails[0].Event)
+			}
+			if !errors.Is(fails[0].Cause, event.ErrShutdownInterrupted) {
+				t.Errorf("Failure cause = %v, want ErrShutdownInterrupted", fails[0].Cause)
+			}
+			if n := len(rec.handlerDones()); n != 0 {
+				t.Errorf("HandlerDone calls = %d, want 0", n)
+			}
+			if n := dlq.Len(); n != 0 {
+				t.Errorf("DLQ records = %d, want 0 (an interruption is never dead-lettered)", n)
+			}
+			if sync {
+				if v := conn.lastReply(t).Header.Get(HeaderError); v != event.ReasonInterrupted {
+					t.Errorf("reply %s = %q, want %q", HeaderError, v, event.ReasonInterrupted)
+				}
+			}
+		})
+	}
+}
+
+// --- zero-configuration logging ---
+
+// noLogs is a slog.Handler capturing every record message.
+type noLogs struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (l *noLogs) Enabled(context.Context, slog.Level) bool { return true }
+
+func (l *noLogs) Handle(_ context.Context, r slog.Record) error {
+	l.mu.Lock()
+	l.msgs = append(l.msgs, r.Message)
+	l.mu.Unlock()
+	return nil
+}
+
+func (l *noLogs) WithAttrs([]slog.Attr) slog.Handler { return l }
+func (l *noLogs) WithGroup(string) slog.Handler      { return l }
+
+func (l *noLogs) count(msg string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, m := range l.msgs {
+		if strings.Contains(m, msg) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestNatsBus_DefaultObserverLogs builds the bus through the code NewNatsBus
+// uses with empty BusOptions: a dropped message is logged once by the default
+// SlogObserver.
+func TestNatsBus_DefaultObserverLogs(t *testing.T) {
+	logs := &noLogs{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(logs))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	conn := newFsLoopConn()
+	reg := newMdRegistry("no.order")
+	bus := newBus(conn, reg, BusOptions{})
+	if err := bus.Subscribe(context.Background(), "no.order", noTerminalHandler, event.WithHandlerName("h")); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	conn.deliver(t, "no.order", fsRequestBytes(t, reg, "no.order"))
+
+	if n := logs.count("eventbus: message failed"); n != 1 {
+		t.Errorf("failure log records = %d, want 1 (%v)", n, logs.msgs)
+	}
+}
+
+// TestNatsBus_NopObserverSilences confirms event.NopObserver{} silences the
+// default logging.
+func TestNatsBus_NopObserverSilences(t *testing.T) {
+	logs := &noLogs{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(logs))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	conn := newFsLoopConn()
+	reg := newMdRegistry("no.order")
+	bus := newBus(conn, reg, BusOptions{Observer: event.NopObserver{}})
+	if err := bus.Subscribe(context.Background(), "no.order", noTerminalHandler); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	conn.deliver(t, "no.order", fsRequestBytes(t, reg, "no.order"))
+
+	if n := logs.count("eventbus: message failed"); n != 0 {
+		t.Errorf("failure log records = %d, want 0 with NopObserver", n)
 	}
 }
