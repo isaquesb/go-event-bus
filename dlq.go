@@ -53,6 +53,10 @@ type DLQRecord struct {
 	Execution Execution
 	// FailedAt is when the record was built, in UTC.
 	FailedAt time.Time
+	// History is the bounded in-process retry history of this delivery, oldest
+	// first. It is empty when no Retry ran. FailureHeaders writes it as the
+	// Eventbus-Dlq-History header.
+	History []Attempt
 }
 
 // NewDLQRecord builds the DLQRecord for a message that failed with cause.
@@ -79,6 +83,10 @@ func NewDLQRecord(ctx context.Context, evt Event, handler string, cause error) D
 		Delivery:  d,
 		Execution: x,
 		FailedAt:  time.Now().UTC(),
+	}
+	var fe *FailureError
+	if errors.As(cause, &fe) && len(fe.History) > 0 {
+		rec.History = slices.Clone(fe.History)
 	}
 	if md, ok := MetadataFromContext(ctx); ok {
 		rec.EventID = md.ID
@@ -107,7 +115,48 @@ const (
 // them, because no redelivery will give it another chance; otherwise it is
 // tried once. It stops early when ctx ends. It returns nil on the first
 // success and the last publish error otherwise.
+//
+// It reports the outcome to the Observer in ctx exactly once per call, never
+// per internal attempt: DeadLettered on success, DLQPublishFailed once the
+// bounded retry is over. Both signals carry a redacted Delivery (Raw nil) and
+// never the payload; DeadLetterInfo.Size is the stored envelope length. This
+// is the only dead-letter emission point, shared by the chain DLQ invoker and
+// the transport backstop.
 func PublishDeadLetter(ctx context.Context, p DLQPublisher, rec DLQRecord) error {
+	err := publishDeadLetter(ctx, p, rec)
+	obs := ObserverFromContext(ctx)
+	if err != nil {
+		obs.DLQPublishFailed(ctx, DLQPublishFailure{
+			Handler:  rec.Handler,
+			Event:    rec.EventName,
+			Reason:   rec.Reason,
+			Subject:  rec.Subject,
+			Attempts: rec.Attempts,
+			Err:      err,
+			Delivery: redactDelivery(rec.Delivery),
+			Final:    rec.Delivery.Final(),
+		})
+		return err
+	}
+	at := rec.FailedAt
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	obs.DeadLettered(ctx, DeadLetterInfo{
+		Handler:  rec.Handler,
+		Event:    rec.EventName,
+		Reason:   rec.Reason,
+		Subject:  rec.Subject,
+		Attempts: rec.Attempts,
+		Delivery: redactDelivery(rec.Delivery),
+		Size:     len(rec.Raw),
+		At:       at,
+	})
+	return nil
+}
+
+// publishDeadLetter is the bounded publish loop behind PublishDeadLetter.
+func publishDeadLetter(ctx context.Context, p DLQPublisher, rec DLQRecord) error {
 	attempts := 1
 	if rec.Delivery.Final() {
 		attempts = publishAttemptsFinal
@@ -201,6 +250,12 @@ const (
 	HeaderDLQOriginalSequence = "Eventbus-Dlq-Original-Sequence"
 	HeaderDLQPublishedAt      = "Eventbus-Dlq-Published-At"
 	HeaderDLQPanicStack       = "Eventbus-Dlq-Panic-Stack"
+	// HeaderDLQHistory holds the retry history as compact JSON, see
+	// EncodeHistoryHeader.
+	HeaderDLQHistory = "Eventbus-Dlq-History"
+	// HeaderDLQHistoryTruncated is "true" when HeaderDLQHistory dropped
+	// attempts to fit HistoryHeaderLimit.
+	HeaderDLQHistoryTruncated = "Eventbus-Dlq-History-Truncated"
 )
 
 // DLQHeaderValueLimit is the maximum byte length of one DLQ failure header.
@@ -244,12 +299,16 @@ func runeBoundary(s string, n int) int {
 }
 
 // FailureHeaders returns the Eventbus-Dlq-* headers that describe the failure.
-// Every value goes through TruncateHeader at DLQHeaderValueLimit; the envelope
-// itself is never truncated. Headers whose value is unknown (empty text, zero
-// time, zero sequence) are omitted. Attempts is always present: 0 means the
-// handler never ran. HeaderDLQPanicStack is set only when the cause holds a
-// *PanicError, bounded like every other value. HeaderDLQOriginalMsgID is not
-// set here, a broker adapter adds it from the stripped broker message id.
+// Every value goes through TruncateHeader at DLQHeaderValueLimit, except
+// HeaderDLQHistory, which is bounded by HistoryHeaderLimit through
+// EncodeHistoryHeader; the envelope itself is never truncated. Headers whose
+// value is unknown (empty text, zero time, zero sequence) are omitted. Attempts
+// is always present: 0 means the handler never ran. HeaderDLQPanicStack is set
+// only when the cause holds a *PanicError, bounded like every other value.
+// HeaderDLQHistory is set only when the record has a History, and
+// HeaderDLQHistoryTruncated only when attempts were dropped to fit.
+// HeaderDLQOriginalMsgID is not set here, a broker adapter adds it from the
+// stripped broker message id.
 func (r DLQRecord) FailureHeaders() map[string]string {
 	h := make(map[string]string, 13)
 	set := func(key, value string) {
@@ -285,5 +344,24 @@ func (r DLQRecord) FailureHeaders() map[string]string {
 	if errors.As(r.Cause, &pe) && len(pe.Stack) > 0 {
 		set(HeaderDLQPanicStack, string(pe.Stack))
 	}
+	setHistoryHeaders(h, r)
 	return h
+}
+
+// setHistoryHeaders adds HeaderDLQHistory, and HeaderDLQHistoryTruncated when
+// attempts were dropped, to h. The history value is not passed through
+// TruncateHeader: EncodeHistoryHeader already bounds it at HistoryHeaderLimit
+// and keeps it valid JSON.
+func setHistoryHeaders(h map[string]string, rec DLQRecord) {
+	if len(rec.History) == 0 {
+		return
+	}
+	v, truncated := EncodeHistoryHeader(rec.History, HistoryHeaderLimit)
+	if v == "" {
+		return
+	}
+	h[HeaderDLQHistory] = v
+	if truncated {
+		h[HeaderDLQHistoryTruncated] = "true"
+	}
 }
