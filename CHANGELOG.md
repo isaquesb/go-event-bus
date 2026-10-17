@@ -5,6 +5,216 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-17
+
+v0.4.0 is a breaking release. It gives every event an identity and a causal lineage, defines what happens to a message that fails (one disposition shared by all transports, a dead-letter record you can replay), makes the bus safe to stop and to overload, and replaces the metrics plumbing with one `Observer`. **This section is the migration guide**: there is no separate migration page. Every signature break has a **Breaking:** entry with a before and an after snippet, and every behavior change has a short note.
+
+> **Read this first: tracing changes without a compile error.** A consumer now honors the producer's W3C sampled flag. v0.3.0 forced every consumed message to be sampled; v0.4.0 does not, and there is no option to bring the old behavior back. See the first entry under Changed.
+
+### Added
+
+#### Core (`github.com/isaquesb/go-event-bus`)
+
+*Observability*
+- `Observer`, the single interface through which invokers and transports report what happens, with ten signals: `RetryAttempt`, `BreakerTransition`, `Failure`, `DeadLettered`, `HandlerDone`, `DecodeFailed`, `DLQPublishFailed`, `StoreError`, `IdempotencyStale` and `InternalError`. Embed `NopObserver` to implement only the signals you need; combine observers with `MultiObserver`. `LocalBusOptions.Observer` configures it once per bus.
+- `SlogObserver`, `NewSlogObserver` and `WithLogEvery`: structured `log/slog` records with per-window deduplication. A bus with no `Observer` installs one, so failures are never silent.
+
+*Failure semantics and DLQ*
+- `DLQRecord`, `NewDLQRecord`, `PublishDeadLetter` and `MemoryDLQ` (an in-memory `DLQPublisher` for tests and examples); `LocalBusOptions.DLQPublisher`, the per-bus dead-letter backstop.
+- `Dispose`, `Settle` and `Disposition`: the one mapping from a handler error to Ack, Retry, RetryDelayed or Terminal, shared by every transport.
+
+*Context and metadata*
+- `Metadata`, `WithID`, `WithCorrelationID` and `WithHeader`: every event carries an id, a correlation id and a causation id, readable in the handler with `MetadataFromContext`.
+
+*Lifecycle*
+- `LocalBus.Shutdown(ctx)`, the `Shutdowner` interface, `ErrBusClosed`, `ErrQueueFull`, `OverflowPolicy` (`OverflowBlock`, `OverflowUnbounded`, `OverflowDrop`) and `LocalBusOptions.HandlerTimeout`.
+
+#### Invoker Chain (`github.com/isaquesb/go-event-bus/invoker`)
+- `CircuitBreakerConfig.OnStateChange` and `CircuitBreaker.State(handler)`
+- `RetryPolicy.HistorySize` (default `DefaultHistorySize`, 5) and `StatusDeadLettered` for idempotency records
+
+### Changed
+
+#### JSON Serialization (`github.com/isaquesb/go-event-bus/json`)
+- **Breaking:** the consumer honors the producer's sampled flag. v0.3.0 rebuilt the remote span context from the envelope's `trace_id` and `span_id` with the sampled flag always set, so every consumed message was traced whatever the producer decided. v0.4.0 extracts `traceparent`, `tracestate` and `baggage` from the envelope headers, so the consumer span gets the sampling decision of the producer: with a `ParentBased` sampler an unsampled producer gives an unsampled consumer span, and the volume of consumer traces falls to the producer's sampling rate. There is no opt-out. An envelope that carries only the legacy `trace_id` and `span_id` (no `traceparent`) is still read as sampled and remote, so a rolling deploy loses no trace. To keep tracing every message, sample on the consumer side with a sampler that does not follow the remote parent, such as `sdktrace.AlwaysSample()`.
+
+#### Core (`github.com/isaquesb/go-event-bus`)
+- **Breaking:** `DLQPublisher.Publish` takes one `event.DLQRecord` instead of an event and a cause. The record carries the original envelope bytes (`Raw`, empty on `LocalBus`, where `Evt` is set), the decoded `Evt` (nil on a decode failure), the `Cause`, a stable `Reason`, `Handler`, `Subject`, `Attempts`, the `History` of attempts, and the `Delivery` and `Execution`. `invoker.DLQPublisher` stays as an alias of `event.DLQPublisher`.
+
+  ```go
+  // v0.3.0
+  type auditDLQ struct{ log *slog.Logger }
+
+  func (d auditDLQ) Publish(ctx context.Context, evt event.Event, cause error) error {
+  	d.log.Error("dead letter", "event", evt.Name(), "cause", cause)
+  	return nil
+  }
+  ```
+
+  ```go
+  // v0.4.0
+  type auditDLQ struct{ log *slog.Logger }
+
+  func (d auditDLQ) Publish(ctx context.Context, rec event.DLQRecord) error {
+  	d.log.Error("dead letter", "event", rec.EventName, "handler", rec.Handler,
+  		"reason", rec.Reason, "attempts", rec.Attempts, "cause", rec.Cause)
+  	return nil
+  }
+  ```
+- **Breaking:** `LocalBusOptions.OnErr` is replaced by `LocalBusOptions.Observer`. The bus-level hook is now `Observer.Failure`, called once per terminal outcome of a message (dead-lettered, dropped, interrupted, decode failure, retries exhausted with no DLQ) with a `FailureContext`: handler, outcome, reason, attempts, the retry history, delivery count, failing invoker, circuit breaker state, and the event `Metadata`. On a decode failure `FailureContext.Event` is nil, as `evt` was in `OnErr`. The event's own `OnErr` method (`event.OnErr`) stays and still runs, after `Observer.Failure`.
+
+  ```go
+  // v0.3.0
+  bus := event.NewLocalBus(event.LocalBusOptions{
+  	OnErr: func(ctx context.Context, evt event.Event, err error, handler string) {
+  		slog.Error("handler failed", "event", evt.Name(), "handler", handler, "err", err)
+  	},
+  })
+  ```
+
+  ```go
+  // v0.4.0
+  type failureLogger struct{ event.NopObserver }
+
+  func (failureLogger) Failure(ctx context.Context, f event.FailureContext) {
+  	slog.ErrorContext(ctx, "handler failed", "handler", f.Handler,
+  		"outcome", f.Outcome, "reason", f.Reason, "attempts", f.Attempts, "cause", f.Cause)
+  }
+
+  bus := event.NewLocalBus(event.LocalBusOptions{Observer: failureLogger{}})
+  ```
+- **Breaking:** `LocalBus.EmitSync` returns the `errors.Join` of the terminal failures of its handlers instead of always returning a nil error. Every handler still runs; each error is a `*event.HandlerError` that names its handler (`errors.As`), and `errors.Is` reaches the cause (a recovered panic matches `event.ErrHandlerPanic`). A failure that was dead-lettered and a duplicate are handled outcomes and are not errors. Callers that ignored the error keep compiling, but a failing handler now surfaces.
+
+  ```go
+  // v0.3.0: err was always nil, whatever the handlers did
+  evt, err := bus.EmitSync(ctx, e)
+  ```
+
+  ```go
+  // v0.4.0
+  evt, err := bus.EmitSync(ctx, e)
+  var herr *event.HandlerError
+  if errors.As(err, &herr) {
+  	slog.Error("handler failed", "handler", herr.Handler, "err", herr.Err)
+  }
+  ```
+
+#### Invoker Chain (`github.com/isaquesb/go-event-bus/invoker`)
+- **Breaking:** the `metrics` argument is gone from `NewRetry`, `NewCircuitBreaker`, `NewRateLimiter`, `NewIdempotency` and `NewDLQ`, and the `Metrics` invoker is removed. Latency and outcome of every handler call come from the `HandlerDone` signal, so the chain has no metrics invoker: configure an `Observer` on the bus (see Prometheus and Observability below). The recommended order changes too: the DLQ invoker moves outside Retry.
+
+  ```go
+  // v0.3.0
+  chain := invoker.NewChain(
+  	invoker.NewMetrics(provider),
+  	invoker.NewRateLimiter(rlStore, rlCfg, provider),
+  	invoker.NewIdempotency(idStore, idCfg, provider),
+  	invoker.NewRetry(policy, provider),
+  	invoker.NewCircuitBreaker(cbCfg, provider),
+  	invoker.NewDLQ(dlq, provider),
+  )
+  ```
+
+  ```go
+  // v0.4.0
+  chain := invoker.NewChain(
+  	invoker.NewRateLimiter(rlStore, rlCfg),
+  	invoker.NewIdempotency(idStore, idCfg),
+  	invoker.NewDLQ(dlq),
+  	invoker.NewRetry(policy),
+  	invoker.NewCircuitBreaker(cbCfg),
+  )
+  ```
+
+#### JetStream Transport (`github.com/isaquesb/go-event-bus/jetstream`)
+- **Breaking:** `NewDQL(js, metrics, prefix)` is removed, with no alias, and replaced by `NewDLQ(js, prefix, opts...)`. The default prefix changes from `dql.` to `dlq.` (`DefaultDLQPrefix`), so a deployment that relied on the default publishes to different subjects after the upgrade: **pass the prefix explicitly to keep `dql.*`**. A dead letter is now published to the prefix plus the subject the message came from (v0.3.0 used the event name).
+
+  ```go
+  // v0.3.0
+  dlq := jetstream.NewDQL(js, nil, "dql.")
+  ```
+
+  ```go
+  // v0.4.0, keeping the v0.3.0 subjects
+  dlq := jetstream.NewDLQ(js, "dql.")
+
+  // v0.4.0, with the new default prefix "dlq."
+  dlq = jetstream.NewDLQ(js, jetstream.DefaultDLQPrefix)
+  ```
+- **Breaking:** `(*Replayer).Replay` returns `(ReplayResult, error)` instead of `error`, and it no longer swallows publish errors. It stops at the first record it cannot republish, Naks that record, and returns the error with the counts in `ReplayResult{Replayed, Failed}`. `ReplayOptions.ToSubject` is now optional: by default each record goes back to its original subject. The consumer is a durable one (`ReplayOptions.Consumer`, default `replay_<stream>`), so the next call continues where the last one stopped. `NewReplayer(js)` is source compatible.
+
+  ```go
+  // v0.3.0
+  err := jetstream.NewReplayer(js).Replay(ctx, jetstream.ReplayOptions{
+  	FromStream: "EVENTS_DLQ",
+  	ToSubject:  "chat.created",
+  	Limit:      100,
+  })
+  ```
+
+  ```go
+  // v0.4.0
+  res, err := jetstream.NewReplayer(js).Replay(ctx, jetstream.ReplayOptions{
+  	FromStream: "EVENTS_DLQ",
+  	Limit:      100, // ToSubject is optional: records return to their original subject
+  })
+  if err != nil {
+  	slog.Error("replay stopped", "replayed", res.Replayed, "failed", res.Failed, "err", err)
+  }
+  ```
+- **Breaking:** `BusOptions.OnErr` is replaced by `BusOptions.Observer`, with the same `Observer.Failure` semantics as on `LocalBus`. See the Core entry for the snippet.
+
+#### NATS Transport (`github.com/isaquesb/go-event-bus/nats`)
+- **Breaking:** `BusOptions.OnErr` is replaced by `BusOptions.Observer`, with the same `Observer.Failure` semantics as on `LocalBus`. See the Core entry for the snippet.
+
+#### Prometheus Metrics (`github.com/isaquesb/go-event-bus/prometheus`)
+- **Breaking:** `NewProvider(namespace, WithRegisterer(reg))` is replaced by `NewObserver(reg, WithNamespace(namespace))`. The module no longer implements `invoker.MetricProvider` and no longer requires the `invoker` module. The Observer declares a fixed set of eleven metric families when it is created, so a label mismatch can no longer panic on a handler goroutine, and it is passed as the bus `Observer` instead of through `invoker.NewMetrics`. The metric names change; the old to new table is under Changed in the Observability notes below.
+
+  ```go
+  // v0.3.0
+  provider := eventbusprom.NewProvider("shop", eventbusprom.WithRegisterer(reg))
+  chain := invoker.NewChain(invoker.NewMetrics(provider))
+  ```
+
+  ```go
+  // v0.4.0
+  obs := eventbusprom.NewObserver(reg, eventbusprom.WithNamespace("shop"))
+  bus := event.NewLocalBus(event.LocalBusOptions{Observer: obs})
+  ```
+
+### Fixed
+
+#### JSON Serialization (`github.com/isaquesb/go-event-bus/json`)
+- `Registry.Decode` returns a typed `*event.DecodeError` instead of panicking on an unknown event name or on an envelope with version 0 or no version (version 0 is read as version 1)
+
+### Removed
+
+#### Core (`github.com/isaquesb/go-event-bus`)
+- `LocalBusOptions.OnErr`: use `LocalBusOptions.Observer` and `Observer.Failure`
+
+#### Invoker Chain (`github.com/isaquesb/go-event-bus/invoker`)
+- `NewMetrics` and the `Metrics` invoker: latency and outcome come from `Observer.HandlerDone`
+- `MetricProvider`, `NoopProvider` (with `IncCounter`, `ObserveHistogram` and `SetGauge`) and `Labels`: implement `event.Observer` (embed `event.NopObserver`) instead
+- The `metrics MetricProvider` parameter of `NewRetry`, `NewCircuitBreaker`, `NewRateLimiter`, `NewIdempotency` and `NewDLQ`
+- `DLQPublisher.Publish(ctx, evt, cause)`: the method is now `Publish(ctx, rec event.DLQRecord)` (`invoker.DLQPublisher` is an alias of `event.DLQPublisher`)
+
+#### JetStream Transport (`github.com/isaquesb/go-event-bus/jetstream`)
+- `NewDQL`: use `NewDLQ(js, prefix, opts...)`; set the prefix to `dql.` to keep the v0.3.0 subjects
+- `BusOptions.OnErr`: use `BusOptions.Observer`
+
+#### NATS Transport (`github.com/isaquesb/go-event-bus/nats`)
+- `BusOptions.OnErr`: use `BusOptions.Observer`
+
+#### Prometheus Metrics (`github.com/isaquesb/go-event-bus/prometheus`)
+- `NewProvider`, `WithRegisterer` and the `Provider` type (with `IncCounter`, `ObserveHistogram` and `SetGauge`): use `NewObserver(reg, opts...)` and `WithNamespace`
+
+### Dependencies
+
+- All in-repo modules require each other at `v0.4.0`
+- `prometheus` requires only the root module: it no longer requires `invoker`
+- `json` requires `go.opentelemetry.io/otel` directly (`propagation`), at the `v1.47.0` it already used
+- `telemetry` requires `go.opentelemetry.io/otel/metric` and `go.opentelemetry.io/otel/sdk/metric` directly (the OpenTelemetry metrics API), at `v1.47.0`
+- No third-party version changes: `go.opentelemetry.io/otel` stays at `v1.47.0`, `github.com/nats-io/nats.go` at `v1.54.0`, `github.com/redis/go-redis/v9` at `v9.23.0` and `github.com/prometheus/client_golang` at `v1.25.0`
+
 ## [0.3.0] - 2026-10-13
 
 ### Added
