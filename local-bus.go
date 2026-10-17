@@ -101,6 +101,18 @@ type LocalBusOptions struct {
 	// below 0 mean DefaultShutdownTimeout.
 	ShutdownTimeout time.Duration
 
+	// HandlerTimeout bounds each async handler execution, including an inline
+	// nested one. When above 0 the handler ctx carries a deadline whose cause is
+	// ErrHandlerTimeout, placed above the invoker chain so Retry and the circuit
+	// breaker see it. Expiry is a transient failure like any other: because
+	// LocalBus deliveries are final it ends dead-lettered (or dropped without a
+	// DLQPublisher), never as an interruption, and the circuit breaker counts it
+	// through the ctx cause. The reported error matches ErrHandlerTimeout and
+	// context.DeadlineExceeded. EmitSync handlers keep the caller's ctx and are
+	// never bounded by it. A handler must honor its ctx for the timeout to take
+	// effect: the bus cannot stop a goroutine. 0 means no timeout.
+	HandlerTimeout time.Duration
+
 	// IDGenerator mints ids for events that carry no id of their own.
 	// Nil means NewID.
 	IDGenerator func() string
@@ -141,6 +153,7 @@ func NewLocalBus(opts LocalBusOptions) *LocalBus {
 		pending:         make(chan struct{}, opts.QueueSize),
 		overflow:        opts.Overflow,
 		shutdownTimeout: opts.ShutdownTimeout,
+		handlerTimeout:  opts.HandlerTimeout,
 		idGen:           opts.IDGenerator,
 		inherit:         slices.Clone(opts.InheritHeaders),
 	}
@@ -160,6 +173,7 @@ type LocalBus struct {
 	pending         chan struct{}
 	overflow        OverflowPolicy
 	shutdownTimeout time.Duration
+	handlerTimeout  time.Duration
 	idGen           func() string
 	inherit         []string
 	life            Lifecycle
@@ -458,6 +472,15 @@ func (b *LocalBus) execute(
 	defer stop()
 	subCtx := hctx
 
+	// The timeout sits above the invoker chain and below the Lifecycle ctx:
+	// SubscriptionCtx stays the bus ctx, so a timeout is never mistaken for a
+	// shutdown interruption. Sync handlers keep the caller's ctx.
+	if async && b.handlerTimeout > 0 {
+		var cancel context.CancelFunc
+		hctx, cancel = context.WithTimeoutCause(hctx, b.handlerTimeout, ErrHandlerTimeout)
+		defer cancel()
+	}
+
 	// LocalBus never redelivers, so every delivery is the final one.
 	hctx = WithDelivery(hctx, Delivery{Count: 1, Max: 1, Subject: subject})
 	hctx = WithExecution(hctx, Execution{Handler: h.Name, StartedAt: time.Now()})
@@ -467,6 +490,10 @@ func (b *LocalBus) execute(
 	})
 	if err == nil {
 		return nil
+	}
+	if (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) &&
+		errors.Is(context.Cause(hctx), ErrHandlerTimeout) {
+		err = fmt.Errorf("%w: %w", ErrHandlerTimeout, err)
 	}
 	err = WrapInterrupted(subCtx, err)
 

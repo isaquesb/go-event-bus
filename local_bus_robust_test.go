@@ -507,3 +507,97 @@ func TestReasonOf_LocalBusSentinels(t *testing.T) {
 		})
 	}
 }
+
+// TestLocalBus_AsyncPanicRecovered proves CORE-01 on the async path: a panicking
+// handler is recovered and reported once while the other handlers of the same
+// event still run, and the process survives.
+func TestLocalBus_AsyncPanicRecovered(t *testing.T) {
+	lrInstallLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		errs := &lrErrs{}
+		bus := event.NewLocalBus(event.LocalBusOptions{OnErr: errs.fn})
+
+		var normal atomic.Int32
+		if err := bus.Subscribe(context.Background(), "lr.evt",
+			func(context.Context, event.Event) error { panic("lr: async boom") },
+			event.WithHandlerName("panicker")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		if err := bus.Subscribe(context.Background(), "lr.evt",
+			func(context.Context, event.Event) error { normal.Add(1); return nil },
+			event.WithHandlerName("normal")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		bus.Emit(context.Background(), &lrEvent{})
+		if err := bus.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown = %v, want nil", err)
+		}
+
+		if got := normal.Load(); got != 1 {
+			t.Errorf("normal handler runs = %d, want 1", got)
+		}
+		got, handlers := errs.snapshot()
+		if len(got) != 1 || !errors.Is(got[0], event.ErrHandlerPanic) || handlers[0] != "panicker" {
+			t.Fatalf("OnErr = %v handlers %q, want one ErrHandlerPanic from panicker", got, handlers)
+		}
+	})
+}
+
+// lrPanickyEvent panics from its own OnErr hook.
+type lrPanickyEvent struct{ lrEvent }
+
+func (*lrPanickyEvent) OnErr(context.Context, error, string) { panic("lr: OnErr boom") }
+
+// TestLocalBus_PanicInOnErrRecovered proves the task-level recover: a panic in
+// user reporting code (the bus OnErr callback or the event's OnErr hook) on an
+// async task is logged, does not crash the process and does not leak the task.
+func TestLocalBus_PanicInOnErrRecovered(t *testing.T) {
+	logs := lrInstallLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		var busOnErr atomic.Int32
+		bus := event.NewLocalBus(event.LocalBusOptions{
+			OnErr: func(context.Context, event.Event, error, string) {
+				busOnErr.Add(1)
+				panic("lr: bus OnErr boom")
+			},
+		})
+		if err := bus.Subscribe(context.Background(), "lr.evt",
+			func(context.Context, event.Event) error { return errors.New("lr: handler failed") },
+			event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		bus.Emit(context.Background(), &lrEvent{})
+		if err := bus.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown = %v, want nil", err)
+		}
+		if got := busOnErr.Load(); got != 1 {
+			t.Errorf("bus OnErr calls = %d, want 1", got)
+		}
+
+		var logged bool
+		logs.mu.Lock()
+		for _, r := range logs.recs {
+			if r.attrs["panic"] == "lr: bus OnErr boom" {
+				logged = true
+			}
+		}
+		logs.mu.Unlock()
+		if !logged {
+			t.Error("the OnErr panic was not logged by the task-level recover")
+		}
+
+		// The same holds when the panic comes from the event's own OnErr hook.
+		hook := event.NewLocalBus(event.LocalBusOptions{})
+		if err := hook.Subscribe(context.Background(), "lr.evt",
+			func(context.Context, event.Event) error { return errors.New("lr: handler failed") },
+			event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		hook.Emit(context.Background(), &lrPanickyEvent{})
+		if err := hook.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown after event OnErr panic = %v, want nil", err)
+		}
+	})
+}
