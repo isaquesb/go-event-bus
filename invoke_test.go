@@ -3,7 +3,6 @@ package event_test
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"runtime"
 	"strings"
 	"sync"
@@ -225,24 +224,33 @@ func TestInvokeHandler_NilInvokerPassthrough(t *testing.T) {
 	}
 }
 
-func TestInvokeHandler_LogsFullStack(t *testing.T) {
+func TestInvokeHandler_PanicStackReachesObservers(t *testing.T) {
 	logs := fsCaptureLogs(t)
-	const name = "ih-log-handler"
-	_ = event.InvokeHandler(context.Background(), nil, &ihEvent{}, name, func(context.Context) error {
-		panic("logged")
+	rec := &obsRecorder{}
+	ctx := event.WithObserver(context.Background(), rec)
+
+	err := event.InvokeHandler(ctx, nil, &ihEvent{}, "ih-stack-handler", func(context.Context) error {
+		panic("observed")
 	})
-	recs := logs.forHandler(name)
-	if len(recs) != 1 {
-		t.Fatalf("log records = %d, want 1", len(recs))
+
+	dones := rec.HandlerDones()
+	if len(dones) != 1 {
+		t.Fatalf("HandlerDone calls = %d, want 1", len(dones))
 	}
-	if recs[0].level != slog.LevelError {
-		t.Errorf("level = %v, want error", recs[0].level)
+	var pe *event.PanicError
+	if !errors.As(dones[0].Err, &pe) || pe.Value != "observed" {
+		t.Fatalf("HandlerDone Err = %v, want a *PanicError with value observed", dones[0].Err)
 	}
-	if recs[0].attrs["stack"] == "" {
-		t.Error("stack attribute is empty")
+	if !strings.Contains(string(pe.Stack), "invoke_test.go") {
+		t.Errorf("Stack does not mention invoke_test.go:\n%s", pe.Stack)
 	}
-	if recs[0].attrs["panic"] != "logged" {
-		t.Errorf("panic attribute = %q, want logged", recs[0].attrs["panic"])
+	if !errors.Is(err, event.ErrHandlerPanic) {
+		t.Errorf("returned err = %v, want it to match ErrHandlerPanic", err)
+	}
+	logs.mu.Lock()
+	defer logs.mu.Unlock()
+	if len(logs.recs) != 0 {
+		t.Errorf("log records = %+v, want none: the stack reaches observers, not the log", logs.recs)
 	}
 }
 
