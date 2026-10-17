@@ -80,6 +80,32 @@ func newStream(t testing.TB, js jetstream.JetStream, subjects ...string) string 
 	return name
 }
 
+// newStreamCfg creates a stream from cfg and deletes it on cleanup. It returns
+// the stream name: cfg.Name when set, else a unique one. The stream is always
+// memory-backed (Storage is overridden). Use it for tests that need stream
+// limits newStream does not set.
+func newStreamCfg(t testing.TB, js jetstream.JetStream, cfg jetstream.StreamConfig) string {
+	t.Helper()
+	if cfg.Name == "" {
+		cfg.Name = uniqueName(t, "S")
+	}
+	// FileStorage is the zero value of the enum, so an unset Storage reads as
+	// file; these tests only ever want memory streams the server drops on exit.
+	cfg.Storage = jetstream.MemoryStorage
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := js.CreateStream(ctx, cfg); err != nil {
+		t.Fatalf("create stream %s: %v", cfg.Name, err)
+	}
+	name := cfg.Name
+	t.Cleanup(func() {
+		dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dcancel()
+		_ = js.DeleteStream(dctx, name)
+	})
+	return name
+}
+
 // testRegistry is a minimal event.Registry so jetstream tests do not need a
 // dependency on the json module.
 type testRegistry struct {
