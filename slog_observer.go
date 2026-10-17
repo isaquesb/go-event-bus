@@ -92,9 +92,101 @@ func (o *SlogObserver) log(ctx context.Context, level slog.Level, msg string, at
 	logger.LogAttrs(ctx, level, msg, attrs...)
 }
 
-// record logs one deduplicable record.
-func (o *SlogObserver) record(ctx context.Context, _ soKey, level slog.Level, msg string, attrs ...slog.Attr) {
+// record logs one deduplicable record. With deduplication enabled, the first
+// record per key and window is logged at once; repeats inside the window are
+// counted and reported by one summary record when the window ends. A key that
+// would exceed soMaxKeys is logged untracked, so the keyspace never grows
+// without bound. The logger is never called while holding mu.
+func (o *SlogObserver) record(ctx context.Context, k soKey, level slog.Level, msg string, attrs ...slog.Attr) {
+	if o.every <= 0 {
+		o.log(ctx, level, msg, attrs...)
+		return
+	}
+	now := time.Now()
+	o.mu.Lock()
+	if e, ok := o.entries[k]; ok {
+		if e.suppressed == 0 && now.Sub(e.first) >= o.every {
+			// The window elapsed with nothing suppressed: start a new one.
+			e.first = now
+			e.level = level
+			o.mu.Unlock()
+			o.log(ctx, level, msg, attrs...)
+			return
+		}
+		e.suppressed++
+		if e.suppressed == 1 {
+			e.timer = time.AfterFunc(o.every-now.Sub(e.first), func() { o.flushKey(k, e) })
+		}
+		o.mu.Unlock()
+		return
+	}
+	if len(o.entries) >= soMaxKeys {
+		for key, e := range o.entries {
+			if e.suppressed == 0 && now.Sub(e.first) >= o.every {
+				delete(o.entries, key)
+			}
+		}
+	}
+	if len(o.entries) >= soMaxKeys {
+		o.mu.Unlock()
+		o.log(ctx, level, msg, attrs...)
+		return
+	}
+	if o.entries == nil {
+		o.entries = make(map[soKey]*soEntry)
+	}
+	o.entries[k] = &soEntry{first: now, level: level}
+	o.mu.Unlock()
 	o.log(ctx, level, msg, attrs...)
+}
+
+// flushKey ends the window of k: when e is still the tracked entry it removes it
+// and logs the summary. It is the body of the window timer.
+func (o *SlogObserver) flushKey(k soKey, e *soEntry) {
+	o.mu.Lock()
+	if o.entries[k] != e {
+		o.mu.Unlock()
+		return
+	}
+	delete(o.entries, k)
+	o.mu.Unlock()
+	o.summary(k, e)
+}
+
+// summary logs the record that reports how many records of k were suppressed.
+func (o *SlogObserver) summary(k soKey, e *soEntry) {
+	o.log(context.Background(), e.level, soSummaryMsg,
+		slog.String("signal", k.signal),
+		slog.String("handler", k.handler),
+		slog.String("outcome", k.outcome),
+		slog.String("reason", k.reason),
+		slog.Int("suppressed", e.suppressed),
+		slog.Duration("window", o.every),
+	)
+}
+
+// Flush logs every pending summary at once and stops all window timers. Call it
+// on shutdown, or in tests, so that no suppressed count is lost.
+func (o *SlogObserver) Flush() {
+	type pending struct {
+		k soKey
+		e *soEntry
+	}
+	var out []pending
+	o.mu.Lock()
+	for k, e := range o.entries {
+		if e.suppressed > 0 {
+			if e.timer != nil {
+				e.timer.Stop()
+			}
+			out = append(out, pending{k, e})
+		}
+	}
+	o.entries = nil
+	o.mu.Unlock()
+	for _, p := range out {
+		o.summary(p.k, p.e)
+	}
 }
 
 // soOpt appends slog.String(key, v) only when v is not empty.
@@ -256,6 +348,3 @@ func (o *SlogObserver) RetryAttempt(ctx context.Context, info RetryAttemptInfo) 
 
 // HandlerDone logs nothing: metrics and traces cover it.
 func (o *SlogObserver) HandlerDone(context.Context, HandlerResult) {}
-
-// Flush is a placeholder until deduplication state exists.
-func (o *SlogObserver) Flush() {}
