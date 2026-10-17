@@ -37,6 +37,10 @@ type Delivery struct {
 	StreamSeq uint64
 	// PublishedAt is the broker timestamp, zero when unknown.
 	PublishedAt time.Time
+	// System is the OpenTelemetry messaging.system value of the transport: "nats"
+	// for NATS Core and JetStream, empty for LocalBus. Telemetry falls back to
+	// "eventbus" when it is empty.
+	System string
 }
 
 // Final reports whether no further delivery will follow this one: Max is

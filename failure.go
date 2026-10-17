@@ -73,7 +73,7 @@ type terminalError interface {
 // finished. errors.Is matches Cause and, by Reason, ErrSendToDLQ (terminal) or
 // ErrRetriesExhausted (retries_exhausted); errors.As recovers Attempts.
 //
-// Phase 10 (OBS-04) adds the bounded retry history as a new field.
+// History (OBS-04) carries the bounded retry history; Error and Unwrap ignore it.
 type FailureError struct {
 	// Cause is the last handler error.
 	Cause error
@@ -81,6 +81,11 @@ type FailureError struct {
 	Reason string
 	// Attempts is the number of in-process attempts made on this delivery.
 	Attempts int
+	// History holds the last RetryPolicy.HistorySize in-process attempts of
+	// this delivery, oldest first. len(History) <= HistorySize while Attempts
+	// keeps the true total. It is never copied into the in-flight envelope
+	// (user decision 2026-10-12).
+	History []Attempt
 }
 
 // Error implements error. It never panics, including on a nil receiver or a

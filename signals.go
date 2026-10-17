@@ -1,6 +1,9 @@
 package event
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // BreakerState is the state of a circuit breaker as reported in signals. The
 // set is closed, so backends may use it as a label. The zero value "" means no
@@ -335,4 +338,20 @@ const (
 func redactDelivery(d Delivery) Delivery {
 	d.Raw = nil
 	return d
+}
+
+// RED stubs: behavior arrives in the GREEN commit.
+
+// AttemptErrLimit is the byte budget of Attempt.Err.
+const AttemptErrLimit = 256
+
+// FailingInvokerOf names the failing part of the pipeline for err.
+func FailingInvokerOf(err error) FailingInvoker { return "" }
+
+// AttemptClassOf classifies the error of one attempt.
+func AttemptClassOf(ctx context.Context, err error) AttemptClass { return "" }
+
+// NewAttempt builds an Attempt.
+func NewAttempt(n int, err error, class AttemptClass, started time.Time, duration, delay time.Duration) Attempt {
+	return Attempt{N: n}
 }
