@@ -894,3 +894,189 @@ func TestLocalBus_SyncHandlerInterruptedAtDeadline(t *testing.T) {
 		}
 	})
 }
+
+// lgPanicRecords counts the captured records that report the panic value at
+// Error level.
+func lgPanicRecords(logs *lrLogs, value string) int {
+	logs.mu.Lock()
+	defer logs.mu.Unlock()
+	n := 0
+	for _, r := range logs.recs {
+		if r.attrs["panic"] == value && r.level == slog.LevelError {
+			n++
+		}
+	}
+	return n
+}
+
+// TestLocalBus_ParkedTaskOnErrPanicRecovered pins CR-01 (D-01, D-05, D-07): a
+// panicking OnErr on a parked task handed back at the Shutdown deadline is
+// recovered, and the in-flight count is released from a defer, so a later
+// Shutdown drains instead of waiting on a leaked count.
+func TestLocalBus_ParkedTaskOnErrPanicRecovered(t *testing.T) {
+	logs := lrInstallLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		var onErr atomic.Int32
+		bus := event.NewLocalBus(event.LocalBusOptions{
+			MaxConcurrent: 1,
+			QueueSize:     4,
+			OnErr: func(context.Context, event.Event, error, string) {
+				onErr.Add(1)
+				panic("lg: OnErr boom")
+			},
+		})
+		if err := bus.Subscribe(context.Background(), "lr.evt", func(ctx context.Context, _ event.Event) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}, event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-1"))
+		synctest.Wait()
+		bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-2")) // parked
+		synctest.Wait()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := bus.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown = %v, want context.DeadlineExceeded", err)
+		}
+		synctest.Wait() // the interrupted tasks report asynchronously
+
+		if got := onErr.Load(); got != 2 {
+			t.Errorf("OnErr calls = %d, want 2 (the running and the parked task)", got)
+		}
+		if got := lgPanicRecords(logs, "lg: OnErr boom"); got < 2 {
+			t.Errorf("logged OnErr panics = %d, want at least 2", got)
+		}
+
+		// A leaked in-flight count would make this wait the whole minute.
+		later, stop := context.WithTimeout(context.Background(), time.Minute)
+		defer stop()
+		if err := bus.Shutdown(later); err != nil {
+			t.Fatalf("second Shutdown = %v, want nil (no in-flight count may leak)", err)
+		}
+	})
+}
+
+// TestLocalBus_SyncReportPanicDoesNotLeak pins CR-01 (D-04, D-10): a panicking
+// OnErr on a report made by the Emit caller goroutine is recovered and logged,
+// Emit returns normally and the in-flight count is released.
+func TestLocalBus_SyncReportPanicDoesNotLeak(t *testing.T) {
+	const boom = "lg: report boom"
+
+	// build returns a bus with one slot and one queue place whose handler "h"
+	// blocks on gate; its OnErr counts and panics.
+	build := func(t *testing.T, policy event.OverflowPolicy, onErr *atomic.Int32) (*event.LocalBus, chan struct{}) {
+		t.Helper()
+		gate := make(chan struct{})
+		bus := event.NewLocalBus(event.LocalBusOptions{
+			MaxConcurrent: 1,
+			QueueSize:     1,
+			Overflow:      policy,
+			OnErr: func(context.Context, event.Event, error, string) {
+				onErr.Add(1)
+				panic(boom)
+			},
+		})
+		if err := bus.Subscribe(context.Background(), "lr.evt", func(context.Context, event.Event) error {
+			<-gate
+			return nil
+		}, event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		return bus, gate
+	}
+
+	t.Run("drop", func(t *testing.T) {
+		logs := lrInstallLogs(t)
+		synctest.Test(t, func(t *testing.T) {
+			var onErr atomic.Int32
+			bus, gate := build(t, event.OverflowDrop, &onErr)
+
+			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-1"))
+			synctest.Wait()
+			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-2"))
+			synctest.Wait()
+			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-3")) // dropped, OnErr panics
+
+			if got := onErr.Load(); got != 1 {
+				t.Errorf("OnErr calls = %d, want 1", got)
+			}
+			if got := lgPanicRecords(logs, boom); got != 1 {
+				t.Errorf("logged report panics = %d, want 1", got)
+			}
+			close(gate)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			if err := bus.Shutdown(ctx); err != nil {
+				t.Fatalf("Shutdown = %v, want nil (no in-flight count may leak)", err)
+			}
+		})
+	})
+
+	t.Run("block", func(t *testing.T) {
+		logs := lrInstallLogs(t)
+		synctest.Test(t, func(t *testing.T) {
+			var onErr atomic.Int32
+			bus, gate := build(t, event.OverflowBlock, &onErr)
+
+			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-1"))
+			synctest.Wait()
+			bus.Emit(context.Background(), &lrEvent{}, event.WithID("lg-2"))
+			synctest.Wait()
+
+			emitCtx, cancelEmit := context.WithTimeout(context.Background(), time.Second)
+			defer cancelEmit()
+			start := time.Now()
+			bus.Emit(emitCtx, &lrEvent{}, event.WithID("lg-3")) // waits 1s, dropped, OnErr panics
+			if got := time.Since(start); got != time.Second {
+				t.Errorf("Emit took %v of fake time, want 1s", got)
+			}
+
+			if got := onErr.Load(); got != 1 {
+				t.Errorf("OnErr calls = %d, want 1", got)
+			}
+			if got := lgPanicRecords(logs, boom); got != 1 {
+				t.Errorf("logged report panics = %d, want 1", got)
+			}
+			close(gate)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			if err := bus.Shutdown(ctx); err != nil {
+				t.Fatalf("Shutdown = %v, want nil (no in-flight count may leak)", err)
+			}
+		})
+	})
+
+	t.Run("rejected", func(t *testing.T) {
+		logs := lrInstallLogs(t)
+		synctest.Test(t, func(t *testing.T) {
+			var onErr atomic.Int32
+			bus := event.NewLocalBus(event.LocalBusOptions{
+				OnErr: func(context.Context, event.Event, error, string) {
+					onErr.Add(1)
+					panic(boom)
+				},
+			})
+			if err := bus.Subscribe(context.Background(), "lr.evt",
+				func(context.Context, event.Event) error { return nil },
+				event.WithHandlerName("h")); err != nil {
+				t.Fatalf("Subscribe: %v", err)
+			}
+			if err := bus.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown = %v, want nil", err)
+			}
+
+			bus.Emit(context.Background(), &lrEvent{}) // rejected, OnErr panics
+
+			if got := onErr.Load(); got != 1 {
+				t.Errorf("OnErr calls = %d, want 1", got)
+			}
+			if got := lgPanicRecords(logs, boom); got != 1 {
+				t.Errorf("logged report panics = %d, want 1", got)
+			}
+		})
+	})
+}

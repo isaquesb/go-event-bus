@@ -284,7 +284,7 @@ func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 
 	release, err := b.life.Admit(ctx)
 	if err != nil {
-		b.reject(ctx, cfg.Subject, e, err)
+		b.guardReport(ctx, e, "", func() { b.reject(ctx, cfg.Subject, e, err) })
 		return
 	}
 	defer release()
@@ -353,10 +353,17 @@ func (b *LocalBus) snapshot(subject string) []*namedHandle {
 
 // dispatchAsync schedules one handler. The order is fixed: a free execution
 // slot, then an inline run for a nested emit, then the overflow policy.
+//
+// Every report made here runs on the Emit caller goroutine through guardReport,
+// and every synchronous drop branch releases its Track count from a defer, so a
+// panicking or exiting reporter cannot leak the in-flight count. The parked
+// goroutine owns its release through a defer as well and recovers like runTask,
+// so a panicking OnErr during a shutdown interruption cannot crash the process
+// or block a later Shutdown.
 func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h *namedHandle) {
 	release, ok := b.life.Track()
 	if !ok {
-		b.interrupted(ctx, subject, e, h.Name)
+		b.guardReport(ctx, e, h.Name, func() { b.interrupted(ctx, subject, e, h.Name) })
 		return
 	}
 
@@ -381,8 +388,8 @@ func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h
 		case b.pending <- struct{}{}:
 			parked = true
 		default:
-			b.dropQueueFull(ctx, subject, e, h.Name)
-			release()
+			defer release()
+			b.guardReport(ctx, e, h.Name, func() { b.dropQueueFull(ctx, subject, e, h.Name) })
 			return
 		}
 	case OverflowBlock:
@@ -396,12 +403,12 @@ func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h
 			case b.pending <- struct{}{}:
 				parked = true
 			case <-ctx.Done():
-				b.dropQueueFull(ctx, subject, e, h.Name)
-				release()
+				defer release()
+				b.guardReport(ctx, e, h.Name, func() { b.dropQueueFull(ctx, subject, e, h.Name) })
 				return
 			case <-b.life.Context().Done():
-				b.interrupted(ctx, subject, e, h.Name)
-				release()
+				defer release()
+				b.guardReport(ctx, e, h.Name, func() { b.interrupted(ctx, subject, e, h.Name) })
 				return
 			}
 		}
@@ -410,6 +417,17 @@ func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h
 	}
 
 	go func() {
+		defer release()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(ctx, "event: panic in LocalBus parked task",
+					"handler", h.Name,
+					"event", safeEventName(e),
+					"panic", fmt.Sprint(r),
+					"stack", string(debug.Stack()),
+				)
+			}
+		}()
 		select {
 		case b.exec <- struct{}{}:
 			if parked {
@@ -418,7 +436,6 @@ func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h
 			if b.life.Context().Err() != nil {
 				<-b.exec
 				b.interrupted(ctx, subject, e, h.Name)
-				release()
 				return
 			}
 			b.runTask(ctx, subject, e, h, release, true)
@@ -427,9 +444,28 @@ func (b *LocalBus) dispatchAsync(ctx context.Context, subject string, e Event, h
 				<-b.pending
 			}
 			b.interrupted(ctx, subject, e, h.Name)
-			release()
 		}
 	}()
+}
+
+// guardReport runs a report made on the Emit caller goroutine (the Admit
+// rejection, the refused Track, a queue-full drop and a bus-ctx interruption)
+// under a recover. The report reaches user code (the bus OnErr, the event's
+// OnErr hook), and a panic there must neither unwind through Emit, which would
+// skip the remaining handlers of the same emit, nor leak accounting. The panic
+// is logged instead, consistent with runTask.
+func (b *LocalBus) guardReport(ctx context.Context, e Event, handler string, report func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "event: panic in LocalBus report",
+				"handler", handler,
+				"event", safeEventName(e),
+				"panic", fmt.Sprint(r),
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	report()
 }
 
 // runTask runs one handler and releases its accounting. The recover guards the
