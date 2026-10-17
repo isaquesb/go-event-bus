@@ -47,19 +47,24 @@
 //   - eventbus_circuit_open_total and eventbus_circuit_half_open_total become
 //     eventbus_breaker_transitions_total by to.
 //   - eventbus_circuit_blocked_total becomes eventbus_handler_total with
-//     outcome circuit_open.
+//     outcome circuit_open for a delivery that will be retried, and with
+//     outcome dropped or dead_lettered when the delivery was final.
 //   - eventbus_dlq_published_total, eventbus_dlq_publish_error_total and the
 //     unprefixed dlq_published_total and dlq_publish_error_total become
 //     eventbus_dlq_records_total and eventbus_dlq_publish_errors_total.
-//   - eventbus_idempotency_duplicate_total and
-//     eventbus_idempotency_in_progress_total become eventbus_handler_total with
-//     outcome duplicate or in_progress.
+//   - eventbus_idempotency_duplicate_total becomes eventbus_handler_total with
+//     outcome duplicate.
+//   - eventbus_idempotency_in_progress_total becomes eventbus_handler_total
+//     with outcome in_progress for a delivery that will be retried, and with
+//     outcome dropped or dead_lettered when the delivery was final.
 //   - eventbus_idempotency_error_total and eventbus_ratelimit_error_total
 //     become eventbus_store_errors_total by store.
 //   - eventbus_idempotency_processing_stale_total becomes
 //     eventbus_idempotency_stale_total.
 //   - eventbus_ratelimit_blocked_total becomes eventbus_handler_total with
-//     outcome rate_limited.
+//     outcome rate_limited for a delivery that will be retried, and with
+//     outcome dropped or dead_lettered when the delivery was final (a lost
+//     message is counted as lost, never as rate_limited).
 //   - eventbus_idempotency_lock_acquired_total,
 //     eventbus_idempotency_executed_total and eventbus_ratelimit_allowed_total
 //     are removed; use eventbus_handler_total.
@@ -191,9 +196,11 @@ func (o *Observer) RetryAttempt(_ context.Context, info event.RetryAttemptInfo) 
 	o.retryAttempts.WithLabelValues(info.Handler, info.Event, string(info.Class)).Inc()
 }
 
-// Failure does nothing: terminal failures are already visible through
-// eventbus_handler_total (HandlerDone) and eventbus_dlq_records_total
-// (DeadLettered), so counting them again would double count.
+// Failure does nothing: terminal outcomes, including final-delivery
+// flow-control losses (circuit_open, rate_limited, in_progress), are already
+// counted by eventbus_handler_total through HandlerDone as dropped or
+// dead_lettered, and dead letters by eventbus_dlq_records_total (DeadLettered),
+// so counting them again would double count.
 func (o *Observer) Failure(context.Context, event.FailureContext) {}
 
 // DeadLettered counts a successful dead-letter publish.

@@ -401,3 +401,91 @@ func TestObserver_DoubleRegistrationPanics(t *testing.T) {
 	}()
 	NewObserver(reg)
 }
+
+// poLossEvent is the event the final-delivery tests send through a real bus.
+type poLossEvent struct{}
+
+func (poLossEvent) Name() string { return "po.loss" }
+
+// poRateLimitInvoker rejects every call the way a rate limiter does. Only root
+// types are used: this module never imports the invoker module (D-26).
+type poRateLimitInvoker struct{}
+
+func (poRateLimitInvoker) Invoke(context.Context, event.Event, string, func(context.Context) error) error {
+	return event.ErrRateLimited
+}
+
+// poHandlerOutcomes returns the eventbus_handler_total value by outcome label.
+func poHandlerOutcomes(t *testing.T, reg *prometheus.Registry) map[string]float64 {
+	t.Helper()
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	out := map[string]float64{}
+	for _, f := range fams {
+		if f.GetName() != "eventbus_handler_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "outcome" {
+					out[l.GetValue()] += m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return out
+}
+
+// TestObserver_FinalDeliveryLossCountedDropped proves D-22 end to end: a
+// LocalBus delivery is final, so a rate-limit rejection is a lost message. It is
+// counted by eventbus_handler_total as dropped (no DLQPublisher) or
+// dead_lettered (with one), and never as rate_limited, which would read as "will
+// be retried".
+func TestObserver_FinalDeliveryLossCountedDropped(t *testing.T) {
+	rows := []struct {
+		name string
+		dlq  event.DLQPublisher
+		want string
+	}{
+		{"no publisher", nil, "dropped"},
+		{"memory dlq", event.NewMemoryDLQ(), "dead_lettered"},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			o := NewObserver(reg)
+			bus := event.NewLocalBus(event.LocalBusOptions{
+				Invoker:      poRateLimitInvoker{},
+				Observer:     o,
+				DLQPublisher: row.dlq,
+			})
+			t.Cleanup(func() { _ = bus.Close() })
+
+			ctx := context.Background()
+			if err := bus.Subscribe(ctx, "po.loss", func(context.Context, event.Event) error { return nil },
+				event.WithHandlerName("limited")); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = bus.EmitSync(ctx, poLossEvent{})
+
+			got := poHandlerOutcomes(t, reg)
+			if got[row.want] != 1 {
+				t.Errorf("eventbus_handler_total{outcome=%q} = %v, want 1 (all: %v)", row.want, got[row.want], got)
+			}
+			if v, ok := got["rate_limited"]; ok {
+				t.Errorf("a rate_limited series exists (%v) for a message that was lost", v)
+			}
+			if dlq, ok := row.dlq.(*event.MemoryDLQ); ok {
+				if dlq.Len() != 1 {
+					t.Errorf("dead-letter records = %d, want 1", dlq.Len())
+				}
+				reason := event.ReasonOf(event.ErrRateLimited)
+				if n := testutil.ToFloat64(o.dlqRecords.WithLabelValues("limited", "po.loss", reason)); n != 1 {
+					t.Errorf("eventbus_dlq_records_total{reason=%q} = %v, want 1", reason, n)
+				}
+			}
+		})
+	}
+}

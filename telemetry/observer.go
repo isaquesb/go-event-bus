@@ -52,9 +52,16 @@ type Observer struct {
 	instruments *instruments
 
 	// breakerMu guards breakerSeq and orders the gauge writes, so the gauge is
-	// last-writer-wins by Seq per handler.
+	// last-writer-wins by Seq per breaker instance (handler and BreakerID).
 	breakerMu  sync.Mutex
-	breakerSeq map[string]uint64
+	breakerSeq map[breakerKey]uint64
+}
+
+// breakerKey scopes Seq: it increases per handler breaker of one CircuitBreaker
+// instance, so the order guard is keyed by the handler and the breaker id.
+type breakerKey struct {
+	handler string
+	breaker uint64
 }
 
 // instruments holds the metric instruments created from a MeterProvider.
@@ -93,7 +100,7 @@ func WithMeterProvider(mp metric.MeterProvider) ObserverOption {
 
 // NewObserver returns an Observer.
 func NewObserver(opts ...ObserverOption) *Observer {
-	o := &Observer{breakerSeq: map[string]uint64{}}
+	o := &Observer{breakerSeq: map[breakerKey]uint64{}}
 	for _, opt := range opts {
 		opt(o)
 	}
@@ -202,8 +209,10 @@ func (o *Observer) BreakerTransition(ctx context.Context, t event.BreakerTransit
 }
 
 // recordBreakerState writes the breaker gauge only when t is newer than the
-// last transition recorded for the handler. Transitions are delivered on the
-// goroutine of the message that caused them, so they can arrive out of order.
+// last transition recorded for the same breaker instance (handler and
+// BreakerID). A rebuilt breaker that reuses a handler name starts a new order
+// and is followed. Transitions are delivered on the goroutine of the message
+// that caused them, so they can arrive out of order.
 // The lock covers the write as well, so two goroutines cannot interleave the
 // check and the record.
 func (o *Observer) recordBreakerState(ctx context.Context, t event.BreakerTransition) {
@@ -220,10 +229,11 @@ func (o *Observer) recordBreakerState(ctx context.Context, t event.BreakerTransi
 	}
 	o.breakerMu.Lock()
 	defer o.breakerMu.Unlock()
-	if last, ok := o.breakerSeq[t.Handler]; ok && t.Seq <= last {
+	key := breakerKey{handler: t.Handler, breaker: t.BreakerID}
+	if last, ok := o.breakerSeq[key]; ok && t.Seq <= last {
 		return
 	}
-	o.breakerSeq[t.Handler] = t.Seq
+	o.breakerSeq[key] = t.Seq
 	o.instruments.state.Record(ctx, v, metric.WithAttributes(attribute.String("handler", t.Handler)))
 }
 

@@ -240,6 +240,86 @@ func TestObserverMetrics_BreakerGaugeSeq(t *testing.T) {
 	}
 }
 
+// TestObserverMetrics_BreakerGaugeNewBreakerSameHandler is WR-03 for the OTel
+// gauge: a rebuilt breaker that reuses a handler name starts again at Seq 1 and
+// must still move the gauge, while a late transition of the old breaker stays
+// ignored.
+func TestObserverMetrics_BreakerGaugeNewBreakerSameHandler(t *testing.T) {
+	o, reader := tmNewMetricObserver()
+	ctx := context.Background()
+	tr := func(id uint64, seq uint64, to event.BreakerState) {
+		o.BreakerTransition(ctx, event.BreakerTransition{Handler: "h", To: to, Reason: event.BreakerReasonFailureThreshold, Seq: seq, BreakerID: id})
+	}
+	state := func() int64 {
+		t.Helper()
+		g, ok := tmCollect(t, reader)["eventbus.breaker.state"].Data.(metricdata.Gauge[int64])
+		if !ok || len(g.DataPoints) != 1 {
+			t.Fatalf("breaker.state data = %#v", g)
+		}
+		return g.DataPoints[0].Value
+	}
+
+	tr(1, 1, event.BreakerOpen)
+	tr(1, 2, event.BreakerHalfOpen)
+	tr(1, 3, event.BreakerOpen)
+	if got := state(); got != 1 {
+		t.Fatalf("gauge after breaker 1 ends open = %d, want 1", got)
+	}
+	tr(2, 1, event.BreakerClosed)
+	if got := state(); got != 0 {
+		t.Fatalf("gauge after breaker 2 Seq 1 closed = %d, want 0: the gauge froze on the old breaker", got)
+	}
+	tr(1, 2, event.BreakerHalfOpen) // late, older Seq of breaker 1
+	if got := state(); got != 0 {
+		t.Fatalf("gauge after a late breaker 1 Seq 2 = %d, want 0 (ignored)", got)
+	}
+}
+
+// tmLossEvent is the event the final-delivery test sends through a real bus.
+type tmLossEvent struct{}
+
+func (tmLossEvent) Name() string { return "tm.loss" }
+
+// tmRateLimitInvoker rejects every call the way a rate limiter does. Only root
+// types are used: this module never imports the invoker module.
+type tmRateLimitInvoker struct{}
+
+func (tmRateLimitInvoker) Invoke(context.Context, event.Event, string, func(context.Context) error) error {
+	return event.ErrRateLimited
+}
+
+// TestObserverMetrics_FinalDeliveryLossCountedDropped proves D-22 end to end: a
+// LocalBus delivery is final, so a rate-limit rejection without a DLQPublisher
+// is a lost message and eventbus.handler counts it as dropped, never as
+// rate_limited (which reads as "will be retried").
+func TestObserverMetrics_FinalDeliveryLossCountedDropped(t *testing.T) {
+	o, reader := tmNewMetricObserver()
+	bus := event.NewLocalBus(event.LocalBusOptions{Invoker: tmRateLimitInvoker{}, Observer: o})
+	t.Cleanup(func() { _ = bus.Close() })
+
+	ctx := context.Background()
+	if err := bus.Subscribe(ctx, "tm.loss", func(context.Context, event.Event) error { return nil },
+		event.WithHandlerName("limited")); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = bus.EmitSync(ctx, tmLossEvent{})
+
+	sum, ok := tmCollect(t, reader)["eventbus.handler"].Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatal("eventbus.handler missing")
+	}
+	if len(sum.DataPoints) != 1 {
+		t.Fatalf("eventbus.handler has %d data points, want 1: %#v", len(sum.DataPoints), sum.DataPoints)
+	}
+	p := sum.DataPoints[0]
+	if v, _ := p.Attributes.Value("outcome"); v.AsString() != "dropped" {
+		t.Errorf("outcome = %q, want dropped", v.AsString())
+	}
+	if p.Value != 1 {
+		t.Errorf("count = %d, want 1", p.Value)
+	}
+}
+
 func TestObserverMetrics_DisabledWithoutProvider(t *testing.T) {
 	// No global MeterProvider fallback: nothing may be recorded and nothing may
 	// panic. The ManualReader below is attached to a provider the Observer never
