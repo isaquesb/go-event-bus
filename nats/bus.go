@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/isaquesb/go-event-bus"
@@ -47,6 +48,11 @@ type BusOptions struct {
 	// request carry the truncated error text after the reason code. Default
 	// false, so internal error text never reaches remote requesters.
 	ReplyErrorMessage bool
+	// ShutdownTimeout bounds the Shutdown that Close runs: the subscriptions
+	// drain and the in-flight handlers finish within it, otherwise the handlers
+	// are interrupted and Close returns context.DeadlineExceeded. Values at or
+	// below 0 mean event.DefaultShutdownTimeout.
+	ShutdownTimeout time.Duration
 }
 
 func NewNatsBus(
@@ -69,6 +75,8 @@ func NewNatsBus(
 
 		dlq:         opts.DLQPublisher,
 		replyErrMsg: opts.ReplyErrorMessage,
+
+		shutdownTimeout: opts.ShutdownTimeout,
 	}
 }
 
@@ -90,7 +98,19 @@ type Bus struct {
 	life event.Lifecycle
 
 	shutdownTimeout time.Duration
+	subsMu          sync.Mutex
+	subs            []trackedSub
+	closeOnce       sync.Once
 }
+
+// trackedSub is a NATS subscription Shutdown drains. done is closed by the
+// subscription closed handler, that is when the drain completed.
+type trackedSub struct {
+	sub  *nats.Subscription
+	done chan struct{}
+}
+
+var _ event.Shutdowner = (*Bus)(nil)
 
 // reply sends data and h to the reply subject of msg through the natsConn seam.
 // It does nothing for a message without a reply subject (a plain publish).
@@ -131,6 +151,12 @@ func (b *Bus) newID() string {
 }
 
 func (b *Bus) Emit(ctx context.Context, e event.Event, opts ...event.EmitOption) error {
+	release, err := b.life.Admit(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	cfg := event.ApplyEmitOptions(e, opts...)
 	md := b.resolve(ctx, e, cfg)
 
@@ -166,6 +192,12 @@ func (b *Bus) Emit(ctx context.Context, e event.Event, opts ...event.EmitOption)
 }
 
 func (b *Bus) EmitSync(ctx context.Context, e event.Event) (event.Event, error) {
+	release, err := b.life.Admit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	// No user options: the signature stays EmitSync(ctx, e) so *Bus keeps
 	// satisfying event.SyncBus. Lineage comes from the Metadata in ctx.
 	md := b.resolve(ctx, e, event.ApplyEmitOptions(e))
@@ -227,6 +259,9 @@ func (b *Bus) Subscribe(
 	handler event.HandleFn,
 	opts ...event.SubscribeOption,
 ) error {
+	if b.life.Closing() {
+		return event.ErrBusClosed
+	}
 	cfg := event.ApplyOptions(opts...)
 
 	handlerName := cfg.HandlerName
@@ -234,7 +269,7 @@ func (b *Bus) Subscribe(
 		handlerName = subject // default to subject name
 	}
 
-	_, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
+	sub, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
 		release, ok := b.life.Track()
 		if !ok {
 			b.rejectInbound(ctx, msg, handlerName, false)
@@ -264,8 +299,10 @@ func (b *Bus) Subscribe(
 			b.settle(hctx, msgCtx, evt, handlerName, handleErr)
 		}
 	})
-
-	return err
+	if err != nil {
+		return err
+	}
+	return b.trackSub(sub)
 }
 
 // SubscribeSync registers a handler that responds synchronously to requests.
@@ -276,6 +313,9 @@ func (b *Bus) SubscribeSync(
 	handler event.HandleFn,
 	opts ...event.SubscribeOption,
 ) error {
+	if b.life.Closing() {
+		return event.ErrBusClosed
+	}
 	cfg := event.ApplyOptions(opts...)
 
 	handlerName := cfg.HandlerName
@@ -283,7 +323,7 @@ func (b *Bus) SubscribeSync(
 		handlerName = subject
 	}
 
-	_, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
+	sub, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
 		release, ok := b.life.Track()
 		if !ok {
 			b.rejectInbound(ctx, msg, handlerName, true)
@@ -332,8 +372,34 @@ func (b *Bus) SubscribeSync(
 
 		b.reply(msgCtx, msg, resp, nil)
 	})
+	if err != nil {
+		return err
+	}
+	return b.trackSub(sub)
+}
 
-	return err
+// trackSub registers sub for the drain Shutdown runs. A nil sub (a test mock)
+// is not tracked and never dereferenced. When Shutdown began between the
+// Subscribe call and the registration the subscription is dropped and
+// event.ErrBusClosed is returned.
+func (b *Bus) trackSub(sub *nats.Subscription) error {
+	if sub == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	sub.SetClosedHandler(func(string) { once.Do(func() { close(done) }) })
+
+	b.subsMu.Lock()
+	defer b.subsMu.Unlock()
+	if b.life.Closing() {
+		if err := sub.Unsubscribe(); err != nil {
+			slog.Warn("nats unsubscribe after close failed", "subject", sub.Subject, "err", err)
+		}
+		return event.ErrBusClosed
+	}
+	b.subs = append(b.subs, trackedSub{sub: sub, done: done})
+	return nil
 }
 
 // rejectInbound handles a message delivered after the forced cancel, when Track
@@ -427,11 +493,66 @@ func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber)
 	return nil
 }
 
-// Close gracefully shuts down the bus connection.
-func (b *Bus) Close() error {
-	b.nc.Close()
-	return nil
+// Shutdown stops accepting work, drains the bus and closes the connection.
+//
+// Emit, EmitSync, Subscribe and SubscribeSync return event.ErrBusClosed from the
+// moment Shutdown begins, except an Emit made with the context of a running
+// handler, which is accepted so the handler can finish its work. Every tracked
+// subscription is drained (messages already received are still delivered), then
+// Shutdown waits for the in-flight callbacks, and only then closes the
+// connection, so the replies of SubscribeSync requests still go out.
+//
+// When ctx expires first the handlers are interrupted (their context is
+// cancelled with cause event.ErrShutdownInterrupted and they are reported, never
+// dead-lettered), the connection is closed and ctx.Err() is returned. Messages
+// delivered afterwards are not run: they are reported as interrupted and a
+// SubscribeSync request gets an Eventbus-Error reply with reason interrupted.
+// Shutdown is safe to call more than once.
+func (b *Bus) Shutdown(ctx context.Context) error {
+	b.life.BeginShutdown()
+
+	b.subsMu.Lock()
+	subs := b.subs
+	b.subs = nil
+	b.subsMu.Unlock()
+
+	waiting := make([]trackedSub, 0, len(subs))
+	for _, ts := range subs {
+		if err := ts.sub.Drain(); err != nil {
+			// Already closed or draining: nothing to wait for.
+			slog.WarnContext(ctx, "nats subscription drain failed", "subject", ts.sub.Subject, "err", err)
+			continue
+		}
+		waiting = append(waiting, ts)
+	}
+	for _, ts := range waiting {
+		select {
+		case <-ts.done:
+		case <-ctx.Done():
+			b.life.Interrupt()
+			b.closeConn()
+			return ctx.Err()
+		}
+	}
+
+	err := b.life.Wait(ctx)
+	b.closeConn()
+	return err
 }
 
-// Shutdown is a RED-phase stub.
-func (b *Bus) Shutdown(ctx context.Context) error { return nil }
+// closeConn closes the connection once.
+func (b *Bus) closeConn() {
+	b.closeOnce.Do(b.nc.Close)
+}
+
+// Close shuts the bus down with Shutdown, bounded by BusOptions.ShutdownTimeout
+// (event.DefaultShutdownTimeout when unset), and returns its error.
+func (b *Bus) Close() error {
+	timeout := b.shutdownTimeout
+	if timeout <= 0 {
+		timeout = event.DefaultShutdownTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return b.Shutdown(ctx)
+}
