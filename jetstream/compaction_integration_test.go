@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -619,5 +620,288 @@ func TestIntegration_CompactionDLQStreamKeepsOnlyLatestFailure(t *testing.T) {
 	}
 	if n := calls.get("u1-a"); n != 1 {
 		t.Errorf("u1-a handled %d times, want 1", n)
+	}
+}
+
+// TestIntegration_CompactionDiscardNewPerSubjectRejects proves C7: with
+// Discard DiscardNew and DiscardNewPerSubject the stream rejects a second
+// message on a subject that is at its MaxMsgsPerSubject limit instead of
+// evicting the old one. That is a "first write wins" log, the opposite of
+// compaction, and the publisher sees an error (DOC-02, D-08, D-09).
+func TestIntegration_CompactionDiscardNewPerSubjectRejects(t *testing.T) {
+	_, js := connect(t)
+
+	base := uniqueName(t, "cp")
+	subject := base + ".user.1"
+	stream := newStreamCfg(t, js, jetstream.StreamConfig{
+		Subjects:             []string{base + ".user.>"},
+		MaxMsgsPerSubject:    1,
+		Discard:              jetstream.DiscardNew,
+		DiscardNewPerSubject: true,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := js.Publish(ctx, subject, []byte("v1")); err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+	_, err := js.Publish(ctx, subject, []byte("v2"))
+	if err == nil {
+		t.Fatal("second publish on the same subject succeeded, want it rejected by DiscardNewPerSubject")
+	}
+	if !strings.Contains(err.Error(), "maximum messages per subject exceeded") {
+		t.Errorf("second publish error = %q, want it to mention %q", err, "maximum messages per subject exceeded")
+	}
+	var apiErr *jetstream.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.ErrorCode != 10077 {
+			t.Errorf("API error code = %d, want 10077", apiErr.ErrorCode)
+		}
+	} else {
+		t.Errorf("second publish error %T is not a *jetstream.APIError", err)
+	}
+
+	st := cpStreamInfo(t, js, stream).State
+	if st.Msgs != 1 || st.LastSeq != 1 {
+		t.Errorf("stream msgs=%d last=%d, want the rejected v2 not stored (msgs=1 last=1)", st.Msgs, st.LastSeq)
+	}
+	if got := string(cpLastMsg(t, js, stream, subject).Data); got != "v1" {
+		t.Errorf("latest message = %q, want v1: DiscardNew keeps the first write", got)
+	}
+}
+
+// cpTryLastMsg is cpLastMsg that reports a missing message as an error.
+func cpTryLastMsg(js jetstream.JetStream, stream, subject string) (*jetstream.RawStreamMsg, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, err := js.Stream(ctx, stream)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetLastMsgForSubject(ctx, subject)
+}
+
+// TestIntegration_CompactionDeleteMarkerReachesConsumerAsEmptyBody proves the
+// marker hazard of the guide. With AllowMsgTTL and SubjectDeleteMarkerTTL, when
+// the last message of a subject expires by MaxAge the server inserts an
+// empty-body marker on the same subject with headers Nats-Marker-Reason MaxAge,
+// Nats-Rollup sub and Nats-TTL (C8). A Bus consumer on the subject receives it
+// as an ordinary message and dead-letters it as decode_malformed (C9). Eviction
+// by MaxMsgsPerSubject inserts no marker (C10, the limit case) (DOC-02, D-08).
+//
+// Expiry is lazy: a MaxAge of 2s still held the message at 3.5s when probed, so
+// the marker is polled for up to 30s and the elapsed time is logged, never slept
+// on.
+func TestIntegration_CompactionDeleteMarkerReachesConsumerAsEmptyBody(t *testing.T) {
+	_, js := connect(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// C10: a limit eviction inserts no marker. This uses its own stream without
+	// MaxAge, so no expiry can race the check and add a marker of its own.
+	limBase := uniqueName(t, "cp")
+	limSubject := limBase + ".user.1"
+	limStream := newStreamCfg(t, js, jetstream.StreamConfig{
+		Subjects:               []string{limBase + ".user.>"},
+		MaxMsgsPerSubject:      1,
+		AllowMsgTTL:            true,
+		SubjectDeleteMarkerTTL: 5 * time.Second,
+	})
+	for _, body := range []string{"v1", "v2"} {
+		if _, err := js.Publish(ctx, limSubject, []byte(body)); err != nil {
+			t.Fatalf("C10: publish %s: %v", body, err)
+		}
+	}
+	// A marker would take a stream sequence of its own; look for one for a while.
+	for end := time.Now().Add(time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+		st := cpStreamInfo(t, js, limStream).State
+		if st.Msgs != 1 || st.FirstSeq != 2 || st.LastSeq != 2 {
+			t.Fatalf("C10: stream msgs=%d first=%d last=%d, want v1 evicted with no marker (msgs=1 first=2 last=2)",
+				st.Msgs, st.FirstSeq, st.LastSeq)
+		}
+	}
+	last := cpLastMsg(t, js, limStream, limSubject)
+	if string(last.Data) != "v2" || last.Header.Get("Nats-Marker-Reason") != "" {
+		t.Errorf("C10: latest message = %q with marker reason %q, want v2 and no marker",
+			last.Data, last.Header.Get("Nats-Marker-Reason"))
+	}
+
+	// C8: the marker of a MaxAge expiry.
+	base := uniqueName(t, "cp")
+	subject := base + ".user.1"
+	stream := newStreamCfg(t, js, jetstream.StreamConfig{
+		Subjects:               []string{base + ".user.>"},
+		MaxMsgsPerSubject:      1,
+		MaxAge:                 3 * time.Second,
+		AllowMsgTTL:            true,
+		SubjectDeleteMarkerTTL: 5 * time.Second,
+	})
+
+	// C9: a Bus consumer is already subscribed when the marker appears, so it
+	// receives the marker live, within the marker's own 5s lifetime.
+	rec := &joRecorder{}
+	dlq := event.NewMemoryDLQ()
+	bus := NewBus(js, itRegistry(), BusOptions{
+		CircuitOpenDelay: time.Second,
+		RateLimitDelay:   time.Second,
+		DLQPublisher:     dlq,
+		Observer:         rec,
+	})
+	t.Cleanup(func() { _ = bus.Close() })
+	sink := &cpSink{}
+	if err := bus.Subscribe(ctx, subject, sink.handler(),
+		event.WithStream(stream),
+		event.WithConsumer(uniqueName(t, "C")),
+		event.WithMaxDeliver(3),
+		event.WithBackOff([]time.Duration{time.Second, time.Second}),
+	); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	cpEmit(ctx, t, bus, subject, "u1-v1")
+	published := time.Now()
+	cpPoll(t, 10*time.Second, "the real message to be handled", func() bool { return len(sink.ids()) == 1 })
+
+	var marker *jetstream.RawStreamMsg
+	cpPoll(t, 30*time.Second, "the MaxAge delete marker to appear in the stream", func() bool {
+		m, err := cpTryLastMsg(js, stream, subject)
+		if err != nil || len(m.Data) != 0 || m.Header.Get("Nats-Marker-Reason") == "" {
+			return false
+		}
+		marker = m
+		return true
+	})
+	t.Logf("observed: MaxAge 3s marker (TTL 5s) appeared %s after the publish", time.Since(published).Round(100*time.Millisecond))
+
+	if len(marker.Data) != 0 {
+		t.Errorf("C8: marker body = %q, want empty", marker.Data)
+	}
+	if got := marker.Header.Get("Nats-Marker-Reason"); got != "MaxAge" {
+		t.Errorf("C8: Nats-Marker-Reason = %q, want MaxAge", got)
+	}
+	if got := marker.Header.Get("Nats-Rollup"); got != "sub" {
+		t.Errorf("C8: Nats-Rollup = %q, want sub", got)
+	}
+	if got := marker.Header.Get("Nats-TTL"); got == "" {
+		t.Error("C8: Nats-TTL header is missing")
+	} else {
+		t.Logf("observed: Nats-TTL = %q", got)
+	}
+	if marker.Subject != subject {
+		t.Errorf("C8: marker subject = %q, want the entity subject %q", marker.Subject, subject)
+	}
+
+	// C9: the Bus consumer got the marker as a message with an empty body and
+	// dead-lettered it as a malformed envelope; the handler never saw it.
+	cpPoll(t, 15*time.Second, "the Bus to dead-letter the marker", func() bool { return dlq.Len() == 1 })
+	rows := dlq.Records()
+	if got := rows[0].Reason; got != event.ReasonDecodeMalformed {
+		t.Errorf("C9: dead-letter reason = %q, want %q", got, event.ReasonDecodeMalformed)
+	}
+	if len(rows[0].Raw) != 0 {
+		t.Errorf("C9: dead-lettered body = %q, want empty", rows[0].Raw)
+	}
+	if got := nats.Header(rows[0].Headers).Get("Nats-Marker-Reason"); got != "MaxAge" {
+		t.Errorf("C9: dead-lettered Nats-Marker-Reason = %q, want MaxAge", got)
+	}
+	cpPoll(t, 5*time.Second, "the decode failure to be reported", func() bool { return len(rec.decodeFailures()) == 1 })
+	if df := rec.decodeFailures()[0]; !errors.Is(df.Err, event.ErrMalformedEnvelope) {
+		t.Errorf("C9: DecodeFailed error = %v, want it to match event.ErrMalformedEnvelope", df.Err)
+	}
+	if got := sink.ids(); !slices.Equal(got, []string{"u1-v1"}) {
+		t.Errorf("C9: handler received %v, want only the real message u1-v1", got)
+	}
+}
+
+// TestIntegration_CompactionKVBucketIsAStream proves C12 and C13: a KV bucket
+// is a stream KV_<bucket> on $KV.<bucket>.> whose MaxMsgsPerSubject equals the
+// History, so it is a compacted log the library can read as one. Delete appends
+// an empty KV-Operation DEL marker and Purge a KV-Operation PURGE marker that
+// rolls up every earlier revision of the key (DOC-02, D-12).
+func TestIntegration_CompactionKVBucketIsAStream(t *testing.T) {
+	_, js := connect(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	bucket := uniqueName(t, "kv")
+	const history = 3
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: bucket, History: history, Storage: jetstream.MemoryStorage})
+	if err != nil {
+		t.Fatalf("create bucket %s: %v", bucket, err)
+	}
+	t.Cleanup(func() {
+		dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dcancel()
+		_ = js.DeleteKeyValue(dctx, bucket)
+	})
+
+	// C12: the bucket is a stream, and History is its per-subject limit.
+	stream := "KV_" + bucket
+	cfg := cpStreamInfo(t, js, stream).Config
+	if want := []string{"$KV." + bucket + ".>"}; !slices.Equal(cfg.Subjects, want) {
+		t.Errorf("C12: subjects = %v, want %v", cfg.Subjects, want)
+	}
+	if cfg.MaxMsgsPerSubject != history {
+		t.Errorf("C12: MaxMsgsPerSubject = %d, want the History %d", cfg.MaxMsgsPerSubject, history)
+	}
+	if !cfg.DenyDelete || !cfg.AllowRollup {
+		t.Errorf("C12: DenyDelete=%v AllowRollup=%v, want both true", cfg.DenyDelete, cfg.AllowRollup)
+	}
+	if cfg.Discard != jetstream.DiscardNew || cfg.DiscardNewPerSubject {
+		t.Errorf("C12: Discard=%v DiscardNewPerSubject=%v, want DiscardNew without the per-subject flag: the history limit still evicts old revisions",
+			cfg.Discard, cfg.DiscardNewPerSubject)
+	}
+
+	// C13, Delete: three revisions fill the history; Delete appends a marker
+	// and the history limit evicts the oldest revision.
+	keySubject := "$KV." + bucket + ".k"
+	for _, v := range []string{"v1", "v2", "v3"} {
+		if _, err := kv.PutString(ctx, "k", v); err != nil {
+			t.Fatalf("Put %s: %v", v, err)
+		}
+	}
+	if st := cpStreamInfo(t, js, stream).State; st.Msgs != history {
+		t.Fatalf("C13: stream holds %d messages after three Puts, want %d", st.Msgs, history)
+	}
+	if err := kv.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	del := cpLastMsg(t, js, stream, keySubject)
+	if len(del.Data) != 0 {
+		t.Errorf("C13: delete marker body = %q, want empty", del.Data)
+	}
+	if got := del.Header.Get("KV-Operation"); got != "DEL" {
+		t.Errorf("C13: KV-Operation = %q, want DEL", got)
+	}
+	if st := cpStreamInfo(t, js, stream).State; st.Msgs != history || st.FirstSeq != 2 {
+		t.Errorf("C13: after Delete stream msgs=%d first=%d, want the history limit to evict v1 (msgs=%d first=2)",
+			st.Msgs, st.FirstSeq, history)
+	}
+	if _, err := kv.Get(ctx, "k"); !errors.Is(err, jetstream.ErrKeyNotFound) {
+		t.Errorf("C13: Get after Delete = %v, want ErrKeyNotFound", err)
+	}
+
+	// C13, Purge: the marker rolls up every earlier revision of the key.
+	if _, err := kv.PutString(ctx, "k", "v4"); err != nil {
+		t.Fatalf("Put v4: %v", err)
+	}
+	if err := kv.Purge(ctx, "k"); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	purge := cpLastMsg(t, js, stream, keySubject)
+	if got := purge.Header.Get("KV-Operation"); got != "PURGE" {
+		t.Errorf("C13: KV-Operation = %q, want PURGE", got)
+	}
+	if got := purge.Header.Get("Nats-Rollup"); got != "sub" {
+		t.Errorf("C13: Nats-Rollup = %q, want sub", got)
+	}
+	if st := cpStreamInfo(t, js, stream).State; st.Msgs != 1 || st.FirstSeq != st.LastSeq {
+		t.Errorf("C13: after Purge stream msgs=%d first=%d last=%d, want the marker alone", st.Msgs, st.FirstSeq, st.LastSeq)
+	}
+	if _, err := kv.Get(ctx, "k"); !errors.Is(err, jetstream.ErrKeyNotFound) {
+		t.Errorf("C13: Get after Purge = %v, want ErrKeyNotFound", err)
 	}
 }
