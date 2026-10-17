@@ -11,6 +11,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // DefaultDLQPrefix is the subject prefix NewDLQ uses when it is given an empty
@@ -92,6 +94,13 @@ const dlqMinimalCauseLimit = 128
 // When the broker rejects the message for exceeding its max payload, Publish
 // retries once with only the minimal failure headers, because the failure
 // headers add to the envelope size.
+//
+// The record carries Eventbus-Dlq-Traceparent, the W3C traceparent of the span
+// active in ctx, so the Replayer can link its replay span to the place where the
+// message died. When the chain DLQ invoker dead-letters inside the tracing
+// invoker, that span is the handler span; otherwise it is the span in the
+// transport ctx. The header is omitted when ctx has no valid span, and it is one
+// of the minimal headers of the max-payload retry.
 func (d *DLQ) Publish(ctx context.Context, rec event.DLQRecord) error {
 	data := rec.Raw
 	if rec.Evt != nil && len(data) == 0 {
@@ -116,11 +125,15 @@ func (d *DLQ) Publish(ctx context.Context, rec event.DLQRecord) error {
 	if origMsgID != "" {
 		h.Set(event.HeaderDLQOriginalMsgID, event.TruncateHeader(origMsgID, event.DLQHeaderValueLimit))
 	}
+	tp := oxTraceparent(ctx)
+	if tp != "" {
+		h.Set(event.HeaderDLQTraceparent, tp)
+	}
 	subject := d.prefix + dlqSubject(rec)
 
 	err := d.send(ctx, subject, h, data)
 	if errors.Is(err, nats.ErrMaxPayload) {
-		err = d.send(ctx, subject, dlqMinimalHeaders(rec), data)
+		err = d.send(ctx, subject, dlqMinimalHeaders(rec, tp), data)
 	}
 	return err
 }
@@ -132,10 +145,13 @@ func (d *DLQ) send(ctx context.Context, subject string, h nats.Header, data []by
 }
 
 // dlqMinimalHeaders is the header set of the max-payload retry: the original
-// headers plus only the reason, original subject, event id, handler and a
-// shortened cause.
-func dlqMinimalHeaders(rec event.DLQRecord) nats.Header {
+// headers plus only the reason, original subject, event id, handler, a
+// shortened cause and the dead-letter traceparent tp when it is not empty.
+func dlqMinimalHeaders(rec event.DLQRecord, tp string) nats.Header {
 	h, _ := dlqCopyHeaders(rec.Headers)
+	if tp != "" {
+		h.Set(event.HeaderDLQTraceparent, tp)
+	}
 	full := rec.FailureHeaders()
 	for _, k := range []string{
 		event.HeaderDLQReason,
@@ -186,4 +202,15 @@ func dlqCopyHeaders(src map[string][]string) (nats.Header, string) {
 		h[k] = slices.Clone(vs)
 	}
 	return h, origMsgID
+}
+
+// oxTraceparent returns the W3C traceparent of the span active in ctx, injected
+// with the W3C TraceContext propagator, or "" when ctx has no valid span.
+func oxTraceparent(ctx context.Context) string {
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		return ""
+	}
+	c := propagation.MapCarrier{}
+	propagation.TraceContext{}.Inject(ctx, c)
+	return c.Get("traceparent")
 }

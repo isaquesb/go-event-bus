@@ -12,6 +12,11 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // replayBatchSize is the largest number of records fetched per round trip.
@@ -30,14 +35,43 @@ type replayBackend interface {
 	PublishMsg(ctx context.Context, msg *nats.Msg, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error)
 }
 
+// replayHeaderPrefix marks the headers a replay writes. A record that was
+// dead-lettered again after an earlier replay still carries the previous
+// replay's values, so they are dropped before the new ones are set.
+const replayHeaderPrefix = "Eventbus-Replay-"
+
 // Replayer republishes dead-lettered messages from a DLQ stream.
 type Replayer struct {
 	js replayBackend
+	tp trace.TracerProvider
+}
+
+// ReplayerOption configures a Replayer.
+type ReplayerOption func(*Replayer)
+
+// WithReplayTracerProvider sets the provider of the replay spans. Without it
+// the Replayer uses the global provider (otel.GetTracerProvider), resolved at
+// replay time.
+func WithReplayTracerProvider(tp trace.TracerProvider) ReplayerOption {
+	return func(r *Replayer) { r.tp = tp }
 }
 
 // NewReplayer returns a Replayer that reads and publishes through js.
-func NewReplayer(js replayBackend) *Replayer {
-	return &Replayer{js: js}
+func NewReplayer(js replayBackend, opts ...ReplayerOption) *Replayer {
+	r := &Replayer{js: js}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+// tracer returns the tracer of the replay spans.
+func (r *Replayer) tracer() trace.Tracer {
+	tp := r.tp
+	if tp == nil {
+		tp = otel.GetTracerProvider()
+	}
+	return tp.Tracer(tracerName)
 }
 
 // ReplayOptions selects what Replay reads and where it publishes.
@@ -70,7 +104,16 @@ type ReplayResult struct {
 
 // Replay republishes DLQ records, byte for byte, to their original subject, or
 // to opts.ToSubject when set. The envelope is never decoded. The original user
-// headers are kept; every Eventbus-Dlq-* and Nats-* header is dropped.
+// headers are kept; every Eventbus-Dlq-*, Eventbus-Replay-* and Nats-* header
+// of the record is dropped.
+//
+// Each record is replayed inside a "replay <subject>" Producer span, linked to
+// the dead-letter span parsed from Eventbus-Dlq-Traceparent when the record has
+// a valid one. The replayed message carries three headers outside the verbatim
+// envelope: Eventbus-Replay-Traceparent (the replay span, omitted when the span
+// is not valid), Eventbus-Replay-Failed-Traceparent (the dead-letter span, copied
+// because the Eventbus-Dlq-* headers are stripped) and Eventbus-Replay-Dlq-Sequence
+// (the DLQ stream sequence). The telemetry tracer turns them into span links.
 //
 // A record with an empty body, the dead letter of an undecodable empty
 // message, is republished empty like any other record. The original consumer
@@ -175,7 +218,39 @@ func (r *Replayer) replayOne(ctx context.Context, msg jetstream.Msg, opts Replay
 		return fmt.Errorf("jetstream: replay stream %s seq %d: %w", opts.FromStream, seq, ErrReplaySubject)
 	}
 
+	// The dead-letter span comes from a header any publisher of the DLQ stream
+	// could have written: it is parsed with the W3C propagator and used only as
+	// a link, never as the parent.
+	failedTP := src.Get(event.HeaderDLQTraceparent)
+	failedSC := oxParseTraceparent(ctx, failedTP)
+
+	attrs := []attribute.KeyValue{
+		attribute.String("messaging.system", "nats"),
+		attribute.String("messaging.operation.name", "replay"),
+		attribute.String("messaging.destination.name", target),
+	}
+	if mdErr == nil {
+		attrs = append(attrs, attribute.Int64("eventbus.dlq.sequence", int64(seq)))
+	}
+	startOpts := []trace.SpanStartOption{
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(attrs...),
+	}
+	if failedSC.IsValid() {
+		startOpts = append(startOpts, trace.WithLinks(trace.Link{
+			SpanContext: failedSC,
+			Attributes:  []attribute.KeyValue{attribute.String("eventbus.link.type", "dead_letter")},
+		}))
+	}
+	sctx, span := r.tracer().Start(ctx, "replay "+target, startOpts...)
+
 	h := replayHeaders(src)
+	if tp := oxTraceparent(sctx); tp != "" {
+		h.Set(event.HeaderReplayTraceparent, tp)
+	}
+	if failedSC.IsValid() {
+		h.Set(event.HeaderReplayFailedTraceparent, failedTP)
+	}
 	if mdErr == nil {
 		sq := strconv.FormatUint(seq, 10)
 		id := "replay:" + opts.FromStream + ":" + sq
@@ -183,9 +258,16 @@ func (r *Replayer) replayOne(ctx context.Context, msg jetstream.Msg, opts Replay
 			id = eid + ":replay:" + sq
 		}
 		h.Set(jetstream.MsgIDHeader, id)
+		h.Set(event.HeaderReplayDLQSequence, sq)
 	}
 
-	if _, err := r.js.PublishMsg(ctx, &nats.Msg{Subject: target, Header: h, Data: msg.Data()}); err != nil {
+	_, err := r.js.PublishMsg(sctx, &nats.Msg{Subject: target, Header: h, Data: msg.Data()})
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
+	if err != nil {
 		_ = msg.Nak()
 		res.Failed++
 		return fmt.Errorf("jetstream: replay stream %s seq %d: %w", opts.FromStream, seq, err)
@@ -198,13 +280,14 @@ func (r *Replayer) replayOne(ctx context.Context, msg jetstream.Msg, opts Replay
 }
 
 // replayHeaders copies the user headers of a dead-letter record, dropping every
-// Eventbus-Dlq-* and Nats-* header.
+// Eventbus-Dlq-*, Eventbus-Replay-* and Nats-* header.
 func replayHeaders(src nats.Header) nats.Header {
 	dlq := strings.ToLower(event.HeaderDLQPrefix)
+	rp := strings.ToLower(replayHeaderPrefix)
 	h := make(nats.Header, len(src))
 	for k, v := range src {
 		lk := strings.ToLower(k)
-		if strings.HasPrefix(lk, dlq) || strings.HasPrefix(lk, "nats-") {
+		if strings.HasPrefix(lk, dlq) || strings.HasPrefix(lk, rp) || strings.HasPrefix(lk, "nats-") {
 			continue
 		}
 		h[k] = append([]string(nil), v...)
@@ -229,4 +312,15 @@ func validReplaySubject(s string) bool {
 		}
 	}
 	return true
+}
+
+// oxParseTraceparent parses a W3C traceparent header value with the W3C
+// TraceContext propagator. An empty or invalid value yields an invalid span
+// context.
+func oxParseTraceparent(ctx context.Context, tp string) trace.SpanContext {
+	if tp == "" {
+		return trace.SpanContext{}
+	}
+	pctx := propagation.TraceContext{}.Extract(ctx, propagation.MapCarrier{"traceparent": tp})
+	return trace.SpanContextFromContext(pctx)
 }
