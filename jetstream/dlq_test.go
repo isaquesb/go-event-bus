@@ -12,6 +12,7 @@ import (
 	event "github.com/isaquesb/go-event-bus"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // dlqtJS is a capturing dlqBackend. errs scripts the result of each PublishMsg
@@ -405,5 +406,101 @@ func TestDLQ_StaleFailureHeadersReplaced(t *testing.T) {
 	}
 	if got := h.Get("Eventbus-Trace"); got != "keep-me" {
 		t.Errorf("other Eventbus-* header = %q, want kept verbatim", got)
+	}
+}
+
+// oxFakeSpanContext builds a valid, sampled span context from fixed ids.
+func oxFakeSpanContext(t testing.TB, traceID, spanID string) trace.SpanContext {
+	t.Helper()
+	tid, err := trace.TraceIDFromHex(traceID)
+	if err != nil {
+		t.Fatalf("trace id %q: %v", traceID, err)
+	}
+	sid, err := trace.SpanIDFromHex(spanID)
+	if err != nil {
+		t.Fatalf("span id %q: %v", spanID, err)
+	}
+	return trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+}
+
+const (
+	oxDeadTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	oxDeadSpanID  = "00f067aa0ba902b7"
+	oxDeadTP      = "00-" + oxDeadTraceID + "-" + oxDeadSpanID + "-01"
+)
+
+func TestDLQ_TraceparentFromSpan(t *testing.T) {
+	js := &dlqtJS{}
+	ctx := trace.ContextWithSpanContext(context.Background(), oxFakeSpanContext(t, oxDeadTraceID, oxDeadSpanID))
+
+	if err := NewDLQ(js, "").Publish(ctx, dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if got := js.msg(0).Header.Get(event.HeaderDLQTraceparent); got != oxDeadTP {
+		t.Errorf("%s = %q, want %q", event.HeaderDLQTraceparent, got, oxDeadTP)
+	}
+	if !bytes.Equal(js.msg(0).Data, dlqtRaw) {
+		t.Error("trace data must travel in headers only: the envelope changed")
+	}
+}
+
+func TestDLQ_NoSpanNoTraceparent(t *testing.T) {
+	js := &dlqtJS{}
+
+	if err := NewDLQ(js, "").Publish(context.Background(), dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if _, ok := js.msg(0).Header[event.HeaderDLQTraceparent]; ok {
+		t.Errorf("%s present without a span in ctx: %v", event.HeaderDLQTraceparent, js.msg(0).Header)
+	}
+
+	// A span context that is not valid (zero ids) counts as no span.
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.SpanContext{})
+	if err := NewDLQ(js, "").Publish(ctx, dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if _, ok := js.msg(1).Header[event.HeaderDLQTraceparent]; ok {
+		t.Errorf("%s present for an invalid span context", event.HeaderDLQTraceparent)
+	}
+}
+
+func TestDLQ_StaleTraceparentReplaced(t *testing.T) {
+	const stale = "00-11111111111111111111111111111111-2222222222222222-01"
+	rec := dlqtRecord()
+	rec.Headers[event.HeaderDLQTraceparent] = []string{stale}
+
+	js := &dlqtJS{}
+	ctx := trace.ContextWithSpanContext(context.Background(), oxFakeSpanContext(t, oxDeadTraceID, oxDeadSpanID))
+	if err := NewDLQ(js, "").Publish(ctx, rec); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if got := js.msg(0).Header.Values(event.HeaderDLQTraceparent); len(got) != 1 || got[0] != oxDeadTP {
+		t.Errorf("%s = %v, want the single fresh value %q", event.HeaderDLQTraceparent, got, oxDeadTP)
+	}
+
+	// Without a span the stale value is dropped, not carried along.
+	if err := NewDLQ(js, "").Publish(context.Background(), rec); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if got := js.msg(1).Header.Values(event.HeaderDLQTraceparent); len(got) != 0 {
+		t.Errorf("stale %s survived: %v", event.HeaderDLQTraceparent, got)
+	}
+}
+
+func TestDLQ_MaxPayloadKeepsTraceparent(t *testing.T) {
+	js := &dlqtJS{errs: []error{nats.ErrMaxPayload}}
+	ctx := trace.ContextWithSpanContext(context.Background(), oxFakeSpanContext(t, oxDeadTraceID, oxDeadSpanID))
+
+	if err := NewDLQ(js, "").Publish(ctx, dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if js.calls() != 2 {
+		t.Fatalf("publish calls = %d, want 2", js.calls())
+	}
+	if got := js.msg(0).Header.Get(event.HeaderDLQTraceparent); got != oxDeadTP {
+		t.Errorf("full header set: %s = %q, want %q", event.HeaderDLQTraceparent, got, oxDeadTP)
+	}
+	if got := js.msg(1).Header.Get(event.HeaderDLQTraceparent); got != oxDeadTP {
+		t.Errorf("minimal retry: %s = %q, want %q", event.HeaderDLQTraceparent, got, oxDeadTP)
 	}
 }

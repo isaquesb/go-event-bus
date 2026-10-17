@@ -10,8 +10,15 @@ import (
 	"testing"
 	"time"
 
+	event "github.com/isaquesb/go-event-bus"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/embedded"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // --- fakes (prefix rp) ---
@@ -493,5 +500,319 @@ func TestReplayer_MetadataErrorPublishesWithoutMsgID(t *testing.T) {
 	}
 	if _, ok := js.published[0].Header[jetstream.MsgIDHeader]; ok {
 		t.Errorf("Nats-Msg-Id = %q, want none when Metadata fails", js.published[0].Header.Get(jetstream.MsgIDHeader))
+	}
+}
+
+// --- replay span fakes (prefix ox) ---
+
+// oxSpanData is one span an oxTracerProvider tracer started.
+type oxSpanData struct {
+	name  string
+	kind  trace.SpanKind
+	attrs map[attribute.Key]attribute.Value
+	links []trace.Link
+	errs  []error
+	code  codes.Code
+	ended bool
+}
+
+// oxTracerProvider is a recording tracer provider built from the API packages
+// only. Every span it starts reports the fixed span context sc.
+type oxTracerProvider struct {
+	embedded.TracerProvider
+
+	sc    trace.SpanContext
+	mu    sync.Mutex
+	spans []*oxSpanData
+}
+
+func (p *oxTracerProvider) Tracer(string, ...trace.TracerOption) trace.Tracer {
+	return &oxTracer{tp: p}
+}
+
+// started returns the recorded spans.
+func (p *oxTracerProvider) started() []*oxSpanData {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]*oxSpanData(nil), p.spans...)
+}
+
+type oxTracer struct {
+	embedded.Tracer
+	tp *oxTracerProvider
+}
+
+func (t *oxTracer) Start(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+	cfg := trace.NewSpanStartConfig(opts...)
+	d := &oxSpanData{
+		name:  name,
+		kind:  cfg.SpanKind(),
+		attrs: map[attribute.Key]attribute.Value{},
+		links: cfg.Links(),
+	}
+	for _, kv := range cfg.Attributes() {
+		d.attrs[kv.Key] = kv.Value
+	}
+	t.tp.mu.Lock()
+	t.tp.spans = append(t.tp.spans, d)
+	t.tp.mu.Unlock()
+
+	_, inner := noop.NewTracerProvider().Tracer("").Start(ctx, name)
+	sp := &oxSpan{Span: inner, tp: t.tp, d: d}
+	return trace.ContextWithSpan(ctx, sp), sp
+}
+
+type oxSpan struct {
+	trace.Span
+	tp *oxTracerProvider
+	d  *oxSpanData
+}
+
+func (s *oxSpan) SpanContext() trace.SpanContext { return s.tp.sc }
+
+func (s *oxSpan) RecordError(err error, _ ...trace.EventOption) {
+	s.tp.mu.Lock()
+	s.d.errs = append(s.d.errs, err)
+	s.tp.mu.Unlock()
+}
+
+func (s *oxSpan) SetStatus(code codes.Code, _ string) {
+	s.tp.mu.Lock()
+	s.d.code = code
+	s.tp.mu.Unlock()
+}
+
+func (s *oxSpan) End(...trace.SpanEndOption) {
+	s.tp.mu.Lock()
+	s.d.ended = true
+	s.tp.mu.Unlock()
+}
+
+const (
+	oxReplayTraceID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	oxReplaySpanID  = "bbbbbbbbbbbbbbbb"
+	oxReplayTP      = "00-" + oxReplayTraceID + "-" + oxReplaySpanID + "-01"
+)
+
+// oxReplayProvider returns a recording provider whose spans carry the fixed
+// replay span context.
+func oxReplayProvider(t *testing.T) *oxTracerProvider {
+	t.Helper()
+	return &oxTracerProvider{sc: oxFakeSpanContext(t, oxReplayTraceID, oxReplaySpanID)}
+}
+
+// oxRecordWithDLQTrace is rpRecord plus the dead-letter traceparent.
+func oxRecordWithDLQTrace(seq uint64, tp string) *rpMsg {
+	rec := rpRecord(seq, "orders.created", "evt-1", []byte(`{"id":"evt-1"}`))
+	if tp != "" {
+		rec.headers.Set(event.HeaderDLQTraceparent, tp)
+	}
+	return rec
+}
+
+func TestReplayer_ReplaySpanLinkAndHeaders(t *testing.T) {
+	tp := oxReplayProvider(t)
+	rec := oxRecordWithDLQTrace(42, oxDeadTP)
+	cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}, {}}}
+	js := &rpJS{consumer: cons}
+
+	res, err := NewReplayer(js, WithReplayTracerProvider(tp)).Replay(context.Background(), ReplayOptions{FromStream: "DLQ"})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if res.Replayed != 1 {
+		t.Fatalf("result = %+v, want 1 replayed", res)
+	}
+
+	spans := tp.started()
+	if len(spans) != 1 {
+		t.Fatalf("spans = %d, want 1", len(spans))
+	}
+	sp := spans[0]
+	if sp.name != "replay orders.created" {
+		t.Errorf("span name = %q, want %q", sp.name, "replay orders.created")
+	}
+	if sp.kind != trace.SpanKindProducer {
+		t.Errorf("span kind = %v, want Producer", sp.kind)
+	}
+	if !sp.ended {
+		t.Error("span was not ended")
+	}
+	if len(sp.links) != 1 {
+		t.Fatalf("links = %d, want 1", len(sp.links))
+	}
+	l := sp.links[0]
+	if l.SpanContext.TraceID().String() != oxDeadTraceID || l.SpanContext.SpanID().String() != oxDeadSpanID {
+		t.Errorf("link target = %s/%s, want the dead-letter span %s/%s",
+			l.SpanContext.TraceID(), l.SpanContext.SpanID(), oxDeadTraceID, oxDeadSpanID)
+	}
+	var linkType string
+	for _, kv := range l.Attributes {
+		if kv.Key == "eventbus.link.type" {
+			linkType = kv.Value.AsString()
+		}
+	}
+	if linkType != "dead_letter" {
+		t.Errorf("link type = %q, want dead_letter", linkType)
+	}
+	for k, want := range map[attribute.Key]string{
+		"messaging.system":           "nats",
+		"messaging.operation.name":   "replay",
+		"messaging.destination.name": "orders.created",
+	} {
+		if got := sp.attrs[k].AsString(); got != want {
+			t.Errorf("attribute %s = %q, want %q", k, got, want)
+		}
+	}
+	if got := sp.attrs["eventbus.dlq.sequence"]; got.AsInt64() != 42 {
+		t.Errorf("attribute eventbus.dlq.sequence = %v, want 42", got)
+	}
+
+	if len(js.published) != 1 {
+		t.Fatalf("published %d messages, want 1", len(js.published))
+	}
+	pub := js.published[0]
+	for k, want := range map[string]string{
+		event.HeaderReplayTraceparent:       oxReplayTP,
+		event.HeaderReplayFailedTraceparent: oxDeadTP,
+		event.HeaderReplayDLQSequence:       "42",
+	} {
+		if got := pub.Header.Values(k); len(got) != 1 || got[0] != want {
+			t.Errorf("%s = %v, want %q", k, got, want)
+		}
+	}
+	for k := range pub.Header {
+		if strings.HasPrefix(strings.ToLower(k), "eventbus-dlq-") {
+			t.Errorf("header %q leaked into the replay", k)
+		}
+	}
+	if !bytes.Equal(pub.Data, rec.data) {
+		t.Errorf("data = %q, want the record bytes untouched", pub.Data)
+	}
+}
+
+func TestReplayer_StaleReplayHeadersReplaced(t *testing.T) {
+	tp := oxReplayProvider(t)
+	rec := oxRecordWithDLQTrace(42, oxDeadTP)
+	// A record re-dead-lettered after an earlier replay carries that replay's
+	// headers, in any case.
+	rec.headers[event.HeaderReplayTraceparent] = []string{"00-11111111111111111111111111111111-2222222222222222-01"}
+	rec.headers[event.HeaderReplayDLQSequence] = []string{"7"}
+	rec.headers["eventbus-replay-failed-traceparent"] = []string{"stale"}
+	rec.headers["Eventbus-Replay-Extra"] = []string{"stale"}
+	cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}, {}}}
+	js := &rpJS{consumer: cons}
+
+	if _, err := NewReplayer(js, WithReplayTracerProvider(tp)).Replay(context.Background(), ReplayOptions{FromStream: "DLQ"}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	pub := js.published[0]
+	for k, want := range map[string]string{
+		event.HeaderReplayTraceparent:       oxReplayTP,
+		event.HeaderReplayFailedTraceparent: oxDeadTP,
+		event.HeaderReplayDLQSequence:       "42",
+	} {
+		if got := pub.Header.Values(k); len(got) != 1 || got[0] != want {
+			t.Errorf("%s = %v, want the single fresh value %q", k, got, want)
+		}
+	}
+	for k, v := range pub.Header {
+		if lk := strings.ToLower(k); lk == "eventbus-replay-extra" || k == "eventbus-replay-failed-traceparent" {
+			t.Errorf("stale replay header %q survived: %v", k, v)
+		}
+	}
+}
+
+func TestReplayer_MissingOrInvalidTraceparentNoLink(t *testing.T) {
+	cases := map[string]string{
+		"missing":   "",
+		"garbage":   "not-a-traceparent",
+		"zero ids":  "00-00000000000000000000000000000000-0000000000000000-01",
+		"truncated": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+	}
+	for name, dtp := range cases {
+		t.Run(name, func(t *testing.T) {
+			tp := oxReplayProvider(t)
+			rec := oxRecordWithDLQTrace(42, dtp)
+			cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}, {}}}
+			js := &rpJS{consumer: cons}
+
+			res, err := NewReplayer(js, WithReplayTracerProvider(tp)).Replay(context.Background(), ReplayOptions{FromStream: "DLQ"})
+			if err != nil || res.Replayed != 1 {
+				t.Fatalf("Replay = %+v, %v; a bad traceparent must not stop the replay", res, err)
+			}
+			spans := tp.started()
+			if len(spans) != 1 {
+				t.Fatalf("spans = %d, want 1", len(spans))
+			}
+			if len(spans[0].links) != 0 {
+				t.Errorf("links = %d, want none for %q", len(spans[0].links), dtp)
+			}
+			pub := js.published[0]
+			if got := pub.Header.Values(event.HeaderReplayFailedTraceparent); len(got) != 0 {
+				t.Errorf("%s = %v, want it absent", event.HeaderReplayFailedTraceparent, got)
+			}
+			if got := pub.Header.Get(event.HeaderReplayDLQSequence); got != "42" {
+				t.Errorf("%s = %q, want 42", event.HeaderReplayDLQSequence, got)
+			}
+			if got := pub.Header.Get(event.HeaderReplayTraceparent); got != oxReplayTP {
+				t.Errorf("%s = %q, want %q", event.HeaderReplayTraceparent, got, oxReplayTP)
+			}
+		})
+	}
+}
+
+func TestReplayer_GlobalTracerProviderFallback(t *testing.T) {
+	tp := oxReplayProvider(t)
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	rec := oxRecordWithDLQTrace(5, oxDeadTP)
+	cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}, {}}}
+	js := &rpJS{consumer: cons}
+
+	if _, err := NewReplayer(js).Replay(context.Background(), ReplayOptions{FromStream: "DLQ"}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	spans := tp.started()
+	if len(spans) != 1 || spans[0].name != "replay orders.created" {
+		t.Fatalf("global provider spans = %+v, want one named %q", spans, "replay orders.created")
+	}
+	if got := js.published[0].Header.Get(event.HeaderReplayTraceparent); got != oxReplayTP {
+		t.Errorf("%s = %q, want %q", event.HeaderReplayTraceparent, got, oxReplayTP)
+	}
+}
+
+func TestReplayer_PublishErrorRecordedOnSpan(t *testing.T) {
+	tp := oxReplayProvider(t)
+	rec := oxRecordWithDLQTrace(42, oxDeadTP)
+	cons := &rpConsumer{batches: []rpBatch{{msgs: []*rpMsg{rec}}}}
+	boom := errors.New("publish refused")
+	js := &rpJS{consumer: cons, results: []rpPubResult{{err: boom}}}
+
+	res, err := NewReplayer(js, WithReplayTracerProvider(tp)).Replay(context.Background(), ReplayOptions{FromStream: "DLQ"})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want it to wrap the publish error", err)
+	}
+	if res.Failed != 1 || res.Replayed != 0 {
+		t.Errorf("result = %+v, want 1 failed", res)
+	}
+	if rec.naks != 1 || rec.acks != 0 {
+		t.Errorf("record acks=%d naks=%d, want a Nak and no Ack", rec.acks, rec.naks)
+	}
+	spans := tp.started()
+	if len(spans) != 1 {
+		t.Fatalf("spans = %d, want 1", len(spans))
+	}
+	sp := spans[0]
+	if len(sp.errs) != 1 || !errors.Is(sp.errs[0], boom) {
+		t.Errorf("recorded errors = %v, want the publish error", sp.errs)
+	}
+	if sp.code != codes.Error {
+		t.Errorf("span status = %v, want Error", sp.code)
+	}
+	if !sp.ended {
+		t.Error("span was not ended on the error path")
 	}
 }
