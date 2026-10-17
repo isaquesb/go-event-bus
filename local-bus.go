@@ -280,8 +280,22 @@ func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 	}
 }
 
-// EmitSync runs every handler subscribed to the event's subject on the caller
-// goroutine, under the caller's ctx. It returns ErrBusClosed after Shutdown.
+// EmitSync runs every handler subscribed to the event's subject, in
+// registration order, on the caller goroutine and under the caller's ctx.
+//
+// It returns the joined terminal failures (errors.Join), each wrapped in a
+// *HandlerError that names the handler: find it with errors.As, and match the
+// cause with errors.Is (a recovered panic matches ErrHandlerPanic). Every
+// handler runs even when an earlier one failed. A failure that was dead-lettered
+// (ErrDeadLettered) and a duplicate (ErrDuplicate) are handled outcomes, not
+// errors; when every handler succeeds or is handled the error is nil.
+//
+// EmitSync stops dispatching when the caller ctx is done and includes ctx.Err()
+// in the joined error; a handler that is already running is not interrupted by
+// the bus. After Shutdown it returns ErrBusClosed. LocalBusOptions.HandlerTimeout
+// does not apply here: the handlers keep the caller's ctx.
+//
+// Releases up to v0.3.0 returned a nil error here whatever the handlers did.
 func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) (Event, error) {
 	cfg := ApplyEmitOptions(e, opts...)
 	cfg.IDGenerator = b.idGen
@@ -300,10 +314,19 @@ func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) (E
 	}
 	defer release()
 
+	var errs []error
 	for _, h := range hList {
-		_ = b.execute(ctx, cfg.Subject, e, h, false)
+		if cerr := ctx.Err(); cerr != nil {
+			errs = append(errs, cerr)
+			break
+		}
+		rerr := b.execute(ctx, cfg.Subject, e, h, false)
+		if rerr == nil || errors.Is(rerr, ErrDeadLettered) || errors.Is(rerr, ErrDuplicate) {
+			continue
+		}
+		errs = append(errs, &HandlerError{Handler: h.Name, Err: rerr})
 	}
-	return e, nil
+	return e, errors.Join(errs...)
 }
 
 // snapshot returns the handlers of subject. The slice is append-only, so the

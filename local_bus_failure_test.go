@@ -203,8 +203,10 @@ func TestLocalBus_DroppedKeepsErrorIdentity(t *testing.T) {
 	}
 
 	evt := &lfEvent{name: "orders.created"}
-	if _, err := bus.EmitSync(context.Background(), evt); err != nil {
-		t.Fatalf("EmitSync: %v", err)
+	_, emitErr := bus.EmitSync(context.Background(), evt)
+	var he *event.HandlerError
+	if !errors.As(emitErr, &he) || he.Handler != "h" || he.Err != boom {
+		t.Fatalf("EmitSync err = %v, want a *HandlerError for h wrapping the identical handler error", emitErr)
 	}
 
 	errs := capture.all()
@@ -256,8 +258,10 @@ func TestLocalBus_DeadLetterFailedReported(t *testing.T) {
 	})
 	lfSubscribeNoop(t, bus, "orders.created")
 
-	if _, err := bus.EmitSync(context.Background(), &lfEvent{name: "orders.created"}); err != nil {
-		t.Fatalf("EmitSync: %v", err)
+	_, emitErr := bus.EmitSync(context.Background(), &lfEvent{name: "orders.created"})
+	var he *event.HandlerError
+	if !errors.As(emitErr, &he) || he.Handler != "h" || !errors.Is(emitErr, event.ErrDeadLetterFailed) {
+		t.Fatalf("EmitSync err = %v, want a *HandlerError for h matching ErrDeadLetterFailed", emitErr)
 	}
 
 	if got := pub.calls.Load(); got != 3 {
@@ -319,8 +323,10 @@ func TestLocalBus_InterruptedNeverDeadLettered(t *testing.T) {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	if _, err := bus.EmitSync(ctx, &lfEvent{name: "orders.created"}); err != nil {
-		t.Fatalf("EmitSync: %v", err)
+	_, emitErr := bus.EmitSync(ctx, &lfEvent{name: "orders.created"})
+	var he *event.HandlerError
+	if !errors.As(emitErr, &he) || he.Handler != "h" || !errors.Is(emitErr, context.Canceled) {
+		t.Fatalf("EmitSync err = %v, want a *HandlerError for h matching context.Canceled", emitErr)
 	}
 
 	if got := dlq.Len(); got != 0 {
