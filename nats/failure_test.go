@@ -106,42 +106,18 @@ type fsPermanent struct{ msg string }
 func (e *fsPermanent) Error() string  { return e.msg }
 func (e *fsPermanent) Terminal() bool { return true }
 
-// fsOnErr counts OnErr calls and keeps the last error and event.
-type fsOnErr struct {
-	mu    sync.Mutex
-	n     int
-	err   error
-	evt   event.Event
-	hName string
-}
-
-func (o *fsOnErr) fn(_ context.Context, evt event.Event, err error, handler string) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.n++
-	o.err = err
-	o.evt = evt
-	o.hName = handler
-}
-
-func (o *fsOnErr) snapshot() (int, error, event.Event, string) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.n, o.err, o.evt, o.hName
-}
-
 // --- tracer ---
 
 func TestNatsSync_TerminalFailureRepliesEventbusError(t *testing.T) {
 	conn := newFsLoopConn()
 	dlq := event.NewMemoryDLQ()
-	var oe fsOnErr
+	rec := &noRecorder{}
 	bus := &Bus{
-		nc:      conn,
-		reg:     newMdRegistry("quote.get"),
-		timeout: time.Second,
-		dlq:     dlq,
-		onErr:   oe.fn,
+		nc:       conn,
+		reg:      newMdRegistry("quote.get"),
+		timeout:  time.Second,
+		dlq:      dlq,
+		observer: rec,
 	}
 
 	err := bus.SubscribeSync(context.Background(), "quote.get", func(context.Context, event.Event) error {
@@ -193,12 +169,15 @@ func TestNatsSync_TerminalFailureRepliesEventbusError(t *testing.T) {
 		t.Errorf("DLQ reason/handler = %q/%q, want terminal/h", recs[0].Reason, recs[0].Handler)
 	}
 
-	n, oerr, _, _ := oe.snapshot()
-	if n != 1 {
-		t.Fatalf("OnErr calls = %d, want 1", n)
+	fails := rec.failures()
+	if len(fails) != 1 {
+		t.Fatalf("Failure calls = %d, want 1", len(fails))
 	}
-	if !errors.Is(oerr, event.ErrDeadLettered) {
-		t.Errorf("OnErr error = %v, want it to match event.ErrDeadLettered", oerr)
+	if !errors.Is(fails[0].Cause, event.ErrDeadLettered) {
+		t.Errorf("Failure cause = %v, want it to match event.ErrDeadLettered", fails[0].Cause)
+	}
+	if fails[0].Handler != "h" || fails[0].Event == nil {
+		t.Errorf("Failure handler/event = %q/%v, want h and the event", fails[0].Handler, fails[0].Event)
 	}
 }
 
@@ -243,10 +222,10 @@ func (p *fsFailingPublisher) calls() int {
 	return p.n
 }
 
-func fsBus(conn *fsLoopConn, reg event.Registry, dlq event.DLQPublisher, oe *fsOnErr, inv event.Invoker) *Bus {
+func fsBus(conn *fsLoopConn, reg event.Registry, dlq event.DLQPublisher, rec *noRecorder, inv event.Invoker) *Bus {
 	b := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, invoker: inv}
-	if oe != nil {
-		b.onErr = oe.fn
+	if rec != nil {
+		b.observer = rec
 	}
 	return b
 }
@@ -266,8 +245,8 @@ func fsRequestBytes(t *testing.T, reg *mdRegistry, name string) []byte {
 func TestNatsSubscribe_DecodeFailureDeadLettered(t *testing.T) {
 	conn := newFsLoopConn()
 	dlq := event.NewMemoryDLQ()
-	var oe fsOnErr
-	bus := fsBus(conn, fsDecodeFailRegistry{}, dlq, &oe, nil)
+	rec := &noRecorder{}
+	bus := fsBus(conn, fsDecodeFailRegistry{}, dlq, rec, nil)
 
 	called := false
 	if err := bus.Subscribe(context.Background(), "x.created", func(context.Context, event.Event) error {
@@ -296,24 +275,30 @@ func TestNatsSubscribe_DecodeFailureDeadLettered(t *testing.T) {
 	if recs[0].Reason != event.ReasonDecodeUnknownEvent {
 		t.Errorf("DLQ Reason = %q, want %q", recs[0].Reason, event.ReasonDecodeUnknownEvent)
 	}
-	n, err, evt, _ := oe.snapshot()
-	if n != 1 {
-		t.Fatalf("OnErr calls = %d, want 1", n)
+	fails := rec.failures()
+	if len(fails) != 1 {
+		t.Fatalf("Failure calls = %d, want 1", len(fails))
 	}
-	if evt != nil {
-		t.Errorf("OnErr evt = %v, want nil", evt)
+	if fails[0].Event != nil {
+		t.Errorf("Failure event = %v, want nil", fails[0].Event)
+	}
+	if fails[0].Outcome != event.OutcomeDecodeFailed {
+		t.Errorf("Failure outcome = %q, want %q", fails[0].Outcome, event.OutcomeDecodeFailed)
 	}
 	var de *event.DecodeError
-	if !errors.As(err, &de) || !errors.Is(err, event.ErrDeadLettered) {
-		t.Errorf("OnErr error = %v, want a dead-lettered *DecodeError", err)
+	if !errors.As(fails[0].Cause, &de) || !errors.Is(fails[0].Cause, event.ErrDeadLettered) {
+		t.Errorf("Failure cause = %v, want a dead-lettered *DecodeError", fails[0].Cause)
+	}
+	if dfs := rec.decodeFailures(); len(dfs) != 1 || dfs[0].Delivery.Raw != nil {
+		t.Errorf("DecodeFailed signals = %+v, want one with Raw nil", dfs)
 	}
 }
 
 func TestNatsSync_DecodeFailureRepliesEventbusError(t *testing.T) {
 	conn := newFsLoopConn()
 	dlq := event.NewMemoryDLQ()
-	var oe fsOnErr
-	bus := fsBus(conn, fsDecodeFailRegistry{}, dlq, &oe, nil)
+	rec := &noRecorder{}
+	bus := fsBus(conn, fsDecodeFailRegistry{}, dlq, rec, nil)
 
 	if err := bus.SubscribeSync(context.Background(), "x.get", func(context.Context, event.Event) error {
 		t.Error("handler ran for a message that failed to decode")
@@ -340,16 +325,16 @@ func TestNatsSync_DecodeFailureRepliesEventbusError(t *testing.T) {
 	if dlq.Len() != 1 {
 		t.Errorf("DLQ records = %d, want 1", dlq.Len())
 	}
-	if n, _, _, _ := oe.snapshot(); n != 1 {
-		t.Errorf("OnErr calls = %d, want 1", n)
+	if n := len(rec.failures()); n != 1 {
+		t.Errorf("Failure calls = %d, want 1", n)
 	}
 }
 
 func TestNatsSubscribe_DroppedKeepsErrorIdentity(t *testing.T) {
 	conn := newFsLoopConn()
 	reg := newMdRegistry("order.created")
-	var oe fsOnErr
-	bus := fsBus(conn, reg, nil, &oe, nil)
+	rec := &noRecorder{}
+	bus := fsBus(conn, reg, nil, rec, nil)
 
 	boom := &fsPermanent{msg: "boom"}
 	if err := bus.Subscribe(context.Background(), "order.created", func(context.Context, event.Event) error {
@@ -360,15 +345,18 @@ func TestNatsSubscribe_DroppedKeepsErrorIdentity(t *testing.T) {
 
 	conn.deliver(t, "order.created", fsRequestBytes(t, reg, "order.created"))
 
-	n, err, evt, handler := oe.snapshot()
-	if n != 1 {
-		t.Fatalf("OnErr calls = %d, want 1", n)
+	fails := rec.failures()
+	if len(fails) != 1 {
+		t.Fatalf("Failure calls = %d, want 1", len(fails))
 	}
-	if err != error(boom) {
-		t.Errorf("OnErr error = %v, want the identical handler error without a publisher", err)
+	if fails[0].Cause != error(boom) {
+		t.Errorf("Failure cause = %v, want the identical handler error without a publisher", fails[0].Cause)
 	}
-	if evt == nil || handler != "h" {
-		t.Errorf("OnErr evt/handler = %v/%q, want the event and h", evt, handler)
+	if fails[0].Outcome != event.OutcomeDropped {
+		t.Errorf("Failure outcome = %q, want %q", fails[0].Outcome, event.OutcomeDropped)
+	}
+	if fails[0].Event == nil || fails[0].Handler != "h" {
+		t.Errorf("Failure event/handler = %v/%q, want the event and h", fails[0].Event, fails[0].Handler)
 	}
 }
 
@@ -376,16 +364,16 @@ func TestNatsSubscribe_DuplicateNotReported(t *testing.T) {
 	conn := newFsLoopConn()
 	reg := newMdRegistry("order.created")
 	dlq := event.NewMemoryDLQ()
-	var oe fsOnErr
-	bus := fsBus(conn, reg, dlq, &oe, fsInvoker{err: event.ErrDuplicate})
+	rec := &noRecorder{}
+	bus := fsBus(conn, reg, dlq, rec, fsInvoker{err: event.ErrDuplicate})
 
 	if err := bus.Subscribe(context.Background(), "order.created", noopHandler); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 	conn.deliver(t, "order.created", fsRequestBytes(t, reg, "order.created"))
 
-	if n, _, _, _ := oe.snapshot(); n != 0 {
-		t.Errorf("OnErr calls = %d, want 0 for ErrDuplicate", n)
+	if n := len(rec.failures()); n != 0 {
+		t.Errorf("Failure calls = %d, want 0 for ErrDuplicate", n)
 	}
 	if dlq.Len() != 0 {
 		t.Errorf("DLQ records = %d, want 0 for ErrDuplicate", dlq.Len())
@@ -395,8 +383,8 @@ func TestNatsSubscribe_DuplicateNotReported(t *testing.T) {
 func TestNatsSync_DuplicateRepliesDuplicateReason(t *testing.T) {
 	conn := newFsLoopConn()
 	reg := newMdRegistry("quote.get")
-	var oe fsOnErr
-	bus := fsBus(conn, reg, event.NewMemoryDLQ(), &oe, fsInvoker{err: event.ErrDuplicate})
+	rec := &noRecorder{}
+	bus := fsBus(conn, reg, event.NewMemoryDLQ(), rec, fsInvoker{err: event.ErrDuplicate})
 
 	if err := bus.SubscribeSync(context.Background(), "quote.get", noopHandler); err != nil {
 		t.Fatalf("SubscribeSync: %v", err)
@@ -409,8 +397,8 @@ func TestNatsSync_DuplicateRepliesDuplicateReason(t *testing.T) {
 	if v := conn.lastReply(t).Header.Get(HeaderError); v != event.ReasonDuplicate {
 		t.Errorf("%s = %q, want %q", HeaderError, v, event.ReasonDuplicate)
 	}
-	if n, _, _, _ := oe.snapshot(); n != 0 {
-		t.Errorf("OnErr calls = %d, want 0 for ErrDuplicate", n)
+	if n := len(rec.failures()); n != 0 {
+		t.Errorf("Failure calls = %d, want 0 for ErrDuplicate", n)
 	}
 }
 
@@ -418,8 +406,8 @@ func TestNatsSubscribe_DeadLetterFailedReported(t *testing.T) {
 	conn := newFsLoopConn()
 	reg := newMdRegistry("order.created")
 	pub := &fsFailingPublisher{}
-	var oe fsOnErr
-	bus := fsBus(conn, reg, pub, &oe, nil)
+	rec := &noRecorder{}
+	bus := fsBus(conn, reg, pub, rec, nil)
 
 	if err := bus.Subscribe(context.Background(), "order.created", func(context.Context, event.Event) error {
 		return &fsPermanent{msg: "boom"}
@@ -431,12 +419,12 @@ func TestNatsSubscribe_DeadLetterFailedReported(t *testing.T) {
 	if got := pub.calls(); got != 3 {
 		t.Errorf("publish calls = %d, want 3 on the final delivery", got)
 	}
-	n, err, _, _ := oe.snapshot()
-	if n != 1 {
-		t.Fatalf("OnErr calls = %d, want 1", n)
+	fails := rec.failures()
+	if len(fails) != 1 {
+		t.Fatalf("Failure calls = %d, want 1", len(fails))
 	}
-	if !errors.Is(err, event.ErrDeadLetterFailed) {
-		t.Errorf("OnErr error = %v, want it to match event.ErrDeadLetterFailed", err)
+	if !errors.Is(fails[0].Cause, event.ErrDeadLetterFailed) {
+		t.Errorf("Failure cause = %v, want it to match event.ErrDeadLetterFailed", fails[0].Cause)
 	}
 }
 

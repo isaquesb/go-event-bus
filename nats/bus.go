@@ -2,7 +2,6 @@ package nats
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"slices"
@@ -34,7 +33,16 @@ type BusOptions struct {
 	RequestTimeout time.Duration
 	// Invoker for cross-cutting concerns (retry, metrics, etc.)
 	Invoker event.Invoker
-	OnErr   func(ctx context.Context, evt event.Event, err error, handler string)
+	// Observer receives every signal of the bus: the Failure of each terminal
+	// outcome (exactly once, NATS Core never redelivers), HandlerDone,
+	// DecodeFailed, DLQPublishFailed and InternalError. It is configured once
+	// here and travels in the handler ctx. Nil means event.NewSlogObserver(nil),
+	// so failures are never silent; event.NopObserver{} silences the bus. The bus
+	// wraps it with event.MultiObserver, which isolates its panics.
+	Observer event.Observer
+	// TracerProvider creates the producer spans of Emit and EmitSync. Nil means
+	// the global provider (otel.GetTracerProvider), resolved at call time.
+	TracerProvider trace.TracerProvider
 	// IDGenerator mints event ids when neither WithID nor the event's Id()
 	// provides one. Nil means event.NewID.
 	IDGenerator func() string
@@ -66,14 +74,20 @@ func NewNatsBus(
 		opts.RequestTimeout = 5 * time.Second
 	}
 
+	obs := opts.Observer
+	if obs == nil {
+		obs = event.NewSlogObserver(nil)
+	}
+
 	return &Bus{
-		nc:      nc,
-		reg:     reg,
-		timeout: opts.RequestTimeout,
-		invoker: opts.Invoker,
-		onErr:   opts.OnErr,
-		idGen:   opts.IDGenerator,
-		inherit: slices.Clone(opts.InheritHeaders),
+		nc:       nc,
+		reg:      reg,
+		timeout:  opts.RequestTimeout,
+		invoker:  opts.Invoker,
+		observer: event.MultiObserver(obs),
+		tp:       opts.TracerProvider,
+		idGen:    opts.IDGenerator,
+		inherit:  slices.Clone(opts.InheritHeaders),
 
 		dlq:         opts.DLQPublisher,
 		replyErrMsg: opts.ReplyErrorMessage,
@@ -88,9 +102,14 @@ type Bus struct {
 	reg     event.Registry
 	timeout time.Duration
 	invoker event.Invoker
-	onErr   func(ctx context.Context, evt event.Event, err error, handler string)
 	idGen   func() string
 	inherit []string
+
+	// observer is the configured bus Observer, installed in every handler ctx.
+	// nil (a struct-literal bus) means event.NopObserver{}, see obs.
+	observer event.Observer
+	// tp creates the producer spans; nil means the global provider.
+	tp trace.TracerProvider
 
 	dlq         event.DLQPublisher
 	replyErrMsg bool
@@ -117,6 +136,36 @@ type trackedSub struct {
 }
 
 var _ event.Shutdowner = (*Bus)(nil)
+
+// obs returns the bus Observer, event.NopObserver{} for a struct-literal bus
+// built without one.
+func (b *Bus) obs() event.Observer {
+	if b.observer == nil {
+		return event.NopObserver{}
+	}
+	return b.observer
+}
+
+// internalError reports an error inside the adapter as an InternalError signal.
+func (b *Bus) internalError(ctx context.Context, op, handler, subject string, err error) {
+	b.obs().InternalError(ctx, event.InternalErrorInfo{
+		Component: event.ComponentTransport,
+		Op:        op,
+		Handler:   handler,
+		Subject:   subject,
+		Err:       err,
+	})
+}
+
+// msgScope installs the bus Observer and a fresh FailureScope on ctx. Every
+// message gets its own scope, so the exactly-once guard of one delivery never
+// leaks into another, and the observer overwrites one inherited from a bus the
+// handler ctx came from.
+func (b *Bus) msgScope(ctx context.Context) context.Context {
+	ctx = event.WithObserver(ctx, b.obs())
+	ctx, _ = event.WithFailureScope(ctx)
+	return ctx
+}
 
 // reply sends data and h to the reply subject of msg through the natsConn seam.
 // It does nothing for a message without a reply subject (a plain publish).
@@ -260,9 +309,9 @@ func (b *Bus) EmitSync(ctx context.Context, e event.Event) (event.Event, error) 
 // Subscribe registers a handler for events on the given subject.
 // Options can be used to configure the subscription (e.g., WithHandlerName).
 //
-// A panic in the callback outside the handler (Decode, Settle, the bus or event
-// OnErr, the DLQ publisher) is recovered and logged at Error with its stack.
-// NATS Core never redelivers, so the message ends there.
+// A panic in the callback outside the handler (Decode, Settle, the DLQ
+// publisher) is recovered and reported as an InternalError signal (Op panic)
+// with its stack. NATS Core never redelivers, so the message ends there.
 func (b *Bus) Subscribe(
 	ctx context.Context,
 	subject string,
@@ -299,6 +348,7 @@ func (b *Bus) Subscribe(
 		// cancelled, with cause ErrShutdownInterrupted, when Shutdown gives up.
 		hctx, stop := b.life.HandlerContext(ctx, false)
 		defer stop()
+		hctx = b.msgScope(hctx)
 
 		msgCtx, evt, err := b.reg.Decode(hctx, msg.Data)
 		if err != nil {
@@ -326,10 +376,11 @@ func (b *Bus) Subscribe(
 // SubscribeSync registers a handler that responds synchronously to requests.
 // Options can be used to configure the subscription (e.g., WithHandlerName).
 //
-// A panic in the callback outside the handler (Decode, Settle, the bus or event
-// OnErr, the DLQ publisher, the reply encode) is recovered and logged at Error
-// with its stack. NATS Core never redelivers, so the message ends there, and a
-// request not answered yet gets an Eventbus-Error reply with reason panic.
+// A panic in the callback outside the handler (Decode, Settle, the DLQ
+// publisher, the reply encode) is recovered and reported as an InternalError
+// signal (Op panic) with its stack. NATS Core never redelivers, so the message
+// ends there, and a request not answered yet gets an Eventbus-Error reply with
+// reason panic.
 func (b *Bus) SubscribeSync(
 	ctx context.Context,
 	subject string,
@@ -367,6 +418,7 @@ func (b *Bus) SubscribeSync(
 
 		hctx, stop := b.life.HandlerContext(ctx, false)
 		defer stop()
+		hctx = b.msgScope(hctx)
 
 		msgCtx, evt, err := b.reg.Decode(hctx, msg.Data)
 		if err != nil {
@@ -417,11 +469,12 @@ func (b *Bus) SubscribeSync(
 
 // recoverCallback is deferred by the Subscribe and SubscribeSync callbacks. The
 // invoker chain recovers handler panics (event.InvokeHandler), but Decode, Settle
-// with the bus OnErr, the event's OnErr, the DLQ publisher and the reply encode
+// with the Observer, the event's OnErr, the DLQ publisher and the reply encode
 // run on the nats.go delivery goroutine, where an unrecovered panic kills the
-// process. The panic is logged once at Error with its stack. NATS Core never
-// redelivers, so the message ends there; it is not reported through OnErr (the
-// panic may come from it) and never dead-lettered. When replied is non-nil and
+// process. The panic is reported once as an InternalError signal (Op panic) whose
+// Err is a *event.PanicError carrying the stack. NATS Core never redelivers, so
+// the message ends there; it is not reported as a Failure (the panic may come
+// from the report itself) and never dead-lettered. When replied is non-nil and
 // false the request is still unanswered, so it gets an Eventbus-Error reply with
 // reason panic instead of waiting for the requester timeout.
 //
@@ -429,7 +482,7 @@ func (b *Bus) SubscribeSync(
 // on unwinding, while the message is still counted in flight: a Shutdown in
 // progress cannot close the connection before the panic reply went out. It also
 // covers the branch where Track refused the message, where rejectInbound runs the
-// user OnErr through Settle.
+// report through Settle.
 //
 // It must be called directly by defer, as recover only works there.
 func (b *Bus) recoverCallback(ctx context.Context, msg *nats.Msg, handlerName string, replied *bool) {
@@ -438,23 +491,15 @@ func (b *Bus) recoverCallback(ctx context.Context, msg *nats.Msg, handlerName st
 		return
 	}
 	stack := debug.Stack()
-	slog.ErrorContext(ctx, "nats: panic in message callback recovered",
-		"handler", handlerName,
-		"subject", msg.Subject,
-		"panic", fmt.Sprint(r),
-		"stack", string(stack),
-	)
+	b.internalError(ctx, event.OpPanic, handlerName, msg.Subject, &event.PanicError{Value: r, Stack: stack})
 	if replied == nil || *replied {
 		return
 	}
 	func() {
 		defer func() {
 			if r2 := recover(); r2 != nil {
-				slog.ErrorContext(ctx, "nats: panic in recovered callback reply",
-					"handler", handlerName,
-					"subject", msg.Subject,
-					"panic", fmt.Sprint(r2),
-				)
+				b.internalError(ctx, event.OpPanic, handlerName, msg.Subject,
+					&event.PanicError{Value: r2, Stack: debug.Stack()})
 			}
 		}()
 		b.replyError(ctx, msg, event.ReasonPanic, &event.PanicError{Value: r, Stack: stack})
@@ -487,7 +532,7 @@ func (b *Bus) trackSub(sub *nats.Subscription) error {
 
 // rejectInbound handles a message delivered after the forced cancel, when Track
 // refuses it: the handler does not run. The message is reported once as
-// interrupted (bus OnErr with a nil event) and, for a SubscribeSync request,
+// interrupted (Observer.Failure with a nil event) and, for a SubscribeSync request,
 // answered with an Eventbus-Error reply carrying reason interrupted, so nothing
 // is lost silently (D-04, D-07). It is never dead-lettered.
 func (b *Bus) rejectInbound(ctx context.Context, msg *nats.Msg, handlerName string, sync bool) {
@@ -496,13 +541,13 @@ func (b *Bus) rejectInbound(ctx context.Context, msg *nats.Msg, handlerName stri
 	// in both cases.
 	ictx, cancel := context.WithCancelCause(ctx)
 	cancel(event.ErrShutdownInterrupted)
+	ictx = b.msgScope(ictx)
 
 	s := event.Settle(event.WithDelivery(ictx, deliveryOf(msg)), event.SettleInput{
 		SubscriptionCtx: ictx,
 		Handler:         handlerName,
 		Err:             event.WrapInterrupted(ictx, context.Canceled),
 		Publisher:       b.dlq,
-		OnErr:           b.onErr,
 	})
 	if sync {
 		b.replyError(ictx, msg, s.Reason, event.ErrShutdownInterrupted)
@@ -526,7 +571,6 @@ func (b *Bus) settle(ctx, msgCtx context.Context, evt event.Event, handlerName s
 		Handler:         handlerName,
 		Err:             err,
 		Publisher:       b.dlq,
-		OnErr:           b.onErr,
 	})
 }
 
@@ -557,6 +601,7 @@ func deliveryOf(msg *nats.Msg) event.Delivery {
 		Subject: msg.Subject,
 		Raw:     msg.Data,
 		Headers: map[string][]string(msg.Header),
+		System:  "nats",
 	}
 }
 

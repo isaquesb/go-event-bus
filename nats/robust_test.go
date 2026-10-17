@@ -3,7 +3,6 @@ package nats
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -112,36 +111,6 @@ func (c *rbConn) lastReply(t *testing.T) *natsgo.Msg {
 	return c.replies[len(c.replies)-1]
 }
 
-// rbErrs records OnErr reports.
-type rbErrs struct {
-	mu   sync.Mutex
-	errs []error
-	evts []event.Event
-}
-
-func (r *rbErrs) onErr(_ context.Context, evt event.Event, err error, _ string) {
-	r.mu.Lock()
-	r.errs = append(r.errs, err)
-	r.evts = append(r.evts, evt)
-	r.mu.Unlock()
-}
-
-func (r *rbErrs) count() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.errs)
-}
-
-func (r *rbErrs) at(t *testing.T, i int) (event.Event, error) {
-	t.Helper()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if i >= len(r.errs) {
-		t.Fatalf("OnErr was called %d times, want index %d", len(r.errs), i)
-	}
-	return r.evts[i], r.errs[i]
-}
-
 // rbPayload encodes an rb.order envelope with the given id.
 func rbPayload(t *testing.T, reg *mdRegistry, id string) []byte {
 	t.Helper()
@@ -160,8 +129,8 @@ func TestNatsSubscribe_PanicRecovered(t *testing.T) {
 	conn := newRbConn()
 	reg := newMdRegistry("rb.order")
 	dlq := event.NewMemoryDLQ()
-	errs := &rbErrs{}
-	bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, onErr: errs.onErr}
+	rec := &noRecorder{}
+	bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, observer: rec}
 
 	if err := bus.Subscribe(context.Background(), "rb.order", rbPanicHandler); err != nil {
 		t.Fatalf("Subscribe: %v", err)
@@ -177,10 +146,10 @@ func TestNatsSubscribe_PanicRecovered(t *testing.T) {
 	if recs[0].Reason != event.ReasonPanic {
 		t.Errorf("DLQ reason = %q, want %q", recs[0].Reason, event.ReasonPanic)
 	}
-	if errs.count() != 1 {
-		t.Fatalf("OnErr calls = %d, want 1", errs.count())
+	if len(rec.failures()) != 1 {
+		t.Fatalf("OnErr calls = %d, want 1", len(rec.failures()))
 	}
-	_, err := errs.at(t, 0)
+	_, err := noFailureAt(t, rec, 0)
 	if !errors.Is(err, event.ErrDeadLettered) || !errors.Is(err, event.ErrHandlerPanic) {
 		t.Errorf("OnErr error = %v, want ErrDeadLettered and ErrHandlerPanic", err)
 	}
@@ -396,8 +365,8 @@ func TestNatsBus_ShutdownDeadlineInterruptsHandler(t *testing.T) {
 		conn := newRbConn()
 		reg := newMdRegistry("rb.order")
 		dlq := event.NewMemoryDLQ()
-		errs := &rbErrs{}
-		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, onErr: errs.onErr}
+		rec := &noRecorder{}
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, observer: rec}
 		gate := newRbGate()
 		defer gate.open()
 
@@ -413,10 +382,10 @@ func TestNatsBus_ShutdownDeadlineInterruptsHandler(t *testing.T) {
 		if got := cause(); !errors.Is(got, event.ErrShutdownInterrupted) {
 			t.Errorf("handler saw cause %v, want ErrShutdownInterrupted", got)
 		}
-		if errs.count() != 1 {
-			t.Fatalf("OnErr calls = %d, want 1", errs.count())
+		if len(rec.failures()) != 1 {
+			t.Fatalf("OnErr calls = %d, want 1", len(rec.failures()))
 		}
-		if _, err := errs.at(t, 0); !errors.Is(err, event.ErrShutdownInterrupted) {
+		if _, err := noFailureAt(t, rec, 0); !errors.Is(err, event.ErrShutdownInterrupted) {
 			t.Errorf("OnErr error = %v, want ErrShutdownInterrupted", err)
 		}
 		if n := dlq.Len(); n != 0 {
@@ -433,8 +402,8 @@ func TestNatsBus_LateDeliveryAfterDeadlineReported(t *testing.T) {
 		conn := newRbConn()
 		reg := newMdRegistry("rb.order", "rb.late")
 		dlq := event.NewMemoryDLQ()
-		errs := &rbErrs{}
-		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, onErr: errs.onErr}
+		rec := &noRecorder{}
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, observer: rec}
 		gate := newRbGate()
 		defer gate.open()
 
@@ -458,14 +427,14 @@ func TestNatsBus_LateDeliveryAfterDeadlineReported(t *testing.T) {
 		defer cancel()
 		_ = bus.Shutdown(sctx)
 		rbWait(t, cbDone)
-		before := errs.count()
+		before := len(rec.failures())
 
 		// A Subscribe delivery after the forced cancel is reported, not run.
 		conn.callback(t, "rb.late")(&natsgo.Msg{Subject: "rb.late", Data: rbPayload(t, reg, "rb-late")})
-		if errs.count() != before+1 {
-			t.Fatalf("OnErr calls = %d, want %d", errs.count(), before+1)
+		if len(rec.failures()) != before+1 {
+			t.Fatalf("OnErr calls = %d, want %d", len(rec.failures()), before+1)
 		}
-		evt, err := errs.at(t, before)
+		evt, err := noFailureAt(t, rec, before)
 		if evt != nil {
 			t.Errorf("OnErr event = %v, want nil", evt)
 		}
@@ -496,8 +465,8 @@ func TestNatsBus_LateDeliveryAfterDeadlineReported(t *testing.T) {
 		conn := newRbConn()
 		reg := newMdRegistry("rb.late")
 		dlq := event.NewMemoryDLQ()
-		errs := &rbErrs{}
-		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, onErr: errs.onErr}
+		rec := &noRecorder{}
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: dlq, observer: rec}
 		if err := bus.Subscribe(context.Background(), "rb.late", noopHandler); err != nil {
 			t.Fatalf("Subscribe: %v", err)
 		}
@@ -505,10 +474,10 @@ func TestNatsBus_LateDeliveryAfterDeadlineReported(t *testing.T) {
 			t.Fatalf("Shutdown = %v, want nil", err)
 		}
 		conn.callback(t, "rb.late")(&natsgo.Msg{Subject: "rb.late", Data: rbPayload(t, reg, "rb-late")})
-		if errs.count() != 1 {
-			t.Fatalf("OnErr calls = %d, want 1", errs.count())
+		if len(rec.failures()) != 1 {
+			t.Fatalf("OnErr calls = %d, want 1", len(rec.failures()))
 		}
-		if _, err := errs.at(t, 0); !errors.Is(err, event.ErrShutdownInterrupted) {
+		if _, err := noFailureAt(t, rec, 0); !errors.Is(err, event.ErrShutdownInterrupted) {
 			t.Errorf("OnErr error = %v, want ErrShutdownInterrupted", err)
 		}
 		if n := dlq.Len(); n != 0 {
@@ -576,58 +545,12 @@ func TestNatsBus_StructLiteralShutdown(t *testing.T) {
 
 // --- callback-level panic recovery (WR-01) ---
 
-// wrRecord is one captured log record.
-type wrRecord struct {
-	level slog.Level
-	msg   string
-	attrs map[string]string
-}
+// wrPanicObserver records every signal and panics in Failure: a panic in the
+// report, outside the handler, that the callback guard has to contain. The bus
+// installs it as is (a struct literal does not wrap it with MultiObserver).
+type wrPanicObserver struct{ *noRecorder }
 
-// wrLogs is a slog.Handler capturing every record.
-type wrLogs struct {
-	mu   sync.Mutex
-	recs []wrRecord
-}
-
-func (l *wrLogs) Enabled(context.Context, slog.Level) bool { return true }
-
-func (l *wrLogs) Handle(_ context.Context, r slog.Record) error {
-	rec := wrRecord{level: r.Level, msg: r.Message, attrs: map[string]string{}}
-	r.Attrs(func(a slog.Attr) bool {
-		rec.attrs[a.Key] = a.Value.String()
-		return true
-	})
-	l.mu.Lock()
-	l.recs = append(l.recs, rec)
-	l.mu.Unlock()
-	return nil
-}
-
-func (l *wrLogs) WithAttrs([]slog.Attr) slog.Handler { return l }
-func (l *wrLogs) WithGroup(string) slog.Handler      { return l }
-
-// errorWithPanic reports whether an Error record carries attrs["panic"] == text.
-func (l *wrLogs) errorWithPanic(text string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, r := range l.recs {
-		if r.level == slog.LevelError && r.attrs["panic"] == text {
-			return true
-		}
-	}
-	return false
-}
-
-// wrInstallLogs makes a fresh wrLogs the slog default until the test ends. Call
-// it outside any synctest bubble.
-func wrInstallLogs(t *testing.T) *wrLogs {
-	t.Helper()
-	logs := &wrLogs{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(logs))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	return logs
-}
+func (wrPanicObserver) Failure(context.Context, event.FailureContext) { panic("wr: onerr boom") }
 
 // wrPanicRegistry panics in Decode.
 type wrPanicRegistry struct{ *mdRegistry }
@@ -646,33 +569,31 @@ type wrPanicReplyConn struct{ *rbConn }
 
 func (wrPanicReplyConn) PublishMsg(*natsgo.Msg) error { panic("wr: reply boom") }
 
-func wrOnErrPanic(context.Context, event.Event, error, string) { panic("wr: onerr boom") }
-
 func wrFailHandler(context.Context, event.Event) error { return errors.New("wr: failed") }
 
 func TestNatsBus_CallbackPanicRecovered(t *testing.T) {
 	rows := []struct {
 		name  string
 		panic string
-		build func(conn *rbConn, reg *mdRegistry) *Bus
+		build func(conn *rbConn, reg *mdRegistry, rec *noRecorder) *Bus
 	}{
-		{"bus OnErr", "wr: onerr boom", func(conn *rbConn, reg *mdRegistry) *Bus {
-			return &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+		{"Observer", "wr: onerr boom", func(conn *rbConn, reg *mdRegistry, rec *noRecorder) *Bus {
+			return &Bus{nc: conn, reg: reg, timeout: time.Second, observer: wrPanicObserver{rec}}
 		}},
-		{"DLQ publisher", "wr: dlq boom", func(conn *rbConn, reg *mdRegistry) *Bus {
-			return &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: wrPanicDLQ{}}
+		{"DLQ publisher", "wr: dlq boom", func(conn *rbConn, reg *mdRegistry, rec *noRecorder) *Bus {
+			return &Bus{nc: conn, reg: reg, timeout: time.Second, dlq: wrPanicDLQ{}, observer: rec}
 		}},
-		{"decode", "wr: decode boom", func(conn *rbConn, reg *mdRegistry) *Bus {
-			return &Bus{nc: conn, reg: wrPanicRegistry{reg}, timeout: time.Second}
+		{"decode", "wr: decode boom", func(conn *rbConn, reg *mdRegistry, rec *noRecorder) *Bus {
+			return &Bus{nc: conn, reg: wrPanicRegistry{reg}, timeout: time.Second, observer: rec}
 		}},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
-			logs := wrInstallLogs(t)
 			synctest.Test(t, func(t *testing.T) {
 				conn := newRbConn()
 				reg := newMdRegistry("rb.order")
-				bus := row.build(conn, reg)
+				rec := &noRecorder{}
+				bus := row.build(conn, reg, rec)
 				if err := bus.Subscribe(context.Background(), "rb.order", wrFailHandler, event.WithHandlerName("h")); err != nil {
 					t.Fatalf("Subscribe: %v", err)
 				}
@@ -680,8 +601,8 @@ func TestNatsBus_CallbackPanicRecovered(t *testing.T) {
 				// The callback returns normally: a propagated panic aborts the binary.
 				conn.callback(t, "rb.order")(&natsgo.Msg{Subject: "rb.order", Data: rbPayload(t, reg, "wr-1")})
 
-				if !logs.errorWithPanic(row.panic) {
-					t.Errorf("no Error record with panic %q", row.panic)
+				if !noPanicReported(rec, row.panic) {
+					t.Errorf("no InternalError panic signal with value %q", row.panic)
 				}
 				sctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 				defer cancel()
@@ -697,7 +618,8 @@ func TestNatsSync_CallbackPanicRepliesPanic(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		conn := newRbConn()
 		reg := newMdRegistry("rb.order")
-		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+		rec := &noRecorder{}
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, observer: wrPanicObserver{rec}}
 		if err := bus.SubscribeSync(context.Background(), "rb.order", wrFailHandler); err != nil {
 			t.Fatalf("SubscribeSync: %v", err)
 		}
@@ -735,11 +657,11 @@ func TestNatsSync_CallbackPanicRepliesPanic(t *testing.T) {
 }
 
 func TestNatsSync_PanicReplyPanicContained(t *testing.T) {
-	logs := wrInstallLogs(t)
 	synctest.Test(t, func(t *testing.T) {
 		reg := newMdRegistry("rb.order")
 		conn := &wrPanicReplyConn{rbConn: newRbConn()}
-		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+		rec := &noRecorder{}
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, observer: wrPanicObserver{rec}}
 		if err := bus.SubscribeSync(context.Background(), "rb.order", wrFailHandler, event.WithHandlerName("h")); err != nil {
 			t.Fatalf("SubscribeSync: %v", err)
 		}
@@ -747,11 +669,11 @@ func TestNatsSync_PanicReplyPanicContained(t *testing.T) {
 		// The callback returns normally: a propagated panic aborts the binary.
 		conn.callback(t, "rb.order")(&natsgo.Msg{Subject: "rb.order", Data: rbPayload(t, reg, "wr-s2"), Reply: rbInbox})
 
-		if !logs.errorWithPanic("wr: onerr boom") {
-			t.Error("no Error record with panic \"wr: onerr boom\"")
+		if !noPanicReported(rec, "wr: onerr boom") {
+			t.Errorf("no InternalError panic signal with value %q", "wr: onerr boom")
 		}
-		if !logs.errorWithPanic("wr: reply boom") {
-			t.Error("no Error record with panic \"wr: reply boom\"")
+		if !noPanicReported(rec, "wr: reply boom") {
+			t.Errorf("no InternalError panic signal with value %q", "wr: reply boom")
 		}
 		sctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
@@ -894,7 +816,6 @@ func (c *wrGatedReplyConn) PublishMsg(m *natsgo.Msg) error {
 }
 
 func TestNatsSync_PanicReplyBeforeShutdownCloses(t *testing.T) {
-	logs := wrInstallLogs(t)
 	synctest.Test(t, func(t *testing.T) {
 		conn := newWrGatedReplyConn()
 		defer conn.gate.open()
@@ -902,7 +823,8 @@ func TestNatsSync_PanicReplyBeforeShutdownCloses(t *testing.T) {
 		handlerGate := newRbGate()
 		defer handlerGate.open()
 		entered := make(chan struct{})
-		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+		rec := &noRecorder{}
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, observer: wrPanicObserver{rec}}
 
 		err := bus.SubscribeSync(context.Background(), "rb.order", func(context.Context, event.Event) error {
 			close(entered)
@@ -971,8 +893,8 @@ func TestNatsSync_PanicReplyBeforeShutdownCloses(t *testing.T) {
 		if len(inbox[0].Data) != 0 {
 			t.Errorf("reply data = %q, want empty", inbox[0].Data)
 		}
-		if !logs.errorWithPanic("wr: onerr boom") {
-			t.Error("no Error record with panic \"wr: onerr boom\"")
+		if !noPanicReported(rec, "wr: onerr boom") {
+			t.Errorf("no InternalError panic signal with value %q", "wr: onerr boom")
 		}
 	})
 }
@@ -987,11 +909,11 @@ func TestNatsBus_RejectedDeliveryPanicRecovered(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
-			logs := wrInstallLogs(t)
 			synctest.Test(t, func(t *testing.T) {
 				conn := newRbConn()
 				reg := newMdRegistry("rb.order")
-				bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+				rec := &noRecorder{}
+				bus := &Bus{nc: conn, reg: reg, timeout: time.Second, observer: wrPanicObserver{rec}}
 				handler := func(context.Context, event.Event) error {
 					t.Error("handler ran for a rejected delivery")
 					return nil
@@ -1017,8 +939,8 @@ func TestNatsBus_RejectedDeliveryPanicRecovered(t *testing.T) {
 				}
 				conn.callback(t, "rb.order")(msg)
 
-				if !logs.errorWithPanic("wr: onerr boom") {
-					t.Error("no Error record with panic \"wr: onerr boom\"")
+				if !noPanicReported(rec, "wr: onerr boom") {
+					t.Errorf("no InternalError panic signal with value %q", "wr: onerr boom")
 				}
 				conn.mu.Lock()
 				var inbox []*natsgo.Msg
@@ -1047,14 +969,14 @@ func TestNatsBus_RejectedDeliveryPanicRecovered(t *testing.T) {
 }
 
 func TestNatsBus_PanicDuringShutdownLoggedBeforeReturn(t *testing.T) {
-	logs := wrInstallLogs(t)
 	synctest.Test(t, func(t *testing.T) {
 		conn := newRbConn()
 		reg := newMdRegistry("rb.order")
 		gate := newRbGate()
 		defer gate.open()
 		entered := make(chan struct{})
-		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, onErr: wrOnErrPanic}
+		rec := &noRecorder{}
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second, observer: wrPanicObserver{rec}}
 
 		err := bus.Subscribe(context.Background(), "rb.order", func(context.Context, event.Event) error {
 			close(entered)
@@ -1081,8 +1003,8 @@ func TestNatsBus_PanicDuringShutdownLoggedBeforeReturn(t *testing.T) {
 			t.Errorf("Shutdown = %v, want nil", err)
 		}
 		// The record is logged before release, and release happens before Wait returns.
-		if !logs.errorWithPanic("wr: onerr boom") {
-			t.Error("panic record not logged before Shutdown returned")
+		if !noPanicReported(rec, "wr: onerr boom") {
+			t.Errorf("no InternalError panic signal with value %q", "wr: onerr boom")
 		}
 		rbWait(t, cbDone)
 		if n := conn.closeCount(); n != 1 {
