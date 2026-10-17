@@ -4,8 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"runtime/debug"
+	"time"
 )
 
 var (
@@ -57,22 +56,50 @@ func (e *PanicError) Terminal() bool { return true }
 //
 // A panic inside fn is recovered innermost, so every invoker in the chain
 // (Retry, CircuitBreaker, DLQ) receives it as an ordinary returned
-// *PanicError. A panic inside an invoker is recovered by an outer layer. Both
-// are logged once with slog.ErrorContext, with the full value and stack as
-// structured attributes. A nil inv is a passthrough: fn is called directly.
+// *PanicError. A panic inside an invoker is recovered by an outer layer. The
+// value and the stack travel in the PanicError, so they reach observers through
+// HandlerResult.Err and FailureContext.Cause; nothing is logged here. A nil inv
+// is a passthrough: fn is called directly.
+//
+// HandlerDone is emitted to the Observer in ctx for every invocation, with the
+// outcome from OutcomeOf, the duration and the error. A terminal failure that
+// the chain did not dead-letter (outcome failed) is not final yet: when the
+// transport installed a FailureScope, the signal is deferred and the
+// transport's Settle emits it once with what really happened to the message
+// (dead_lettered, dropped, retry or failed). Without a FailureScope the signal
+// is emitted at the end of the chain with outcome failed.
 //
 // The recover does not stop runtime.Goexit, so callers release their
 // accounting in a defer.
 func InvokeHandler(ctx context.Context, inv Invoker, evt Event, handlerName string, fn func(context.Context) error) (err error) {
+	start := time.Now()
+	scope, ok := FailureScopeFromContext(ctx)
+	if !ok {
+		ctx, scope = newDetachedScope(ctx)
+	}
+	defer func() {
+		r := HandlerResult{
+			Handler:  handlerName,
+			Event:    safeEventName(evt),
+			Outcome:  OutcomeOf(ctx, err),
+			Duration: time.Since(start),
+			Err:      err,
+			At:       time.Now().UTC(),
+		}
+		if r.Outcome == OutcomeFailed && scope.deferHandlerDone(r) {
+			return
+		}
+		ObserverFromContext(ctx).HandlerDone(ctx, r)
+	}()
 	defer func() {
 		if r := recover(); r != nil {
-			err = newPanicError(ctx, r, evt, handlerName, "invoker")
+			err = recoveredPanic(r)
 		}
 	}()
 	call := func(c context.Context) (cerr error) {
 		defer func() {
 			if r := recover(); r != nil {
-				cerr = newPanicError(c, r, evt, handlerName, "handler")
+				cerr = recoveredPanic(r)
 			}
 		}()
 		return fn(c)
@@ -81,31 +108,6 @@ func InvokeHandler(ctx context.Context, inv Invoker, evt Event, handlerName stri
 		return call(ctx)
 	}
 	return inv.Invoke(ctx, evt, handlerName, call)
-}
-
-// newPanicError builds the PanicError for a recovered value and logs it. It
-// must be called from the deferred function that recovered r, so the captured
-// stack still holds the panicking frames.
-func newPanicError(ctx context.Context, r any, evt Event, handlerName, site string) *PanicError {
-	pe := &PanicError{Value: r, Stack: debug.Stack()}
-	msg := "event: handler panic recovered"
-	if site == "invoker" {
-		msg = "event: invoker panic recovered"
-	}
-	attrs := make([]slog.Attr, 0, 5)
-	attrs = append(attrs, slog.String("handler", handlerName))
-	if name := safeEventName(evt); name != "" {
-		attrs = append(attrs, slog.String("event", name))
-	}
-	if md, ok := MetadataFromContext(ctx); ok && md.ID != "" {
-		attrs = append(attrs, slog.String("event_id", md.ID))
-	}
-	attrs = append(attrs,
-		slog.String("panic", fmt.Sprint(r)),
-		slog.String("stack", string(pe.Stack)),
-	)
-	slog.LogAttrs(ctx, slog.LevelError, msg, attrs...)
-	return pe
 }
 
 // safeEventName returns evt.Name(), or "" for a nil event or one whose Name

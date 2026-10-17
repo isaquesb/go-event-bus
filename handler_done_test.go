@@ -200,10 +200,10 @@ func TestHandlerDone_RateLimitedNotDeferred(t *testing.T) {
 }
 
 func TestHandlerDone_Panic(t *testing.T) {
-	logs := fsCaptureLogs(t)
 	rec := &obsRecorder{}
 	bus := hdBus(t, rec, event.LocalBusOptions{DLQPublisher: event.NewMemoryDLQ()},
 		func(context.Context, event.Event) error { panic("hd: boom") })
+	logs := fsCaptureLogs(t) // after Subscribe, which logs a debug line
 
 	if _, err := bus.EmitSync(context.Background(), &hdEvent{}); err != nil {
 		t.Fatalf("EmitSync = %v, want nil for a dead-lettered panic", err)
