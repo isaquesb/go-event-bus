@@ -192,8 +192,17 @@ func (r *Retry) Invoke(
 		}
 
 		// Flow-control, dead-lettered and context errors are returned unchanged
-		// and are not attempts of the retry policy.
+		// and are not attempts of the retry policy. The one exception is a
+		// circuit that opens after real attempts ran: the rejected call is not an
+		// attempt and stays out of the history, but the attempts that did run
+		// are kept as a FailureError{circuit_open}, which still matches
+		// ErrCircuitOpen, so the DLQ record tells how many handler runs preceded
+		// the open circuit. On the first call nothing ran, and the error is
+		// returned unchanged.
 		if !retry {
+			if attempt > 1 && errors.Is(err, event.ErrCircuitOpen) {
+				return &event.FailureError{Cause: err, Reason: event.ReasonCircuitOpen, Attempts: attempt - 1, History: hist.items}
+			}
 			return err
 		}
 

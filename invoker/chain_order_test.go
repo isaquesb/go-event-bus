@@ -199,6 +199,66 @@ func TestChainOrder_FlowControlDeadLetteredOnlyOnFinal(t *testing.T) {
 	}
 }
 
+// The breaker opens after two real attempts of the same delivery. On the final
+// delivery the DLQ record keeps those attempts and their history; before the
+// final delivery nothing is dead-lettered and the error still matches
+// ErrCircuitOpen.
+func TestChainOrder_CircuitOpensMidRetryKeepsHistory(t *testing.T) {
+	newChain := func(pub invoker.DLQPublisher) *invoker.Chain {
+		return invoker.NewChain(
+			invoker.NewDLQ(pub),
+			invoker.NewRetry(invoker.RetryPolicy{MaxAttempts: 4, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}),
+			invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{FailureThreshold: 2, OpenTimeout: time.Minute}),
+		)
+	}
+	evt := &testEvent{name: "test.event"}
+	transient := errors.New("db down")
+
+	t.Run("final delivery", func(t *testing.T) {
+		pub := &dqPublisher{}
+		calls := 0
+
+		err := newChain(pub).Invoke(dqDelivery(3, 3), evt, "handler", coHandler(&calls, -1, transient))
+
+		if calls != 2 {
+			t.Errorf("handler calls = %d, want 2 (the open circuit stops the third)", calls)
+		}
+		if !errors.Is(err, event.ErrDeadLettered) {
+			t.Errorf("expected ErrDeadLettered, got %v", err)
+		}
+		recs := pub.records()
+		if len(recs) != 1 {
+			t.Fatalf("expected 1 DLQ record, got %d", len(recs))
+		}
+		rec := recs[0]
+		if rec.Reason != event.ReasonCircuitOpen || rec.Attempts != 2 || len(rec.History) != 2 {
+			t.Fatalf("record reason=%q attempts=%d history=%d, want circuit_open, 2 and 2",
+				rec.Reason, rec.Attempts, len(rec.History))
+		}
+		h := rec.FailureHeaders()
+		if h[event.HeaderDLQAttempts] != "2" {
+			t.Errorf("%s = %q, want 2", event.HeaderDLQAttempts, h[event.HeaderDLQAttempts])
+		}
+		if h[event.HeaderDLQHistory] == "" {
+			t.Errorf("%s is empty, want the two attempts", event.HeaderDLQHistory)
+		}
+	})
+
+	t.Run("not final delivery", func(t *testing.T) {
+		pub := &dqPublisher{}
+		calls := 0
+
+		err := newChain(pub).Invoke(dqDelivery(1, 3), evt, "handler", coHandler(&calls, -1, transient))
+
+		if !errors.Is(err, event.ErrCircuitOpen) {
+			t.Errorf("expected ErrCircuitOpen, got %v", err)
+		}
+		if n := len(pub.records()); n != 0 {
+			t.Errorf("expected no DLQ record before the final delivery, got %d", n)
+		}
+	})
+}
+
 // Idempotency sits outside DLQ, so its ErrInProgress never reaches the DLQ
 // invoker. The transport backstop (event.Settle) must dead-letter it on the
 // final delivery.

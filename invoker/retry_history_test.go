@@ -315,6 +315,7 @@ func TestRetryHistory_TerminalAfterTransient(t *testing.T) {
 	}
 }
 
+// First call, no attempt ran: ErrCircuitOpen is returned unchanged.
 func TestRetryHistory_FlowControlNoHistory(t *testing.T) {
 	rec := &invRecorder{}
 	ctx := event.WithObserver(context.Background(), rec)
@@ -334,5 +335,59 @@ func TestRetryHistory_FlowControlNoHistory(t *testing.T) {
 	}
 	if n := len(rec.Retries()); n != 0 {
 		t.Errorf("RetryAttempt signals = %d, want 0", n)
+	}
+}
+
+// The breaker opens after two real attempts: the error keeps the attempts that
+// ran and their history, and the rejected call is neither counted nor recorded.
+func TestRetryHistory_CircuitOpensMidRetry(t *testing.T) {
+	transient := errors.New("db down")
+
+	for _, tc := range []struct {
+		name        string
+		historySize int
+		wantNs      []int
+	}{
+		{"history on", 5, []int{1, 2}},
+		{"history off", -1, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			next := func(context.Context) error {
+				calls++
+				if calls <= 2 {
+					return transient
+				}
+				return event.ErrCircuitOpen
+			}
+
+			err := invoker.NewRetry(rhFast(5, tc.historySize)).Invoke(context.Background(), rhEvent{}, "h", next)
+
+			fe := rhFailureOf(t, err)
+			if fe.Attempts != 2 {
+				t.Errorf("Attempts = %d, want 2 (the rejected call is not an attempt)", fe.Attempts)
+			}
+			if got := rhNs(fe.History); !rhEqualInts(got, tc.wantNs) {
+				t.Errorf("History numbers = %v, want %v", got, tc.wantNs)
+			}
+			if tc.wantNs == nil && fe.History != nil {
+				t.Errorf("History = %+v, want nil when disabled", fe.History)
+			}
+			if calls != 3 {
+				t.Errorf("handler calls = %d, want 3", calls)
+			}
+			if !errors.Is(err, event.ErrCircuitOpen) {
+				t.Errorf("errors.Is(ErrCircuitOpen) = false for %v", err)
+			}
+			if errors.Is(err, event.ErrRetriesExhausted) {
+				t.Errorf("a mid-retry open circuit must not match ErrRetriesExhausted: %v", err)
+			}
+			if r := event.ReasonOf(err); r != event.ReasonCircuitOpen {
+				t.Errorf("ReasonOf = %q, want circuit_open", r)
+			}
+			if o := event.OutcomeOf(context.Background(), err); o != event.OutcomeCircuitOpen {
+				t.Errorf("OutcomeOf = %q, want circuit_open", o)
+			}
+		})
 	}
 }
