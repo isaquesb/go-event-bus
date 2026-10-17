@@ -102,14 +102,18 @@ type Bus struct {
 	shutdownTimeout time.Duration
 	subsMu          sync.Mutex
 	subs            []trackedSub
+	drained         chan struct{} // closed when the owner Shutdown ended the drain step; guarded by subsMu
 	closeOnce       sync.Once
 }
 
-// trackedSub is a NATS subscription Shutdown drains. done is closed by the
-// subscription closed handler, that is when the drain completed.
+// trackedSub is a NATS subscription Shutdown drains. drain starts the drain and
+// done is closed by the subscription closed handler, that is when the drain
+// completed. Shutdown never dereferences the subscription itself, so a test can
+// inject a tracked subscription with a controllable drain.
 type trackedSub struct {
-	sub  *nats.Subscription
-	done chan struct{}
+	subject string
+	drain   func() error
+	done    chan struct{}
 }
 
 var _ event.Shutdowner = (*Bus)(nil)
@@ -458,7 +462,7 @@ func (b *Bus) trackSub(sub *nats.Subscription) error {
 		}
 		return event.ErrBusClosed
 	}
-	b.subs = append(b.subs, trackedSub{sub: sub, done: done})
+	b.subs = append(b.subs, trackedSub{subject: sub.Subject, drain: sub.Drain, done: done})
 	return nil
 }
 
@@ -567,37 +571,85 @@ func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber)
 // dead-lettered), the connection is closed and ctx.Err() is returned. Messages
 // delivered afterwards are not run: they are reported as interrupted and a
 // SubscribeSync request gets an Eventbus-Error reply with reason interrupted.
-// Shutdown is safe to call more than once.
+//
+// Concurrent and repeated calls share one drain: the first caller owns it and a
+// later caller waits for it, bounded by its own ctx. A caller whose ctx expires
+// first interrupts the handlers, closes the connection and returns ctx.Err();
+// otherwise each caller returns nil once no handler is in flight. The connection
+// is never closed while a subscription is still draining unless a deadline forced
+// it.
 func (b *Bus) Shutdown(ctx context.Context) error {
 	b.life.BeginShutdown()
 
 	b.subsMu.Lock()
-	subs := b.subs
-	b.subs = nil
-	b.subsMu.Unlock()
+	if b.drained == nil {
+		// Owner: this caller drains the subscriptions.
+		drained := make(chan struct{})
+		b.drained = drained
+		subs := b.subs
+		b.subs = nil
+		b.subsMu.Unlock()
 
-	waiting := make([]trackedSub, 0, len(subs))
-	for _, ts := range subs {
-		if err := ts.sub.Drain(); err != nil {
-			// Already closed or draining: nothing to wait for.
-			slog.WarnContext(ctx, "nats subscription drain failed", "subject", ts.sub.Subject, "err", err)
-			continue
+		if err := b.drainSubs(ctx, subs, drained); err != nil {
+			return err
 		}
-		waiting = append(waiting, ts)
-	}
-	for _, ts := range waiting {
+	} else {
+		// Later caller: wait for the drain in progress.
+		drained := b.drained
+		b.subsMu.Unlock()
+
 		select {
-		case <-ts.done:
-		case <-ctx.Done():
-			b.life.Interrupt()
-			b.closeConn()
-			return ctx.Err()
+		case <-drained:
+		default:
+			select {
+			case <-drained:
+			case <-ctx.Done():
+				b.force()
+				return ctx.Err()
+			}
 		}
 	}
 
 	err := b.life.Wait(ctx)
 	b.closeConn()
 	return err
+}
+
+// drainSubs is the drain step of the owner Shutdown. It closes drained when it
+// ends, whatever the reason, so later callers go on. A forced shutdown by a
+// concurrent caller ends the wait without an error; an expired ctx forces the
+// shutdown and is returned.
+func (b *Bus) drainSubs(ctx context.Context, subs []trackedSub, drained chan struct{}) error {
+	defer close(drained)
+
+	waiting := make([]trackedSub, 0, len(subs))
+	for _, ts := range subs {
+		if err := ts.drain(); err != nil {
+			// Already closed or draining: nothing to wait for.
+			slog.WarnContext(ctx, "nats subscription drain failed", "subject", ts.subject, "err", err)
+			continue
+		}
+		waiting = append(waiting, ts)
+	}
+	forced := b.life.Context().Done()
+	for _, ts := range waiting {
+		select {
+		case <-ts.done:
+		case <-forced:
+			return nil
+		case <-ctx.Done():
+			b.force()
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// force interrupts the handlers and closes the connection: the forced path of a
+// Shutdown whose ctx expired.
+func (b *Bus) force() {
+	b.life.Interrupt()
+	b.closeConn()
 }
 
 // closeConn closes the connection once.

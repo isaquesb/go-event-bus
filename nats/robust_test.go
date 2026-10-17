@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -756,6 +757,112 @@ func TestNatsSync_PanicReplyPanicContained(t *testing.T) {
 		defer cancel()
 		if err := bus.Shutdown(sctx); err != nil {
 			t.Errorf("Shutdown = %v, want nil", err)
+		}
+	})
+}
+
+// --- concurrent Shutdown (WR-02) ---
+
+// wrTrack injects one tracked subscription into bus.subs, before any goroutine
+// starts. Its drain only counts calls; the test closes done to finish it.
+func wrTrack(bus *Bus) (done chan struct{}, drains *atomic.Int32) {
+	done = make(chan struct{})
+	drains = &atomic.Int32{}
+	bus.subs = append(bus.subs, trackedSub{
+		subject: "wr.sub",
+		drain:   func() error { drains.Add(1); return nil },
+		done:    done,
+	})
+	return done, drains
+}
+
+func TestNatsBus_ConcurrentShutdownWaitsForDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn := newRbConn()
+		bus := &Bus{nc: conn, reg: newMdRegistry(), timeout: time.Second}
+		done, drains := wrTrack(bus)
+
+		res := make(chan error, 3)
+		go func() { res <- bus.Shutdown(context.Background()) }()
+		synctest.Wait()
+		go func() { res <- bus.Shutdown(context.Background()) }()
+		synctest.Wait()
+
+		select {
+		case err := <-res:
+			t.Fatalf("a Shutdown returned %v while the subscription was draining", err)
+		default:
+		}
+		if n := drains.Load(); n != 1 {
+			t.Errorf("drain ran %d times, want 1", n)
+		}
+		if n := conn.closeCount(); n != 0 {
+			t.Errorf("conn closed %d times during the drain, want 0", n)
+		}
+
+		close(done)
+		for i := 0; i < 2; i++ {
+			if err := <-res; err != nil {
+				t.Errorf("Shutdown #%d = %v, want nil", i+1, err)
+			}
+		}
+		if n := conn.closeCount(); n != 1 {
+			t.Errorf("conn closed %d times, want 1", n)
+		}
+
+		go func() { res <- bus.Shutdown(context.Background()) }()
+		if err := <-res; err != nil {
+			t.Errorf("third Shutdown = %v, want nil", err)
+		}
+		if n := conn.closeCount(); n != 1 {
+			t.Errorf("conn closed %d times after the third Shutdown, want 1", n)
+		}
+		if n := drains.Load(); n != 1 {
+			t.Errorf("drain ran %d times in total, want 1", n)
+		}
+	})
+}
+
+func TestNatsBus_ConcurrentShutdownPeerDeadlineForces(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn := newRbConn()
+		reg := newMdRegistry("rb.order")
+		bus := &Bus{nc: conn, reg: reg, timeout: time.Second}
+		_, drains := wrTrack(bus) // never finishes
+		gate := newRbGate()
+		defer gate.open()
+		cbDone, cause := rbStuck(t, bus, conn, reg, gate)
+
+		owner := make(chan error, 1)
+		go func() { owner <- bus.Shutdown(context.Background()) }()
+		synctest.Wait()
+
+		peer := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			sctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			peer <- bus.Shutdown(sctx)
+		}()
+		if err := <-peer; !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("peer Shutdown = %v, want context.DeadlineExceeded", err)
+		}
+		if got := time.Since(start); got != time.Second {
+			t.Errorf("peer Shutdown took %v of fake time, want 1s", got)
+		}
+
+		rbWait(t, cbDone)
+		if got := cause(); !errors.Is(got, event.ErrShutdownInterrupted) {
+			t.Errorf("handler saw cause %v, want ErrShutdownInterrupted", got)
+		}
+		if err := <-owner; err != nil {
+			t.Errorf("owner Shutdown = %v, want nil", err)
+		}
+		if n := conn.closeCount(); n != 1 {
+			t.Errorf("conn closed %d times, want 1", n)
+		}
+		if n := drains.Load(); n != 1 {
+			t.Errorf("drain ran %d times, want 1", n)
 		}
 	})
 }
