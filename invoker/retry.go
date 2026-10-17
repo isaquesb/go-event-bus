@@ -225,7 +225,7 @@ func (r *Retry) Invoke(
 			Class:   class,
 			Err:     err,
 			Delay:   delay,
-			At:      started,
+			At:      started.Add(took),
 		})
 		if hist.enabled() {
 			hist.add(event.NewAttempt(attempt, err, class, started, took, delay))

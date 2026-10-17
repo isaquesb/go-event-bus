@@ -391,3 +391,34 @@ func TestRetryHistory_CircuitOpensMidRetry(t *testing.T) {
 		})
 	}
 }
+
+// RetryAttemptInfo.At is when the attempt failed (start plus duration), not
+// when it started.
+func TestRetry_AttemptAtIsFailureTime(t *testing.T) {
+	const work = 5 * time.Millisecond
+	rec := &invRecorder{}
+	ctx := event.WithObserver(context.Background(), rec)
+	before := time.Now()
+	calls := 0
+	next := func(context.Context) error {
+		calls++
+		time.Sleep(work)
+		return errors.New("transient")
+	}
+
+	err := invoker.NewRetry(rhFast(2, 5)).Invoke(ctx, rhEvent{}, "h", next)
+
+	fe := rhFailureOf(t, err)
+	retries := rec.Retries()
+	if len(retries) != 1 {
+		t.Fatalf("RetryAttempt signals = %d, want 1", len(retries))
+	}
+	at := retries[0].Val.At
+	if at.Before(before.Add(work)) {
+		t.Errorf("At = %v, want >= %v (start of the call plus the %v of work)", at, before.Add(work), work)
+	}
+	first := fe.History[0]
+	if d := at.Sub(first.Started.Add(first.Duration)); d < -time.Millisecond || d > time.Millisecond {
+		t.Errorf("At = %v, history Started+Duration = %v, differ by %v", at, first.Started.Add(first.Duration), d)
+	}
+}

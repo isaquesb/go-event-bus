@@ -477,3 +477,45 @@ func (e *eventWithBothKeys) IdempotencyKey() string { return e.idempotencyKey }
 // Verify that WithIdempotencyKey is checked before WithId
 var _ event.WithId = (*eventWithBothKeys)(nil)
 var _ invoker.WithIdempotencyKey = (*eventWithBothKeys)(nil)
+
+// The completed or failed record written after the handler keeps the StartedAt
+// of the processing marker; a fresh key must not end up with the zero time.
+func TestIdempotency_FinalRecordKeepsStartedAt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handle  func(context.Context) error
+		want    invoker.IdempotencyStatus
+		wantErr bool
+	}{
+		{"success", func(context.Context) error { return nil }, invoker.StatusCompleted, false},
+		{"failure", func(context.Context) error { return errors.New("boom") }, invoker.StatusFailed, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := invoker.NewMemoryIdempotencyStore()
+			inv := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
+			before := time.Now()
+
+			err := inv.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", tc.handle)
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Invoke error = %v, wantErr %v", err, tc.wantErr)
+			}
+			rec, ok, gerr := store.Get(context.Background(), "evt-1:handler")
+			if gerr != nil || !ok {
+				t.Fatalf("Get = %v, %v, %v, want a stored record", rec, ok, gerr)
+			}
+			if rec.Status != tc.want {
+				t.Fatalf("Status = %q, want %q", rec.Status, tc.want)
+			}
+			if rec.StartedAt.IsZero() {
+				t.Fatal("StartedAt is the zero time, want the start of the execution")
+			}
+			if rec.StartedAt.Before(before) {
+				t.Errorf("StartedAt = %v is before the call at %v", rec.StartedAt, before)
+			}
+			if rec.EndedAt == nil || rec.StartedAt.After(*rec.EndedAt) {
+				t.Errorf("StartedAt = %v, EndedAt = %v, want StartedAt <= EndedAt", rec.StartedAt, rec.EndedAt)
+			}
+		})
+	}
+}

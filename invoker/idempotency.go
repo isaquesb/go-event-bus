@@ -130,9 +130,11 @@ func (i *Idempotency) Invoke(
 		}
 	}
 
+	// started is kept by the processing marker and by the final record.
+	started := time.Now()
 	if err := i.store.Put(ctx, key, IdempotencyRecord{
 		Status:    StatusProcessing,
-		StartedAt: time.Now(),
+		StartedAt: started,
 	}); err != nil {
 		i.storeError(ctx, evt, handlerName, "put_processing", err)
 		return err
@@ -155,7 +157,7 @@ func (i *Idempotency) Invoke(
 	// the processing record to expire, and is reported as a StoreError.
 	if perr := i.store.Put(ctx, key, IdempotencyRecord{
 		Status:    status,
-		StartedAt: rec.StartedAt,
+		StartedAt: started,
 		EndedAt:   &now,
 	}); perr != nil {
 		i.storeError(ctx, evt, handlerName, op, perr)
