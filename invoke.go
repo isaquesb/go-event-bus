@@ -69,6 +69,14 @@ func (e *PanicError) Terminal() bool { return true }
 // (dead_lettered, dropped, retry or failed). Without a FailureScope the signal
 // is emitted at the end of the chain with outcome failed.
 //
+// A flow-control outcome (circuit_open, rate_limited or in_progress) is
+// deferred the same way on a final delivery, that is when ctx carries no
+// Delivery or Delivery.Final reports true: the message is lost there, so Settle
+// completes the signal with the settled outcome (dead_lettered, dropped, or
+// failed when the DLQ publish failed) and HandlerDone agrees with the single
+// Observer.Failure. On a non-final delivery the flow-control outcome is emitted
+// at once and means the message will be retried.
+//
 // The recover does not stop runtime.Goexit, so callers release their
 // accounting in a defer.
 func InvokeHandler(ctx context.Context, inv Invoker, evt Event, handlerName string, fn func(context.Context) error) (err error) {
@@ -86,7 +94,7 @@ func InvokeHandler(ctx context.Context, inv Invoker, evt Event, handlerName stri
 			Err:      err,
 			At:       time.Now().UTC(),
 		}
-		if r.Outcome == OutcomeFailed && scope.deferHandlerDone(r) {
+		if (r.Outcome == OutcomeFailed || (isFlowControl(r.Outcome) && finalDelivery(ctx))) && scope.deferHandlerDone(r) {
 			return
 		}
 		ObserverFromContext(ctx).HandlerDone(ctx, r)
@@ -108,6 +116,19 @@ func InvokeHandler(ctx context.Context, inv Invoker, evt Event, handlerName stri
 		return call(ctx)
 	}
 	return inv.Invoke(ctx, evt, handlerName, call)
+}
+
+// finalDelivery reports whether no redelivery follows: ctx carries no Delivery,
+// or its Delivery is final. It is the rule OutcomeOf applies.
+func finalDelivery(ctx context.Context) bool {
+	d, ok := DeliveryFromContext(ctx)
+	return !ok || d.Final()
+}
+
+// isFlowControl reports whether o is one of the outcomes of a message the chain
+// declined to run: in_progress, rate_limited or circuit_open.
+func isFlowControl(o Outcome) bool {
+	return o == OutcomeInProgress || o == OutcomeRateLimited || o == OutcomeCircuitOpen
 }
 
 // safeEventName returns evt.Name(), or "" for a nil event or one whose Name

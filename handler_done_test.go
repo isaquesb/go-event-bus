@@ -179,23 +179,95 @@ func TestHandlerDone_Duplicate(t *testing.T) {
 	}
 }
 
-func TestHandlerDone_RateLimitedNotDeferred(t *testing.T) {
-	rec := &obsRecorder{}
-	bus := hdBus(t, rec, event.LocalBusOptions{
-		Invoker:      &lfInvoker{err: event.ErrRateLimited},
-		DLQPublisher: event.NewMemoryDLQ(),
-	}, func(context.Context, event.Event) error { return nil })
+func TestHandlerDone_FlowControlFinalDelivery(t *testing.T) {
+	sentinels := []struct {
+		name string
+		err  error
+	}{
+		{"rate_limited", event.ErrRateLimited},
+		{"circuit_open", event.ErrCircuitOpen},
+		{"in_progress", event.ErrInProgress},
+	}
+	for _, s := range sentinels {
+		for _, withDLQ := range []bool{true, false} {
+			name := s.name + "/no_publisher"
+			want := event.OutcomeDropped
+			opts := event.LocalBusOptions{Invoker: &lfInvoker{err: s.err}}
+			if withDLQ {
+				name = s.name + "/dlq"
+				want = event.OutcomeDeadLettered
+				opts.DLQPublisher = event.NewMemoryDLQ()
+			}
+			t.Run(name, func(t *testing.T) {
+				rec := &obsRecorder{}
+				bus := hdBus(t, rec, opts, func(context.Context, event.Event) error { return nil })
 
-	if _, err := bus.EmitSync(context.Background(), &hdEvent{}); err != nil {
-		t.Fatalf("EmitSync = %v, want nil", err)
+				_, err := bus.EmitSync(context.Background(), &hdEvent{})
+				if withDLQ && err != nil {
+					t.Errorf("EmitSync = %v, want nil for a dead-lettered message", err)
+				}
+				if !withDLQ && !errors.Is(err, s.err) {
+					t.Errorf("EmitSync = %v, want %v for a dropped message", err, s.err)
+				}
+
+				d := hdOneDone(t, rec)
+				if d.Outcome != want {
+					t.Errorf("HandlerDone Outcome = %q, want %q", d.Outcome, want)
+				}
+				f := rec.Failures()
+				if len(f) != 1 {
+					t.Fatalf("Failure calls = %d (%+v), want exactly 1", len(f), f)
+				}
+				if f[0].Outcome != d.Outcome {
+					t.Errorf("Failure Outcome = %q, HandlerDone Outcome = %q, want them to agree", f[0].Outcome, d.Outcome)
+				}
+			})
+		}
+	}
+}
+
+func TestHandlerDone_FlowControlNonFinalNotDeferred(t *testing.T) {
+	rows := []struct {
+		name string
+		err  error
+		want event.Outcome
+	}{
+		{"circuit_open", event.ErrCircuitOpen, event.OutcomeCircuitOpen},
+		{"rate_limited", event.ErrRateLimited, event.OutcomeRateLimited},
+		{"in_progress", event.ErrInProgress, event.OutcomeInProgress},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			rec := &obsRecorder{}
+			ctx := event.WithDelivery(event.WithObserver(context.Background(), rec), event.Delivery{Count: 1, Max: 3})
+			ctx, _ = event.WithFailureScope(ctx)
+
+			err := event.InvokeHandler(ctx, &lfInvoker{err: row.err}, &hdEvent{}, "h", func(context.Context) error { return nil })
+			if !errors.Is(err, row.err) {
+				t.Fatalf("InvokeHandler = %v, want %v", err, row.err)
+			}
+
+			if d := hdOneDone(t, rec); d.Outcome != row.want {
+				t.Errorf("Outcome = %q, want %q emitted at once: the message will be retried", d.Outcome, row.want)
+			}
+			if f := rec.Failures(); len(f) != 0 {
+				t.Errorf("Failures = %+v, want none on a non-final delivery", f)
+			}
+		})
+	}
+}
+
+func TestHandlerDone_FlowControlNoScopeImmediate(t *testing.T) {
+	rec := &obsRecorder{}
+	ctx := event.WithObserver(context.Background(), rec)
+
+	err := event.InvokeHandler(ctx, &lfInvoker{err: event.ErrRateLimited}, &hdEvent{}, "h", func(context.Context) error { return nil })
+	if !errors.Is(err, event.ErrRateLimited) {
+		t.Fatalf("InvokeHandler = %v, want ErrRateLimited", err)
 	}
 
 	if d := hdOneDone(t, rec); d.Outcome != event.OutcomeRateLimited {
-		t.Errorf("Outcome = %q, want rate_limited (not replaced by the settled outcome)", d.Outcome)
-	}
-	f := rec.Failures()
-	if len(f) != 1 || f[0].Reason != event.ReasonRateLimited {
-		t.Errorf("Failures = %+v, want one with reason rate_limited", f)
+		t.Errorf("Outcome = %q, want rate_limited emitted at once without a FailureScope", d.Outcome)
 	}
 }
 
