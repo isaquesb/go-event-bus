@@ -3,11 +3,14 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 
 	event "github.com/isaquesb/go-event-bus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -127,7 +130,59 @@ func (i *TracerInvoker) Invoke(
 	return err
 }
 
-// replayLinks returns the span links and attributes of a replayed message.
-func replayLinks(event.Delivery) ([]trace.Link, []attribute.KeyValue) {
-	return nil, nil
+// replayLinks builds the span links and attributes of a replayed message from
+// the Eventbus-Replay-* delivery headers. Header names match case-insensitively
+// and an invalid traceparent is ignored, so a forged header cannot break the
+// handler. The parent of the span stays the producer trace already in ctx.
+func replayLinks(d event.Delivery) ([]trace.Link, []attribute.KeyValue) {
+	if len(d.Headers) == 0 {
+		return nil, nil
+	}
+	failed, hasFailed := headerValue(d.Headers, event.HeaderReplayFailedTraceparent)
+	replay, hasReplay := headerValue(d.Headers, event.HeaderReplayTraceparent)
+	seq, hasSeq := headerValue(d.Headers, event.HeaderReplayDLQSequence)
+	if !hasFailed && !hasReplay && !hasSeq {
+		return nil, nil
+	}
+
+	var links []trace.Link
+	if sc, ok := parseTraceparent(failed); ok {
+		links = append(links, trace.Link{
+			SpanContext: sc,
+			Attributes:  []attribute.KeyValue{attribute.String(AttrLinkType, linkTypeDeadLetter)},
+		})
+	}
+	if sc, ok := parseTraceparent(replay); ok {
+		links = append(links, trace.Link{
+			SpanContext: sc,
+			Attributes:  []attribute.KeyValue{attribute.String(AttrLinkType, linkTypeReplay)},
+		})
+	}
+	attrs := []attribute.KeyValue{attribute.Bool(AttrReplayed, true)}
+	if n, err := strconv.ParseUint(strings.TrimSpace(seq), 10, 64); err == nil {
+		attrs = append(attrs, attribute.Int64(AttrDLQSequence, int64(n)))
+	}
+	return links, attrs
+}
+
+// headerValue returns the first value of the header name, matched
+// case-insensitively.
+func headerValue(h map[string][]string, name string) (string, bool) {
+	for k, v := range h {
+		if strings.EqualFold(k, name) && len(v) > 0 {
+			return v[0], true
+		}
+	}
+	return "", false
+}
+
+// parseTraceparent extracts a valid remote span context from a W3C traceparent
+// value.
+func parseTraceparent(value string) (trace.SpanContext, bool) {
+	if value == "" {
+		return trace.SpanContext{}, false
+	}
+	ctx := propagation.TraceContext{}.Extract(context.Background(), propagation.MapCarrier{"traceparent": value})
+	sc := trace.SpanContextFromContext(ctx)
+	return sc, sc.IsValid()
 }
