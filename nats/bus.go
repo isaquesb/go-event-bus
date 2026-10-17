@@ -40,7 +40,10 @@ type BusOptions struct {
 	// DecodeFailed, DLQPublishFailed and InternalError. It is configured once
 	// here and travels in the handler ctx. Nil means event.NewSlogObserver(nil),
 	// so failures are never silent; event.NopObserver{} silences the bus. The bus
-	// wraps it with event.MultiObserver, which isolates its panics.
+	// wraps it with event.MultiObserver, which isolates its panics. The bus
+	// flushes only the default observer it created, at the end of Shutdown (and
+	// so of Close), so a pending dedup summary with its suppressed count is
+	// logged; an Observer supplied here is never flushed by the bus.
 	Observer event.Observer
 	// TracerProvider creates the producer spans of Emit and EmitSync. Nil means
 	// the global provider (otel.GetTracerProvider), resolved at call time.
@@ -83,8 +86,10 @@ func newBus(nc natsConn, reg event.Registry, opts BusOptions) *Bus {
 	}
 
 	obs := opts.Observer
+	var defaultLog *event.SlogObserver
 	if obs == nil {
-		obs = event.NewSlogObserver(nil)
+		defaultLog = event.NewSlogObserver(nil)
+		obs = defaultLog
 	}
 
 	return &Bus{
@@ -93,9 +98,11 @@ func newBus(nc natsConn, reg event.Registry, opts BusOptions) *Bus {
 		timeout:  opts.RequestTimeout,
 		invoker:  opts.Invoker,
 		observer: event.MultiObserver(obs),
-		tp:       opts.TracerProvider,
-		idGen:    opts.IDGenerator,
-		inherit:  slices.Clone(opts.InheritHeaders),
+		// defaultLog is the observer this bus created itself; Shutdown flushes it.
+		defaultLog: defaultLog,
+		tp:         opts.TracerProvider,
+		idGen:      opts.IDGenerator,
+		inherit:    slices.Clone(opts.InheritHeaders),
 
 		dlq:         opts.DLQPublisher,
 		replyErrMsg: opts.ReplyErrorMessage,
@@ -116,6 +123,10 @@ type Bus struct {
 	// observer is the configured bus Observer, installed in every handler ctx.
 	// nil (a struct-literal bus) means event.NopObserver{}, see obs.
 	observer event.Observer
+	// defaultLog is the SlogObserver the bus created because BusOptions.Observer
+	// was nil; nil when the caller supplied an Observer (the bus never flushes
+	// that one) or for a struct-literal bus. Shutdown flushes it.
+	defaultLog *event.SlogObserver
 	// tp creates the producer spans; nil means the global provider.
 	tp trace.TracerProvider
 
@@ -394,7 +405,7 @@ func (b *Bus) Subscribe(
 	if err != nil {
 		return err
 	}
-	return b.trackSub(sub)
+	return b.trackSub(ctx, sub)
 }
 
 // SubscribeSync registers a handler that responds synchronously to requests.
@@ -485,7 +496,7 @@ func (b *Bus) SubscribeSync(
 	if err != nil {
 		return err
 	}
-	return b.trackSub(sub)
+	return b.trackSub(ctx, sub)
 }
 
 // recoverCallback is deferred by the Subscribe and SubscribeSync callbacks. The
@@ -530,8 +541,9 @@ func (b *Bus) recoverCallback(ctx context.Context, msg *nats.Msg, handlerName st
 // trackSub registers sub for the drain Shutdown runs. A nil sub (a test mock)
 // is not tracked and never dereferenced. When Shutdown began between the
 // Subscribe call and the registration the subscription is dropped and
-// event.ErrBusClosed is returned.
-func (b *Bus) trackSub(sub *nats.Subscription) error {
+// event.ErrBusClosed is returned. A failing Unsubscribe in that case is reported
+// as an InternalError signal (Op unsubscribe) on the Subscribe ctx.
+func (b *Bus) trackSub(ctx context.Context, sub *nats.Subscription) error {
 	if sub == nil {
 		return nil
 	}
@@ -543,7 +555,7 @@ func (b *Bus) trackSub(sub *nats.Subscription) error {
 	defer b.subsMu.Unlock()
 	if b.life.Closing() {
 		if err := sub.Unsubscribe(); err != nil {
-			slog.Warn("nats unsubscribe after close failed", "subject", sub.Subject, "err", err)
+			b.internalError(ctx, event.OpUnsubscribe, "", sub.Subject, err)
 		}
 		return event.ErrBusClosed
 	}
@@ -673,7 +685,22 @@ func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber)
 // otherwise each caller returns nil once no handler is in flight. The connection
 // is never closed while a subscription is still draining unless a deadline forced
 // it.
+//
+// When BusOptions.Observer is nil, Shutdown flushes the default SlogObserver the
+// bus created, on every return path, so a pending dedup summary with its
+// suppressed count is logged. An Observer supplied by the caller is never
+// flushed by the bus: it owns its Flush.
 func (b *Bus) Shutdown(ctx context.Context) error {
+	err := b.shutdown(ctx)
+	if b.defaultLog != nil {
+		b.defaultLog.Flush()
+	}
+	return err
+}
+
+// shutdown is the Shutdown body, without the final flush of the default
+// observer.
+func (b *Bus) shutdown(ctx context.Context) error {
 	b.life.BeginShutdown()
 
 	b.subsMu.Lock()
@@ -721,7 +748,7 @@ func (b *Bus) drainSubs(ctx context.Context, subs []trackedSub, drained chan str
 	for _, ts := range subs {
 		if err := ts.drain(); err != nil {
 			// Already closed or draining: nothing to wait for.
-			slog.WarnContext(ctx, "nats subscription drain failed", "subject", ts.subject, "err", err)
+			b.internalError(ctx, event.OpDrain, "", ts.subject, err)
 			continue
 		}
 		waiting = append(waiting, ts)

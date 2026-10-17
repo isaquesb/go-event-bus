@@ -73,7 +73,10 @@ type BusOptions struct {
 	// InternalError. It is configured once here and travels in the handler ctx.
 	// Nil means event.NewSlogObserver(nil), so failures are never silent;
 	// event.NopObserver{} silences the bus. The bus wraps it with
-	// event.MultiObserver, which isolates its panics.
+	// event.MultiObserver, which isolates its panics. The bus flushes only the
+	// default observer it created, at the end of Shutdown (and so of Close), so a
+	// pending dedup summary with its suppressed count is logged; an Observer
+	// supplied here is never flushed by the bus.
 	Observer event.Observer
 
 	// TracerProvider creates the producer spans of Emit. Nil means the global
@@ -128,6 +131,10 @@ type Bus struct {
 	// observer is the configured bus Observer, installed in every handler ctx.
 	// nil (a struct-literal bus) means event.NopObserver{}, see obs.
 	observer event.Observer
+	// defaultLog is the SlogObserver the bus created because BusOptions.Observer
+	// was nil; nil when the caller supplied an Observer (the bus never flushes
+	// that one) or for a struct-literal bus. Shutdown flushes it.
+	defaultLog *event.SlogObserver
 	// tp creates the producer spans; nil means the global provider.
 	tp trace.TracerProvider
 
@@ -180,10 +187,13 @@ func NewBus(
 		opts.ShutdownTimeout = event.DefaultShutdownTimeout
 	}
 	obs := opts.Observer
+	var defaultLog *event.SlogObserver
 	if obs == nil {
-		obs = event.NewSlogObserver(nil)
+		defaultLog = event.NewSlogObserver(nil)
+		obs = defaultLog
 	}
 	return &Bus{
+		defaultLog:       defaultLog,
 		pubRetry:         opts.PublishRetry.normalized(),
 		shutdownTimeout:  opts.ShutdownTimeout,
 		js:               js,
@@ -509,7 +519,22 @@ func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber)
 // event.ErrShutdownInterrupted (their messages are Naked, never dead-lettered)
 // and returns ctx.Err(); the other callers then stop waiting. Otherwise each
 // caller returns nil once no handler is in flight.
+//
+// When BusOptions.Observer is nil, Shutdown flushes the default SlogObserver the
+// bus created, on every return path, so a pending dedup summary with its
+// suppressed count is logged. An Observer supplied by the caller is never
+// flushed by the bus: it owns its Flush.
 func (b *Bus) Shutdown(ctx context.Context) error {
+	err := b.shutdown(ctx)
+	if b.defaultLog != nil {
+		b.defaultLog.Flush()
+	}
+	return err
+}
+
+// shutdown is the Shutdown body, without the final flush of the default
+// observer.
+func (b *Bus) shutdown(ctx context.Context) error {
 	b.life.BeginShutdown()
 
 	b.mu.Lock()

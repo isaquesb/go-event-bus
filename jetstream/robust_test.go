@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -1086,4 +1087,174 @@ func TestJetStreamBus_ConcurrentShutdownPeerDeadlineForces(t *testing.T) {
 			t.Errorf("Drain/Stop calls = %d/%d, want 1/1", drains, stops)
 		}
 	})
+}
+
+// --- default observer flush (D-25 WR-05) ---
+
+// dcLog is one captured slog record.
+type dcLog struct {
+	msg   string
+	attrs map[string]any
+}
+
+// dcCapture is a minimal slog.Handler recording every record with its attrs.
+type dcCapture struct {
+	mu   *sync.Mutex
+	recs *[]dcLog
+}
+
+func newDcCapture() dcCapture { return dcCapture{mu: &sync.Mutex{}, recs: &[]dcLog{}} }
+
+func (c dcCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c dcCapture) Handle(_ context.Context, r slog.Record) error {
+	rec := dcLog{msg: r.Message, attrs: map[string]any{}}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	c.mu.Lock()
+	*c.recs = append(*c.recs, rec)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c dcCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c dcCapture) WithGroup(string) slog.Handler      { return c }
+
+func (c dcCapture) records() []dcLog {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]dcLog(nil), *c.recs...)
+}
+
+// dcInstallDefault installs a capturing default logger until the test ends. A
+// test that uses it must not run in parallel.
+func dcInstallDefault(t *testing.T) dcCapture {
+	t.Helper()
+	c := newDcCapture()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(c))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return c
+}
+
+// dcSummaries returns the dedup summary records of capt.
+func dcSummaries(capt dcCapture) []dcLog {
+	var out []dcLog
+	for _, r := range capt.records() {
+		if r.msg == "eventbus: repeated log records suppressed" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// dcThreeDropsBus builds a bus through NewBus (so a nil Observer gets the
+// default SlogObserver) with a subscription whose handler fails terminally, and
+// delivers the same message three times: the log dedup holds one record and
+// counts two suppressed. The consumer is returned to be finished by the caller.
+func dcThreeDropsBus(t *testing.T, opts BusOptions) (*Bus, *rbConsumer) {
+	t.Helper()
+	cons := &rbConsumer{cc: newRbConsumeCtx()}
+	js := &rbJS{cons: cons}
+	opts.DLQPublisher = event.NewMemoryDLQ()
+	bus := NewBus(js, newMdRegistry("rb.order"), opts)
+	err := bus.Subscribe(context.Background(), "rb.order", joTerminalFn,
+		event.WithStream("S"),
+		event.WithConsumer("C"),
+		event.WithMaxDeliver(3),
+		event.WithBackOff([]time.Duration{time.Second}),
+	)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if err := bus.Emit(context.Background(), &mdEvent{name: "rb.order"}, event.WithID("id-dc")); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	payload := js.payload(t, 0).data
+	for i := 0; i < 3; i++ {
+		cons.handler(&mdMsg{data: payload, numDelivered: 1, subject: "rb.order"})
+	}
+	return bus, cons
+}
+
+// dcCheckSummary asserts the flush logged the dedup summary of the Failure
+// signal with suppressed 2. A dead-lettered message also dedups its DeadLettered
+// signal, so only the failure summary is selected.
+func dcCheckSummary(t *testing.T, capt dcCapture) {
+	t.Helper()
+	var sums []dcLog
+	for _, r := range dcSummaries(capt) {
+		if r.attrs["signal"] == "failure" {
+			sums = append(sums, r)
+		}
+	}
+	if len(sums) != 1 {
+		t.Fatalf("failure summary records = %d, want 1: %+v", len(sums), capt.records())
+	}
+	if got := sums[0].attrs["suppressed"]; got != int64(2) {
+		t.Errorf("summary suppressed = %v, want 2", got)
+	}
+}
+
+// TestJetStreamBus_ShutdownFlushesDefaultObserver: the default SlogObserver of a
+// bus built without Observer logs its pending dedup summary on Shutdown and
+// Close (WR-05).
+func TestJetStreamBus_ShutdownFlushesDefaultObserver(t *testing.T) {
+	for _, closeIt := range []bool{false, true} {
+		name := "Shutdown"
+		if closeIt {
+			name = "Close"
+		}
+		t.Run(name, func(t *testing.T) {
+			capt := dcInstallDefault(t)
+			bus, cons := dcThreeDropsBus(t, BusOptions{})
+			cons.cc.finish()
+
+			if n := len(dcSummaries(capt)); n != 0 {
+				t.Fatalf("summaries before Shutdown = %d, want 0", n)
+			}
+			var err error
+			if closeIt {
+				err = bus.Close()
+			} else {
+				err = bus.Shutdown(context.Background())
+			}
+			if err != nil {
+				t.Fatalf("%s = %v", name, err)
+			}
+			dcCheckSummary(t, capt)
+		})
+	}
+}
+
+// TestJetStreamBus_ShutdownFlushesOnExpiredContext: the flush also runs when the
+// consumer does not close before the Shutdown ctx expires.
+func TestJetStreamBus_ShutdownFlushesOnExpiredContext(t *testing.T) {
+	capt := dcInstallDefault(t)
+	bus, cons := dcThreeDropsBus(t, BusOptions{})
+	defer cons.cc.finish()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := bus.Shutdown(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Shutdown = %v, want context.Canceled", err)
+	}
+	dcCheckSummary(t, capt)
+}
+
+// TestJetStreamBus_ShutdownLeavesUserObserver: an Observer supplied by the
+// caller is never flushed by the bus.
+func TestJetStreamBus_ShutdownLeavesUserObserver(t *testing.T) {
+	capt := newDcCapture()
+	bus, cons := dcThreeDropsBus(t, BusOptions{Observer: event.NewSlogObserver(slog.New(capt))})
+	cons.cc.finish()
+
+	if err := bus.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown = %v", err)
+	}
+	if n := len(dcSummaries(capt)); n != 0 {
+		t.Errorf("summaries after Shutdown = %d, want 0: the bus does not flush a user observer", n)
+	}
 }

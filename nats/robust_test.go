@@ -3,6 +3,7 @@ package nats
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1031,4 +1032,234 @@ func TestNatsBus_PanicDuringShutdownLoggedBeforeReturn(t *testing.T) {
 			t.Errorf("conn closed %d times, want 1", n)
 		}
 	})
+}
+
+// --- drain/unsubscribe InternalError and default observer flush (D-25 WR-04, WR-05) ---
+
+// dcLog is one captured slog record.
+type dcLog struct {
+	msg   string
+	attrs map[string]any
+}
+
+// dcCapture is a minimal slog.Handler recording every record with its attrs.
+type dcCapture struct {
+	mu   *sync.Mutex
+	recs *[]dcLog
+}
+
+func newDcCapture() dcCapture { return dcCapture{mu: &sync.Mutex{}, recs: &[]dcLog{}} }
+
+func (c dcCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c dcCapture) Handle(_ context.Context, r slog.Record) error {
+	rec := dcLog{msg: r.Message, attrs: map[string]any{}}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	c.mu.Lock()
+	*c.recs = append(*c.recs, rec)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c dcCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c dcCapture) WithGroup(string) slog.Handler      { return c }
+
+func (c dcCapture) records() []dcLog {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]dcLog(nil), *c.recs...)
+}
+
+// dcInstallDefault installs a capturing default logger until the test ends. A
+// test that uses it must not run in parallel.
+func dcInstallDefault(t *testing.T) dcCapture {
+	t.Helper()
+	c := newDcCapture()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(c))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return c
+}
+
+// dcSummaries returns the dedup summary records of capt.
+func dcSummaries(capt dcCapture) []dcLog {
+	var out []dcLog
+	for _, r := range capt.records() {
+		if r.msg == "eventbus: repeated log records suppressed" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func TestNatsBus_DrainFailureIsInternalError(t *testing.T) {
+	capt := dcInstallDefault(t)
+	rec := &noRecorder{}
+	bus := &Bus{nc: newRbConn(), reg: newMdRegistry("dc.order"), timeout: time.Second, observer: rec}
+	bus.subs = append(bus.subs, trackedSub{
+		subject: "dc.sub",
+		drain:   func() error { return errors.New("dc: drain boom") },
+		done:    make(chan struct{}),
+	})
+
+	if err := bus.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown = %v, want nil", err)
+	}
+	ies := rec.internalErrors()
+	if len(ies) != 1 {
+		t.Fatalf("InternalError calls = %d, want 1: %+v", len(ies), ies)
+	}
+	if ies[0].Op != event.OpDrain || ies[0].Subject != "dc.sub" || ies[0].Component != event.ComponentTransport {
+		t.Errorf("InternalError = %+v, want Op %q on subject dc.sub", ies[0], event.OpDrain)
+	}
+	if ies[0].Err == nil {
+		t.Error("InternalError.Err = nil")
+	}
+	if n := len(capt.records()); n != 0 {
+		t.Errorf("direct slog records = %d, want 0: %+v", n, capt.records())
+	}
+}
+
+func TestNatsBus_DrainFailureSilencedByNopObserver(t *testing.T) {
+	capt := dcInstallDefault(t)
+	bus := &Bus{nc: newRbConn(), reg: newMdRegistry("dc.order"), timeout: time.Second, observer: event.NopObserver{}}
+	bus.subs = append(bus.subs, trackedSub{
+		subject: "dc.sub",
+		drain:   func() error { return errors.New("dc: drain boom") },
+		done:    make(chan struct{}),
+	})
+
+	if err := bus.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown = %v, want nil", err)
+	}
+	if recs := capt.records(); len(recs) != 0 {
+		t.Errorf("slog records with NopObserver = %+v, want none", recs)
+	}
+}
+
+func TestNatsBus_UnsubscribeAfterCloseIsInternalError(t *testing.T) {
+	capt := dcInstallDefault(t)
+	rec := &noRecorder{}
+	bus := &Bus{nc: newRbConn(), reg: newMdRegistry("dc.order"), timeout: time.Second, observer: rec}
+	bus.life.BeginShutdown()
+
+	// A subscription with no connection: Unsubscribe fails with a connection error.
+	sub := &natsgo.Subscription{Subject: "dc.late"}
+	if err := bus.trackSub(context.Background(), sub); !errors.Is(err, event.ErrBusClosed) {
+		t.Fatalf("trackSub = %v, want event.ErrBusClosed", err)
+	}
+	ies := rec.internalErrors()
+	if len(ies) != 1 {
+		t.Fatalf("InternalError calls = %d, want 1: %+v", len(ies), ies)
+	}
+	if ies[0].Op != event.OpUnsubscribe || ies[0].Subject != "dc.late" || ies[0].Err == nil {
+		t.Errorf("InternalError = %+v, want Op %q on subject dc.late with an error", ies[0], event.OpUnsubscribe)
+	}
+	if n := len(capt.records()); n != 0 {
+		t.Errorf("direct slog records = %d, want 0: %+v", n, capt.records())
+	}
+}
+
+// dcThreeDrops delivers the same terminal failure three times.
+func dcThreeDrops(t *testing.T, conn *fsLoopConn, reg *mdRegistry) {
+	t.Helper()
+	for i := 0; i < 3; i++ {
+		conn.deliver(t, "dc.order", fsRequestBytes(t, reg, "dc.order"))
+	}
+}
+
+func dcCheckSummary(t *testing.T, capt dcCapture) {
+	t.Helper()
+	sums := dcSummaries(capt)
+	if len(sums) != 1 {
+		t.Fatalf("summary records = %d, want 1: %+v", len(sums), capt.records())
+	}
+	if got := sums[0].attrs["suppressed"]; got != int64(2) {
+		t.Errorf("summary suppressed = %v, want 2", got)
+	}
+}
+
+// TestNatsBus_ShutdownFlushesDefaultObserver: the default SlogObserver of a bus
+// built without Observer logs its pending dedup summary on Shutdown and Close
+// (WR-05).
+func TestNatsBus_ShutdownFlushesDefaultObserver(t *testing.T) {
+	for _, closeIt := range []bool{false, true} {
+		name := "Shutdown"
+		if closeIt {
+			name = "Close"
+		}
+		t.Run(name, func(t *testing.T) {
+			capt := dcInstallDefault(t)
+			conn := newFsLoopConn()
+			reg := newMdRegistry("dc.order")
+			bus := newBus(conn, reg, BusOptions{})
+			if err := bus.Subscribe(context.Background(), "dc.order", noTerminalHandler, event.WithHandlerName("h")); err != nil {
+				t.Fatalf("Subscribe: %v", err)
+			}
+			dcThreeDrops(t, conn, reg)
+
+			if n := len(dcSummaries(capt)); n != 0 {
+				t.Fatalf("summaries before Shutdown = %d, want 0", n)
+			}
+			var err error
+			if closeIt {
+				err = bus.Close()
+			} else {
+				err = bus.Shutdown(context.Background())
+			}
+			if err != nil {
+				t.Fatalf("%s = %v", name, err)
+			}
+			dcCheckSummary(t, capt)
+		})
+	}
+}
+
+// TestNatsBus_ShutdownFlushesOnExpiredContext: the flush also runs when the
+// Shutdown ctx has already expired.
+func TestNatsBus_ShutdownFlushesOnExpiredContext(t *testing.T) {
+	capt := dcInstallDefault(t)
+	conn := newFsLoopConn()
+	reg := newMdRegistry("dc.order")
+	bus := newBus(conn, reg, BusOptions{})
+	if err := bus.Subscribe(context.Background(), "dc.order", noTerminalHandler, event.WithHandlerName("h")); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	dcThreeDrops(t, conn, reg)
+	// A tracked subscription that never finishes draining forces the ctx path.
+	bus.subs = append(bus.subs, trackedSub{
+		subject: "dc.stuck",
+		drain:   func() error { return nil },
+		done:    make(chan struct{}),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := bus.Shutdown(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Shutdown = %v, want context.Canceled", err)
+	}
+	dcCheckSummary(t, capt)
+}
+
+// TestNatsBus_ShutdownLeavesUserObserver: an Observer supplied by the caller is
+// never flushed by the bus.
+func TestNatsBus_ShutdownLeavesUserObserver(t *testing.T) {
+	capt := newDcCapture()
+	conn := newFsLoopConn()
+	reg := newMdRegistry("dc.order")
+	bus := newBus(conn, reg, BusOptions{Observer: event.NewSlogObserver(slog.New(capt))})
+	if err := bus.Subscribe(context.Background(), "dc.order", noTerminalHandler, event.WithHandlerName("h")); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	dcThreeDrops(t, conn, reg)
+
+	if err := bus.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown = %v", err)
+	}
+	if n := len(dcSummaries(capt)); n != 0 {
+		t.Errorf("summaries after Shutdown = %d, want 0: the bus does not flush a user observer", n)
+	}
 }
