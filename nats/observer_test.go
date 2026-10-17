@@ -204,6 +204,16 @@ type noRow struct {
 	want    noWant
 }
 
+// isFlowControlReason reports whether reason is one of the flow-control reasons
+// whose HandlerDone is deferred to the settled outcome on a final delivery.
+func isFlowControlReason(reason string) bool {
+	switch reason {
+	case event.ReasonRateLimited, event.ReasonCircuitOpen, event.ReasonInProgress:
+		return true
+	}
+	return false
+}
+
 func noOK(context.Context, event.Event) error { return nil }
 
 func noPanic(context.Context, event.Event) error { panic("no: handler boom") }
@@ -211,7 +221,7 @@ func noPanic(context.Context, event.Event) error { panic("no: handler boom") }
 func noTerminalHandler(context.Context, event.Event) error { return &noTerminal{msg: "no: terminal"} }
 
 func noMatrixRows() []noRow {
-	return []noRow{
+	rows := []noRow{
 		{
 			name: "success", handler: noOK,
 			want: noWant{dones: 1, doneResult: event.OutcomeOK},
@@ -257,6 +267,42 @@ func noMatrixRows() []noRow {
 			},
 		},
 	}
+	return append(rows, noFlowControlRows()...)
+}
+
+// noFlowControlRows pins D-22 on NATS Core, where every delivery is the final
+// one: a rate_limited, circuit_open or in_progress handler result is lost, so
+// the single Failure and the HandlerDone carry the same settled outcome
+// (dropped without a DLQ publisher, dead_lettered with one).
+func noFlowControlRows() []noRow {
+	var rows []noRow
+	for _, fc := range []struct {
+		name   string
+		err    error
+		reason string
+	}{
+		{"rate limited", event.ErrRateLimited, event.ReasonRateLimited},
+		{"circuit open", event.ErrCircuitOpen, event.ReasonCircuitOpen},
+		{"in progress", event.ErrInProgress, event.ReasonInProgress},
+	} {
+		rows = append(rows,
+			noRow{
+				name: fc.name + " dropped without publisher", handler: noOK, inv: fsInvoker{err: fc.err},
+				want: noWant{
+					fails: 1, outcome: event.OutcomeDropped, reason: fc.reason, hasEvent: true, handler: "h",
+					dones: 1, doneResult: event.OutcomeDropped, replyCode: fc.reason,
+				},
+			},
+			noRow{
+				name: fc.name + " dead lettered", handler: noOK, dlq: event.NewMemoryDLQ(), inv: fsInvoker{err: fc.err},
+				want: noWant{
+					fails: 1, outcome: event.OutcomeDeadLettered, reason: fc.reason, hasEvent: true, handler: "h",
+					dones: 1, doneResult: event.OutcomeDeadLettered, replyCode: fc.reason,
+				},
+			},
+		)
+	}
+	return rows
 }
 
 // noRun delivers one message for row through Subscribe (sync false) or
@@ -338,6 +384,11 @@ func TestNatsObserver_FailureMatrix(t *testing.T) {
 				}
 				if w.dones == 1 && dones[0].Outcome != w.doneResult {
 					t.Errorf("HandlerDone outcome = %q, want %q", dones[0].Outcome, w.doneResult)
+				}
+				// D-22: a flow-control loss on the final (only) delivery reports the
+				// same settled outcome on the Failure and on the HandlerDone.
+				if w.fails == 1 && w.dones == 1 && isFlowControlReason(w.reason) && dones[0].Outcome != fails[0].Outcome {
+					t.Errorf("HandlerDone outcome = %q, Failure outcome = %q, want them equal (D-22)", dones[0].Outcome, fails[0].Outcome)
 				}
 
 				decodes := rec.decodeFailures()

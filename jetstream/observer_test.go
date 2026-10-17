@@ -370,6 +370,16 @@ func joDeliver(t *testing.T, rec *joRecorder, reg event.Registry, opts BusOption
 	return msg
 }
 
+// joFlowControlReason reports whether reason is one of the flow-control reasons
+// whose HandlerDone is deferred to the settled outcome on a final delivery.
+func joFlowControlReason(reason string) bool {
+	switch reason {
+	case event.ReasonRateLimited, event.ReasonCircuitOpen, event.ReasonInProgress:
+		return true
+	}
+	return false
+}
+
 func joReg() event.Registry { return newMdRegistry("jo.order") }
 
 func joTransient(context.Context, event.Event) error { return errors.New("jo: transient") }
@@ -377,7 +387,7 @@ func joTransient(context.Context, event.Event) error { return errors.New("jo: tr
 func joTerminalFn(context.Context, event.Event) error { return &joTerminal{msg: "jo: terminal"} }
 
 func joMatrixRows() []joRow {
-	return []joRow{
+	rows := []joRow{
 		{
 			name: "transient, delivery 1 of 3",
 			run: func(t *testing.T, rec *joRecorder) *mdMsg {
@@ -524,6 +534,66 @@ func joMatrixRows() []joRow {
 			},
 		},
 	}
+	return append(rows, joFlowControlRows()...)
+}
+
+// joFlowControlRows pins D-22 on JetStream. On the final delivery (3 of 3) a
+// rate_limited, circuit_open or in_progress handler result is lost: the single
+// Failure and the HandlerDone carry the same settled outcome (dropped without a
+// DLQ publisher, dead_lettered with one, termed only after the dead-letter). On
+// a non-final delivery (1 of 3) the message is NakWithDelayed, no Failure fires
+// and HandlerDone keeps the flow-control outcome.
+func joFlowControlRows() []joRow {
+	var rows []joRow
+	for _, fc := range []struct {
+		name    string
+		err     error
+		reason  string
+		outcome event.Outcome
+	}{
+		{"rate limited", event.ErrRateLimited, event.ReasonRateLimited, event.OutcomeRateLimited},
+		{"circuit open", event.ErrCircuitOpen, event.ReasonCircuitOpen, event.OutcomeCircuitOpen},
+		{"in progress", event.ErrInProgress, event.ReasonInProgress, event.OutcomeInProgress},
+	} {
+		run := func(opts BusOptions, delivered uint64) func(t *testing.T, rec *joRecorder) *mdMsg {
+			return func(t *testing.T, rec *joRecorder) *mdMsg {
+				opts.Invoker = joInvoker{err: fc.err}
+				return joDeliver(t, rec, joReg(), opts, delivered, joThree,
+					func(context.Context, event.Event) error { return nil })
+			}
+		}
+		rows = append(rows,
+			joRow{
+				name: fc.name + ", final delivery dead-letters",
+				run:  run(BusOptions{DLQPublisher: event.NewMemoryDLQ()}, 3),
+				want: joWant{
+					termReasons: []string{"dead_lettered: " + fc.reason},
+					fails:       1, outcome: event.OutcomeDeadLettered, reason: fc.reason, hasEvent: true,
+					dones: 1, doneOutcome: event.OutcomeDeadLettered,
+				},
+			},
+			joRow{
+				name: fc.name + ", final delivery without publisher is dropped",
+				run:  run(BusOptions{}, 3),
+				want: joWant{
+					termReasons: []string{"dropped: " + fc.reason},
+					fails:       1, outcome: event.OutcomeDropped, reason: fc.reason, hasEvent: true,
+					dones: 1, doneOutcome: event.OutcomeDropped,
+				},
+			},
+			joRow{
+				name: fc.name + ", non-final delivery is nak-delayed",
+				run:  run(BusOptions{DLQPublisher: event.NewMemoryDLQ()}, 1),
+				want: joWant{nakDelays: 1, dones: 1, doneOutcome: fc.outcome},
+			},
+			joRow{
+				name: fc.name + ", non-final delivery without publisher is nak-delayed",
+				run:  run(BusOptions{}, 1),
+				want: joWant{nakDelays: 1, dones: 1, doneOutcome: fc.outcome},
+			},
+		)
+	}
+	return rows
 }
 
 // joDeadlineInterrupt delivers one message to a handler that blocks until
@@ -624,6 +694,11 @@ func TestJetStreamObserver_FailureMatrix(t *testing.T) {
 				}
 				if w.dones == 1 && dones[0].Outcome != w.doneOutcome {
 					t.Errorf("HandlerDone outcome = %q, want %q", dones[0].Outcome, w.doneOutcome)
+				}
+				// D-22: a flow-control loss on the final delivery reports the same
+				// settled outcome on the single Failure and on the HandlerDone.
+				if w.fails == 1 && w.dones == 1 && joFlowControlReason(w.reason) && dones[0].Outcome != fails[0].Outcome {
+					t.Errorf("HandlerDone outcome = %q, Failure outcome = %q, want them equal (D-22)", dones[0].Outcome, fails[0].Outcome)
 				}
 
 				decodes := rec.decodeFailures()
