@@ -44,10 +44,58 @@ func (e RetryableError) Retryable() bool {
 // number of attempts.
 type FailureError = event.FailureError
 
+// DefaultHistorySize is the retry history bound used when
+// RetryPolicy.HistorySize is zero.
+const DefaultHistorySize = 5
+
 type RetryPolicy struct {
 	MaxAttempts int
 	BaseDelay   time.Duration
 	MaxDelay    time.Duration
+
+	// HistorySize bounds the retry history Retry puts in the returned
+	// *event.FailureError (and through it in the DLQ record and the failure
+	// hook). Zero means DefaultHistorySize; a negative value disables the
+	// history, which then allocates nothing. The history holds the last
+	// HistorySize failed in-process attempts of this delivery, oldest first, with
+	// the error text truncated. Earlier broker deliveries only appear as
+	// Delivery.Count, because the in-flight envelope is immutable and the history
+	// is never written into it.
+	HistorySize int
+}
+
+// attemptRing keeps the last size attempts, oldest first. A size of zero or
+// less keeps nothing and never allocates.
+type attemptRing struct {
+	size  int
+	items []event.Attempt
+}
+
+// newAttemptRing resolves the configured HistorySize: 0 means the default and
+// a negative value disables the history.
+func newAttemptRing(configured int) attemptRing {
+	switch {
+	case configured == 0:
+		configured = DefaultHistorySize
+	case configured < 0:
+		configured = 0
+	}
+	return attemptRing{size: configured}
+}
+
+func (g *attemptRing) enabled() bool { return g.size > 0 }
+
+// add appends a, dropping the oldest entry when the ring is full.
+func (g *attemptRing) add(a event.Attempt) {
+	if g.size <= 0 {
+		return
+	}
+	if len(g.items) == g.size {
+		copy(g.items, g.items[1:])
+		g.items[len(g.items)-1] = a
+		return
+	}
+	g.items = append(g.items, a)
 }
 
 func classify(err error) (retry bool, terminal bool) {
@@ -115,7 +163,7 @@ type Retry struct {
 
 func (r *Retry) Invoke(
 	ctx context.Context,
-	_ event.Event,
+	evt event.Event,
 	handler string,
 	next func(context.Context) error,
 ) error {
@@ -124,35 +172,58 @@ func (r *Retry) Invoke(
 	// A policy below 1 still runs the handler once, so a FailureError never
 	// carries a nil cause.
 	maxAttempts := max(r.policy.MaxAttempts, 1)
+	hist := newAttemptRing(r.policy.HistorySize)
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		started := time.Now()
 		err := next(ctx)
 		if err == nil {
 			return nil
 		}
+		took := time.Since(started)
 
 		retry, terminal := classify(err)
 
 		if terminal {
-			return &event.FailureError{Cause: err, Reason: event.ReasonTerminal, Attempts: attempt}
+			if hist.enabled() {
+				hist.add(event.NewAttempt(attempt, err, event.AttemptClassOf(ctx, err), started, took, 0))
+			}
+			return &event.FailureError{Cause: err, Reason: event.ReasonTerminal, Attempts: attempt, History: hist.items}
 		}
 
+		// Flow-control, dead-lettered and context errors are returned unchanged
+		// and are not attempts of the retry policy.
 		if !retry {
 			return err
 		}
 
 		lastErr = err
+		class := event.AttemptClassOf(ctx, err)
 
 		if attempt == maxAttempts {
+			if hist.enabled() {
+				hist.add(event.NewAttempt(attempt, err, class, started, took, 0))
+			}
 			break
 		}
 
 		delay := backoff(attempt-1, r.policy.BaseDelay, r.policy.MaxDelay)
 
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return ctx.Err()
+		event.ObserverFromContext(ctx).RetryAttempt(ctx, event.RetryAttemptInfo{
+			Handler: handler,
+			Event:   eventName(evt),
+			Attempt: attempt,
+			Class:   class,
+			Err:     err,
+			Delay:   delay,
+			At:      started,
+		})
+		if hist.enabled() {
+			hist.add(event.NewAttempt(attempt, err, class, started, took, delay))
+		}
+
+		if err := wait(ctx, delay); err != nil {
+			return err
 		}
 	}
 
@@ -160,7 +231,31 @@ func (r *Retry) Invoke(
 		Cause:    lastErr,
 		Reason:   event.ReasonRetriesExhausted,
 		Attempts: maxAttempts,
+		History:  hist.items,
 	}
+}
+
+// wait sleeps for d, or returns the context error when ctx ends first. A zero
+// delay does not allocate a timer; it only honors cancellation.
+func wait(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func eventName(evt event.Event) string {
+	if evt == nil {
+		return ""
+	}
+	return evt.Name()
 }
 
 /*
