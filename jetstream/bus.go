@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -28,7 +29,8 @@ var ErrStreamRequired = errors.New("stream is required for JetStream subscriptio
 // ErrInvalidConfig is returned when consumer configuration is invalid.
 var ErrInvalidConfig = errors.New("eventbus: invalid consumer configuration")
 
-var tracer = otel.Tracer("go-event-bus")
+// tracerName is the instrumentation scope of the producer spans.
+const tracerName = "github.com/isaquesb/go-event-bus/jetstream"
 
 // jsBackend is an internal interface over jetstream.JetStream to allow testing.
 // Publishing goes through PublishMsg, not Publish, so a mock can read the
@@ -230,14 +232,7 @@ func (b *Bus) Emit(
 	cfg := event.ApplyEmitOptions(evt, opts...)
 	md := b.resolve(ctx, evt, cfg)
 
-	ctx, span := tracer.Start(ctx, "eventbus.emit",
-		trace.WithSpanKind(trace.SpanKindProducer),
-		trace.WithAttributes(
-			attribute.String("messaging.system", "nats"),
-			attribute.String("messaging.destination", cfg.Subject),
-			attribute.String("event.name", evt.Name()),
-		),
-	)
+	ctx, span := b.startPublish(ctx, cfg.Subject, md.ID)
 	defer span.End()
 
 	data, err := event.EncodeEvent(ctx, b.registry, evt, md)
@@ -249,7 +244,6 @@ func (b *Bus) Emit(
 
 	msg := &nats.Msg{Subject: cfg.Subject, Data: data, Header: nats.Header{}}
 	msg.Header.Set(jetstream.MsgIDHeader, md.ID)
-	span.SetAttributes(attribute.String("messaging.message.id", md.ID))
 
 	ack, attempts, err := b.publish(ctx, msg)
 	span.SetAttributes(attribute.Int("eventbus.publish.attempts", attempts))
@@ -466,14 +460,19 @@ func (b *Bus) Subscribe(
 
 // consumeErr is the error handler of a consumer's Consume loop: it receives the
 // errors nats.go raises while pulling messages (heartbeat loss, a deleted
-// consumer, a broken connection).
-func (b *Bus) consumeErr(_ context.Context, handlerName, subject string) func(jetstream.ConsumeContext, error) {
+// consumer, a broken connection) and reports each as an InternalError signal
+// (Op consume). The bus Observer is installed on the subscribe ctx once, when
+// the handler is built.
+func (b *Bus) consumeErr(ctx context.Context, handlerName, subject string) func(jetstream.ConsumeContext, error) {
+	octx := event.WithObserver(ctx, b.obs())
 	return func(_ jetstream.ConsumeContext, err error) {
-		slog.Warn("consumer error",
-			"handler", handlerName,
-			"subject", subject,
-			"error", err,
-		)
+		event.ObserverFromContext(octx).InternalError(octx, event.InternalErrorInfo{
+			Component: event.ComponentTransport,
+			Op:        event.OpConsume,
+			Handler:   handlerName,
+			Subject:   subject,
+			Err:       err,
+		})
 	}
 }
 
@@ -610,6 +609,35 @@ func (b *Bus) internalError(ctx context.Context, op, handler, subject string, er
 		Subject:   subject,
 		Err:       err,
 	})
+}
+
+// tracer returns the tracer of the producer spans: BusOptions.TracerProvider, or
+// the global provider resolved at call time when none was configured.
+func (b *Bus) tracer() trace.Tracer {
+	tp := b.tp
+	if tp == nil {
+		tp = otel.GetTracerProvider()
+	}
+	return tp.Tracer(tracerName)
+}
+
+// startPublish starts the producer span of an Emit following the OTel messaging
+// conventions: "publish <subject>", kind Producer. The attributes are ids and
+// the subject only, never the payload.
+func (b *Bus) startPublish(ctx context.Context, subject, id string) (context.Context, trace.Span) {
+	attrs := []attribute.KeyValue{
+		semconv.MessagingSystemKey.String("nats"),
+		semconv.MessagingOperationName("publish"),
+		semconv.MessagingOperationTypeSend,
+		semconv.MessagingDestinationName(subject),
+	}
+	if id != "" {
+		attrs = append(attrs, semconv.MessagingMessageID(id))
+	}
+	return b.tracer().Start(ctx, "publish "+subject,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(attrs...),
+	)
 }
 
 // msgScope installs the bus Observer and a fresh FailureScope on ctx. Every
@@ -769,7 +797,7 @@ func (b *Bus) msgHandler(
 				Publisher:       guard.publisher(b.dlq),
 			})
 			acted = true
-			b.apply(msg, handlerName, s, err, d, policy)
+			b.apply(hctx, msg, handlerName, s, err, d, policy)
 			return
 		}
 
@@ -789,7 +817,7 @@ func (b *Bus) msgHandler(
 			Publisher:       guard.publisher(b.dlq),
 		})
 		acted = true
-		b.apply(msg, handlerName, s, err, d, policy)
+		b.apply(msgCtx, msg, handlerName, s, err, d, policy)
 	}
 }
 
@@ -898,11 +926,7 @@ func (b *Bus) handBack(ctx context.Context, msg jetstream.Msg, handlerName strin
 	hctx := b.msgScope(ctx, nil)
 	d := b.delivery(hctx, msg, policy)
 	if err := msg.Nak(); err != nil {
-		slog.Warn("eventbus: handing back message failed, the broker may redeliver it",
-			"handler", handlerName,
-			"subject", d.Subject,
-			"error", err,
-		)
+		b.internalError(hctx, event.OpNak, handlerName, d.Subject, err)
 	}
 	if !d.Final() {
 		return
@@ -918,33 +942,34 @@ func (b *Bus) handBack(ctx context.Context, msg jetstream.Msg, handlerName strin
 	})
 }
 
-// apply performs the one broker action for s. A failing ack call is logged and
+// apply performs the one broker action for s. A failing ack call is reported as
+// an InternalError signal (Op ack, nak or term; NakWithDelay counts as nak) and
 // otherwise ignored: the server redelivers an unacknowledged message, which can
 // duplicate a DLQ record (at-least-once, D-13).
-func (b *Bus) apply(msg jetstream.Msg, handlerName string, s event.Settlement, err error, d event.Delivery, policy deliveryPolicy) {
+func (b *Bus) apply(ctx context.Context, msg jetstream.Msg, handlerName string, s event.Settlement, err error, d event.Delivery, policy deliveryPolicy) {
 	var aerr error
+	var op string
 	switch s.Disposition {
 	case event.DispositionAck:
+		op = event.OpAck
 		aerr = msg.Ack()
 	case event.DispositionRetry:
 		// Only the interruption path: the subscription context ended.
+		op = event.OpNak
 		aerr = msg.Nak()
 	case event.DispositionRetryDelayed:
 		errForDelay := s.Err
 		if errForDelay == nil {
 			errForDelay = err
 		}
+		op = event.OpNak
 		aerr = msg.NakWithDelay(b.delayFor(errForDelay, d, policy.backOff))
 	case event.DispositionTerminal:
+		op = event.OpTerm
 		aerr = msg.TermWithReason(string(s.Outcome) + ": " + s.Reason)
 	}
 	if aerr != nil {
-		slog.Warn("eventbus: acknowledging message failed, the broker may redeliver it",
-			"handler", handlerName,
-			"subject", d.Subject,
-			"disposition", s.Disposition.String(),
-			"error", aerr,
-		)
+		b.internalError(ctx, op, handlerName, d.Subject, aerr)
 	}
 }
 
