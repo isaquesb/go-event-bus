@@ -72,9 +72,6 @@ func ExampleRedisStores() {
 
 	// Build production-ready invoker chain
 	chain := invoker.NewChain(
-		// Metrics first (always wrap)
-		invoker.NewMetrics(nil),
-
 		// Rate limiting - prevent abuse
 		invoker.NewRateLimiter(
 			rateLimitStore,
@@ -90,7 +87,6 @@ func ExampleRedisStores() {
 					)
 				},
 			},
-			nil,
 		),
 
 		// Idempotency - prevent duplicate processing
@@ -99,7 +95,6 @@ func ExampleRedisStores() {
 			invoker.IdempotencyConfig{
 				ProcessingTTL: 5 * time.Minute, // Lock expires after 5 min
 			},
-			nil,
 		),
 
 		// Retry with backoff
@@ -109,7 +104,6 @@ func ExampleRedisStores() {
 				BaseDelay:   100 * time.Millisecond,
 				MaxDelay:    10 * time.Second,
 			},
-			nil,
 		),
 
 		// Circuit breaker for downstream protection
@@ -119,7 +113,6 @@ func ExampleRedisStores() {
 				SuccessThreshold: 2,
 				OpenTimeout:      30 * time.Second,
 			},
-			nil,
 		),
 	)
 
@@ -127,13 +120,9 @@ func ExampleRedisStores() {
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:       chain,
 		MaxConcurrent: 32,
-		OnErr: func(ctx context.Context, evt event.Event, err error, handler string) {
-			slog.Error("handler error",
-				"event", evt.Name(),
-				"handler", handler,
-				"error", err,
-			)
-		},
+		// Observer receives every terminal failure once (Observer.Failure). The slog
+		// observer is also the default when Observer is nil.
+		Observer: event.NewSlogObserver(nil),
 	})
 
 	// Register handler

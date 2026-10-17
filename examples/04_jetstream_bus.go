@@ -98,11 +98,9 @@ func ExampleJetStreamBus() {
 
 	// Setup invoker chain
 	chain := invoker.NewChain(
-		invoker.NewMetrics(nil),
 		invoker.NewIdempotency(
 			invoker.NewMemoryIdempotencyStore(),
 			invoker.IdempotencyConfig{ProcessingTTL: 5 * time.Minute},
-			nil,
 		),
 		invoker.NewRetry(
 			invoker.RetryPolicy{
@@ -110,20 +108,15 @@ func ExampleJetStreamBus() {
 				BaseDelay:   100 * time.Millisecond,
 				MaxDelay:    5 * time.Second,
 			},
-			nil,
 		),
 	)
 
 	// Create JetStream bus
 	bus := jetstream.NewBus(js, registry, jetstream.BusOptions{
 		Invoker: chain,
-		OnErr: func(ctx context.Context, evt event.Event, err error, handler string) {
-			slog.Error("handler failed",
-				"event", evt.Name(),
-				"handler", handler,
-				"error", err,
-			)
-		},
+		// Observer receives every terminal failure once (Observer.Failure). The slog
+		// observer is also the default when Observer is nil.
+		Observer: event.NewSlogObserver(nil),
 	})
 
 	// Subscribe to events using base event options
@@ -224,15 +217,14 @@ func ExampleJetStreamDLQ() {
 
 	// Create DLQ publisher. The empty prefix means the default "dlq.", which
 	// matches the "dlq.>" stream above.
-	dlq := jetstream.NewDLQ(js, nil, "")
+	dlq := jetstream.NewDLQ(js, "")
 
 	// In your invoker chain, DLQ sits outside Retry so it dead-letters the
 	// final outcome once:
 	chain := invoker.NewChain(
-		invoker.NewDLQ(dlq, nil), // Final failures go to DLQ
+		invoker.NewDLQ(dlq), // Final failures go to DLQ
 		invoker.NewRetry(
 			invoker.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Second, MaxDelay: 30 * time.Second},
-			nil,
 		),
 	)
 

@@ -226,24 +226,19 @@ func (e *CriticalEvent) OnErr(ctx context.Context, err error, listenerName strin
 func ExampleSubscriberPattern() {
 	// Create bus with invoker chain
 	chain := invoker.NewChain(
-		invoker.NewMetrics(nil),
 		invoker.NewRetry(invoker.RetryPolicy{
 			MaxAttempts: 3,
 			BaseDelay:   100,
 			MaxDelay:    1000,
-		}, nil),
+		}),
 	)
 
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:       chain,
 		MaxConcurrent: 16,
-		OnErr: func(ctx context.Context, evt event.Event, err error, handler string) {
-			slog.Error("handler failed",
-				"event", evt.Name(),
-				"handler", handler,
-				"error", err,
-			)
-		},
+		// Observer receives every terminal failure once (Observer.Failure). The slog
+		// observer is also the default when Observer is nil.
+		Observer: event.NewSlogObserver(nil),
 	})
 
 	ctx := context.Background()

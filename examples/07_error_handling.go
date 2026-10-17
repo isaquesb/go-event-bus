@@ -239,22 +239,20 @@ func ExampleErrorHandling() {
 	dlq := &EnhancedDLQPublisher{}
 
 	chain := invoker.NewChain(
-		invoker.NewMetrics(nil),
-
 		// DLQ sits outside Retry: it dead-letters the final outcome once.
-		invoker.NewDLQ(dlq, nil),
+		invoker.NewDLQ(dlq),
 
 		invoker.NewRetry(invoker.RetryPolicy{
 			MaxAttempts: 3,
 			BaseDelay:   100 * time.Millisecond,
 			MaxDelay:    5 * time.Second,
-		}, nil),
+		}),
 
 		invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
 			FailureThreshold: 5,
 			SuccessThreshold: 2,
 			OpenTimeout:      30 * time.Second,
-		}, nil),
+		}),
 	)
 
 	bus := event.NewLocalBus(event.LocalBusOptions{
