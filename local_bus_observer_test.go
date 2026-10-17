@@ -515,3 +515,305 @@ func TestLocalBus_FailureMatrix(t *testing.T) {
 		}
 	})
 }
+
+// lbBreakerInvoker writes a breaker state into the FailureScope like the
+// circuit breaker invoker does, then fails with err.
+type lbBreakerInvoker struct {
+	state event.BreakerState
+	err   error
+}
+
+func (i *lbBreakerInvoker) Invoke(ctx context.Context, _ event.Event, _ string, _ func(context.Context) error) error {
+	if scope, ok := event.FailureScopeFromContext(ctx); ok && i.state != "" {
+		scope.SetBreaker(i.state)
+	}
+	return i.err
+}
+
+// lbPanicEvent is an event whose own OnErr method panics.
+type lbPanicEvent struct{}
+
+func (lbPanicEvent) Name() string                         { return "lb.order" }
+func (lbPanicEvent) OnErr(context.Context, error, string) { panic("lb: OnErr boom") }
+
+// lbEmitFailing emits one event through a bus whose chain invoker is inv and
+// whose observer is rec, and returns the first Failure.
+func lbEmitFailing(t *testing.T, inv event.Invoker) event.FailureContext {
+	t.Helper()
+	rec := &obsRecorder{}
+	bus := event.NewLocalBus(event.LocalBusOptions{Invoker: inv, Observer: rec})
+	if err := bus.Subscribe(context.Background(), "lb.order",
+		func(context.Context, event.Event) error { return nil },
+		event.WithHandlerName("billing")); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	_, _ = bus.EmitSync(context.Background(), &lbEvent{}, event.WithID("lb-1"))
+	failures := rec.Failures()
+	if len(failures) != 1 {
+		t.Fatalf("Failure calls = %d, want exactly 1", len(failures))
+	}
+	return failures[0]
+}
+
+// TestFailureContext_AttemptsAndHistory: Attempts, History and the retry
+// invoker name come from the *FailureError the chain returned (D-16).
+func TestFailureContext_AttemptsAndHistory(t *testing.T) {
+	now := time.Now()
+	history := []event.Attempt{
+		event.NewAttempt(3, errors.New("x"), event.AttemptTransient, now, time.Millisecond, 10*time.Millisecond),
+		event.NewAttempt(4, errors.New("x"), event.AttemptTransient, now, time.Millisecond, 0),
+	}
+	f := lbEmitFailing(t, &lbInvoker{err: &event.FailureError{
+		Cause:    errors.New("x"),
+		Reason:   event.ReasonRetriesExhausted,
+		Attempts: 4,
+		History:  history,
+	}})
+
+	if f.Attempts != 4 {
+		t.Errorf("Attempts = %d, want 4", f.Attempts)
+	}
+	if len(f.History) != 2 || f.History[0] != history[0] || f.History[1] != history[1] {
+		t.Errorf("History = %+v, want %+v", f.History, history)
+	}
+	if &f.History[0] == &history[0] {
+		t.Error("History shares its backing array with the FailureError, want a copy")
+	}
+	if f.Invoker != event.InvokerRetry {
+		t.Errorf("Invoker = %q, want retry", f.Invoker)
+	}
+	if f.Reason != event.ReasonRetriesExhausted {
+		t.Errorf("Reason = %q, want retries_exhausted", f.Reason)
+	}
+}
+
+// TestFailureContext_BreakerFromScope: the breaker state an invoker wrote into
+// the FailureScope reaches Failure.Breaker, and is empty without one (D-16).
+func TestFailureContext_BreakerFromScope(t *testing.T) {
+	t.Run("written_by_invoker", func(t *testing.T) {
+		f := lbEmitFailing(t, &lbBreakerInvoker{state: event.BreakerOpen, err: lbPermanent{}})
+		if f.Breaker != event.BreakerOpen {
+			t.Errorf("Breaker = %q, want open", f.Breaker)
+		}
+	})
+	t.Run("absent_without_breaker", func(t *testing.T) {
+		f := lbEmitFailing(t, &lbBreakerInvoker{err: lbPermanent{}})
+		if f.Breaker != "" {
+			t.Errorf("Breaker = %q, want empty when no breaker ran", f.Breaker)
+		}
+	})
+}
+
+// lbSettleCtx builds the context a transport hands to Settle: the observer, a
+// FailureScope, metadata and a delivery that carries raw payload bytes.
+func lbSettleCtx(rec *obsRecorder, d event.Delivery) context.Context {
+	ctx := event.WithObserver(context.Background(), rec)
+	ctx, _ = event.WithFailureScope(ctx)
+	ctx = event.WithMetadata(ctx, event.Metadata{ID: "lb-id", CorrelationID: "lb-corr"})
+	return event.WithDelivery(ctx, d)
+}
+
+// TestFailureContext_MetadataAndRedactedDelivery: the Failure carries the
+// metadata ids, the delivery without its payload bytes and a current At; the
+// DeadLettered signal carries no payload either (D-14, D-20).
+func TestFailureContext_MetadataAndRedactedDelivery(t *testing.T) {
+	rec := &obsRecorder{}
+	mem := event.NewMemoryDLQ()
+	raw := make([]byte, 32)
+	for i := range raw {
+		raw[i] = byte(i + 1)
+	}
+	ctx := lbSettleCtx(rec, event.Delivery{Count: 2, Max: 2, Raw: raw, Subject: "lb.subject"})
+
+	before := time.Now()
+	event.Settle(ctx, event.SettleInput{
+		SubscriptionCtx: context.Background(),
+		Evt:             &lbEvent{},
+		Handler:         "billing",
+		Err:             lbPermanent{},
+		Publisher:       mem,
+	})
+	after := time.Now()
+
+	failures := rec.Failures()
+	if len(failures) != 1 {
+		t.Fatalf("Failure calls = %d, want 1", len(failures))
+	}
+	f := failures[0]
+	if f.Metadata.ID != "lb-id" || f.Metadata.CorrelationID != "lb-corr" {
+		t.Errorf("Metadata = %+v, want ids lb-id / lb-corr", f.Metadata)
+	}
+	if f.Delivery.Count != 2 || f.Delivery.Max != 2 || f.Delivery.Subject != "lb.subject" {
+		t.Errorf("Delivery = %+v, want Count 2 Max 2 Subject lb.subject", f.Delivery)
+	}
+	if f.Delivery.Raw != nil {
+		t.Errorf("Delivery.Raw = %q, want nil", f.Delivery.Raw)
+	}
+	if f.At.Before(before) || f.At.After(after) {
+		t.Errorf("At = %v, want within [%v, %v]", f.At, before, after)
+	}
+
+	dl := rec.DeadLetters()
+	if len(dl) != 1 {
+		t.Fatalf("DeadLettered signals = %d, want 1", len(dl))
+	}
+	if dl[0].Delivery.Raw != nil {
+		t.Errorf("DeadLettered.Delivery.Raw = %q, want nil", dl[0].Delivery.Raw)
+	}
+	// The record handed to the publisher keeps the payload: it is the DLQ copy,
+	// not a signal.
+	if recs := mem.Records(); len(recs) != 1 || len(recs[0].Raw) != len(raw) {
+		t.Errorf("DLQ record Raw length = %d, want %d", len(recs[0].Raw), len(raw))
+	}
+}
+
+// TestSettle_DoubleReportGuard: settling the same delivery ctx twice reports one
+// Failure and runs the event's OnErr once (FailureScope guard, D-01).
+func TestSettle_DoubleReportGuard(t *testing.T) {
+	rec := &obsRecorder{}
+	ctx := lbSettleCtx(rec, event.Delivery{Count: 1, Max: 1, Subject: "lb.subject"})
+	evt := &lbEvent{}
+	in := event.SettleInput{
+		SubscriptionCtx: context.Background(),
+		Evt:             evt,
+		Handler:         "billing",
+		Err:             lbPermanent{},
+	}
+
+	first := event.Settle(ctx, in)
+	second := event.Settle(ctx, in)
+
+	if first.Outcome != event.OutcomeDropped || second.Outcome != event.OutcomeDropped {
+		t.Fatalf("outcomes = %q, %q, want dropped twice", first.Outcome, second.Outcome)
+	}
+	if got := len(rec.Failures()); got != 1 {
+		t.Errorf("Failure calls = %d, want exactly 1", got)
+	}
+	if got := evt.onErr.Load(); got != 1 {
+		t.Errorf("event OnErr calls = %d, want 1", got)
+	}
+}
+
+// TestLocalBus_EventOnErrPanicIsolated: a panic inside the event's own OnErr
+// method is reported as an InternalError and never reaches the bus caller.
+func TestLocalBus_EventOnErrPanicIsolated(t *testing.T) {
+	rec := &obsRecorder{}
+	bus := event.NewLocalBus(event.LocalBusOptions{Invoker: &passthroughInvoker{}, Observer: rec})
+	if err := bus.Subscribe(context.Background(), "lb.order",
+		func(context.Context, event.Event) error { return lbPermanent{} },
+		event.WithHandlerName("billing")); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	_, _ = bus.EmitSync(context.Background(), lbPanicEvent{}, event.WithID("lb-1"))
+
+	if got := len(rec.Failures()); got != 1 {
+		t.Errorf("Failure calls = %d, want 1", got)
+	}
+	ie := rec.InternalErrors()
+	if len(ie) != 1 {
+		t.Fatalf("InternalError calls = %d (%+v), want 1", len(ie), ie)
+	}
+	if ie[0].Component != event.ComponentEvent || ie[0].Op != event.OpPanic {
+		t.Errorf("InternalError = %s/%s, want event/panic", ie[0].Component, ie[0].Op)
+	}
+	if !errors.Is(ie[0].Err, event.ErrHandlerPanic) {
+		t.Errorf("InternalError.Err = %v, want a recovered panic", ie[0].Err)
+	}
+
+	// The bus survives: a second failure is reported like the first.
+	_, _ = bus.EmitSync(context.Background(), lbPanicEvent{}, event.WithID("lb-2"))
+	if got := len(rec.Failures()); got != 2 {
+		t.Errorf("Failure calls after a second emit = %d, want 2", got)
+	}
+}
+
+// TestLocalBus_ObserverPanicIsolated: a panicking observer configured next to a
+// recording one does not stop the recording one or the handler path.
+func TestLocalBus_ObserverPanicIsolated(t *testing.T) {
+	lbInstallCapture(t) // MultiObserver logs the first panic of each observer
+	rec := &obsRecorder{}
+	bus := event.NewLocalBus(event.LocalBusOptions{
+		Invoker:      &passthroughInvoker{},
+		Observer:     event.MultiObserver(obPanicObserver{}, rec),
+		DLQPublisher: event.NewMemoryDLQ(),
+	})
+	if err := bus.Subscribe(context.Background(), "lb.order",
+		func(context.Context, event.Event) error { return lbPermanent{} },
+		event.WithHandlerName("billing")); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	evt := &lbEvent{}
+	if _, err := bus.EmitSync(context.Background(), evt, event.WithID("lb-1")); err != nil {
+		t.Fatalf("EmitSync = %v, want nil for a dead-lettered failure", err)
+	}
+
+	if got := len(rec.Failures()); got != 1 {
+		t.Errorf("recording observer Failure calls = %d, want 1", got)
+	}
+	if got := len(rec.DeadLetters()); got != 1 {
+		t.Errorf("recording observer DeadLettered calls = %d, want 1", got)
+	}
+	if got := len(rec.HandlerDones()); got != 1 {
+		t.Errorf("recording observer HandlerDone calls = %d, want 1", got)
+	}
+	if got := evt.onErr.Load(); got != 1 {
+		t.Errorf("event OnErr calls = %d, want 1", got)
+	}
+}
+
+// TestSettle_DecodeFailureSignals: a decode failure (no event) with a DLQ
+// publisher emits DecodeFailed (final, no payload) and one decode_failed
+// Failure whose cause is dead-lettered.
+func TestSettle_DecodeFailureSignals(t *testing.T) {
+	rec := &obsRecorder{}
+	mem := event.NewMemoryDLQ()
+	ctx := lbSettleCtx(rec, event.Delivery{Count: 1, Max: 1, Subject: "lb.subject", Raw: []byte(`{"secret":true}`)})
+
+	s := event.Settle(ctx, event.SettleInput{
+		SubscriptionCtx: context.Background(),
+		Err:             &event.DecodeError{Err: event.ErrUnknownEvent},
+		Publisher:       mem,
+	})
+	if s.Disposition != event.DispositionTerminal {
+		t.Fatalf("Disposition = %v, want terminal", s.Disposition)
+	}
+
+	df := rec.DecodeFailures()
+	if len(df) != 1 {
+		t.Fatalf("DecodeFailed calls = %d, want 1", len(df))
+	}
+	if !df[0].Final {
+		t.Error("DecodeFailed.Final = false, want true")
+	}
+	if df[0].Delivery.Raw != nil {
+		t.Errorf("DecodeFailed.Delivery.Raw = %q, want nil", df[0].Delivery.Raw)
+	}
+
+	failures := rec.Failures()
+	if len(failures) != 1 {
+		t.Fatalf("Failure calls = %d, want 1", len(failures))
+	}
+	f := failures[0]
+	if f.Outcome != event.OutcomeDecodeFailed {
+		t.Errorf("Outcome = %q, want decode_failed", f.Outcome)
+	}
+	if f.Event != nil {
+		t.Errorf("Event = %v, want nil", f.Event)
+	}
+	if !errors.Is(f.Cause, event.ErrDeadLettered) {
+		t.Errorf("Cause = %v, want ErrDeadLettered", f.Cause)
+	}
+	if f.Delivery.Raw != nil {
+		t.Errorf("Failure.Delivery.Raw = %q, want nil", f.Delivery.Raw)
+	}
+	if mem.Len() != 1 {
+		t.Errorf("MemoryDLQ records = %d, want 1", mem.Len())
+	}
+	for _, d := range rec.DeadLetters() {
+		if d.Delivery.Raw != nil {
+			t.Errorf("DeadLettered.Delivery.Raw = %q, want nil", d.Delivery.Raw)
+		}
+	}
+}
