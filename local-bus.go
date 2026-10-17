@@ -110,7 +110,10 @@ type LocalBusOptions struct {
 	// through the ctx cause. The reported error matches ErrHandlerTimeout and
 	// context.DeadlineExceeded. EmitSync handlers keep the caller's ctx and are
 	// never bounded by it. A handler must honor its ctx for the timeout to take
-	// effect: the bus cannot stop a goroutine. 0 means no timeout.
+	// effect: the bus cannot stop a goroutine. The dead-letter publish of a
+	// timed-out execution runs on a ctx detached from the timeout that keeps the
+	// handler ctx values and is cancelled only by the Shutdown deadline. 0 means
+	// no timeout.
 	HandlerTimeout time.Duration
 
 	// IDGenerator mints ids for events that carry no id of their own.
@@ -307,7 +310,10 @@ func (b *LocalBus) Emit(ctx context.Context, e Event, opts ...EmitOption) {
 // EmitSync stops dispatching when the caller ctx is done and includes ctx.Err()
 // in the joined error; a handler that is already running is not interrupted by
 // the bus. After Shutdown it returns ErrBusClosed. LocalBusOptions.HandlerTimeout
-// does not apply here: the handlers keep the caller's ctx.
+// does not apply here: the handlers keep the caller's ctx. A failure is settled
+// on a ctx detached from the caller's cancellation and deadline, so EmitSync can
+// return after that deadline by the time the dead-letter publish takes, bounded
+// by its in-process retry and the Shutdown deadline.
 //
 // Releases up to v0.3.0 returned a nil error here whatever the handlers did.
 func (b *LocalBus) EmitSync(ctx context.Context, e Event, opts ...EmitOption) (Event, error) {
@@ -533,9 +539,19 @@ func (b *LocalBus) execute(
 	}
 	err = WrapInterrupted(subCtx, err)
 
+	// Settle runs on a ctx detached from the HandlerTimeout deadline and from the
+	// EmitSync caller's cancellation, so a DLQ publisher that honors its ctx can
+	// persist a timed-out or late failure instead of losing it. The ctx keeps the
+	// Delivery, Execution, Metadata and trace values of hctx and is still
+	// cancelled at the Shutdown deadline, so a hung publisher cannot hold the
+	// task past it. SubscriptionCtx stays subCtx: a timeout is never read as an
+	// interruption.
+	sctx, sstop := b.life.HandlerContext(hctx, true)
+	defer sstop()
+
 	// Settle is the single place that dead-letters and reports; a local bus has
 	// no broker action to take on the Settlement.
-	s := Settle(hctx, SettleInput{
+	s := Settle(sctx, SettleInput{
 		SubscriptionCtx: subCtx,
 		Evt:             e,
 		Handler:         h.Name,

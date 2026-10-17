@@ -349,3 +349,184 @@ func TestLocalBus_HandlerTimeoutScope(t *testing.T) {
 		}
 	})
 }
+
+// lgCtxDLQ is a DLQPublisher that, like a broker-backed one, honors its ctx: it
+// fails with ctx.Err() when the ctx is done and otherwise stores the record plus
+// what the publish ctx carried.
+type lgCtxDLQ struct {
+	mu         sync.Mutex
+	recs       []event.DLQRecord
+	deliveryOK []bool
+	metaIDs    []string
+}
+
+func (p *lgCtxDLQ) Publish(ctx context.Context, rec event.DLQRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, dok := event.DeliveryFromContext(ctx)
+	md, _ := event.MetadataFromContext(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recs = append(p.recs, rec)
+	p.deliveryOK = append(p.deliveryOK, dok)
+	p.metaIDs = append(p.metaIDs, md.ID)
+	return nil
+}
+
+// lgBlockingDLQ is a DLQPublisher that blocks until its ctx ends.
+type lgBlockingDLQ struct{ calls atomic.Int32 }
+
+func (p *lgBlockingDLQ) Publish(ctx context.Context, _ event.DLQRecord) error {
+	p.calls.Add(1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestLocalBus_HandlerTimeoutDeadLettersWithCtxHonoringDLQ pins CR-02 (D-11,
+// Phase 8 D-07): a handler that ran past HandlerTimeout is dead-lettered through
+// a publisher that honors its ctx, because the settle ctx is detached from the
+// expired timeout.
+func TestLocalBus_HandlerTimeoutDeadLettersWithCtxHonoringDLQ(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pub := &lgCtxDLQ{}
+		cap := &lsCapture{}
+		bus := event.NewLocalBus(event.LocalBusOptions{
+			HandlerTimeout: time.Second,
+			DLQPublisher:   pub,
+			OnErr:          cap.fn,
+		})
+		if err := bus.Subscribe(context.Background(), "ls.evt", func(ctx context.Context, _ event.Event) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}, event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		bus.Emit(context.Background(), &lsEvent{}, event.WithID("lg-t1"))
+		if err := bus.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown = %v, want nil", err)
+		}
+
+		pub.mu.Lock()
+		defer pub.mu.Unlock()
+		if len(pub.recs) != 1 {
+			t.Fatalf("DLQ records = %d, want 1 (the timed-out event must not be lost)", len(pub.recs))
+		}
+		cause := pub.recs[0].Cause
+		if !errors.Is(cause, event.ErrHandlerTimeout) || !errors.Is(cause, context.DeadlineExceeded) {
+			t.Errorf("record cause = %v, want ErrHandlerTimeout and DeadlineExceeded", cause)
+		}
+		if !pub.deliveryOK[0] {
+			t.Error("the publish ctx carries no Delivery")
+		}
+		if pub.metaIDs[0] != "lg-t1" {
+			t.Errorf("publish ctx Metadata ID = %q, want lg-t1", pub.metaIDs[0])
+		}
+
+		errs := cap.all()
+		if len(errs) != 1 {
+			t.Fatalf("OnErr calls = %d (%v), want 1", len(errs), errs)
+		}
+		if !errors.Is(errs[0], event.ErrDeadLettered) || !errors.Is(errs[0], event.ErrHandlerTimeout) {
+			t.Errorf("OnErr err = %v, want ErrDeadLettered and ErrHandlerTimeout", errs[0])
+		}
+		if errors.Is(errs[0], event.ErrDeadLetterFailed) {
+			t.Errorf("OnErr err = %v, must not be ErrDeadLetterFailed", errs[0])
+		}
+	})
+}
+
+// TestLocalBus_EmitSync_CallerDeadlineDeadLetters pins CR-02 (D-03): an EmitSync
+// whose caller deadline expired while its handler ran, and whose handler then
+// failed with a non-ctx error, is dead-lettered once, and the handled failure is
+// not an EmitSync error.
+func TestLocalBus_EmitSync_CallerDeadlineDeadLetters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pub := &lgCtxDLQ{}
+		cap := &lsCapture{}
+		bus := event.NewLocalBus(event.LocalBusOptions{
+			DLQPublisher: pub,
+			OnErr:        cap.fn,
+		})
+		if err := bus.Subscribe(context.Background(), "ls.evt", func(context.Context, event.Event) error {
+			time.Sleep(2 * time.Second) // ignores its ctx
+			return errors.New("lg: late failure")
+		}, event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		evt := &lsEvent{}
+		got, err := bus.EmitSync(ctx, evt)
+		if got != event.Event(evt) {
+			t.Errorf("EmitSync event = %v, want the emitted event", got)
+		}
+		if err != nil {
+			t.Fatalf("EmitSync = %v, want nil (the only handler's failure was dead-lettered)", err)
+		}
+
+		pub.mu.Lock()
+		n := len(pub.recs)
+		pub.mu.Unlock()
+		if n != 1 {
+			t.Fatalf("DLQ records = %d, want 1", n)
+		}
+		errs := cap.all()
+		if len(errs) != 1 {
+			t.Fatalf("OnErr calls = %d (%v), want 1", len(errs), errs)
+		}
+		if !errors.Is(errs[0], event.ErrDeadLettered) || errors.Is(errs[0], event.ErrDeadLetterFailed) {
+			t.Errorf("OnErr err = %v, want ErrDeadLettered and not ErrDeadLetterFailed", errs[0])
+		}
+		if err := bus.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown = %v, want nil", err)
+		}
+	})
+}
+
+// TestLocalBus_SettleBoundedByShutdownDeadline pins T-09-23 (D-05): a DLQ
+// publisher that blocks until its ctx ends cannot hold a timed-out task past the
+// Shutdown deadline, and the lost dead-letter is reported, not silent.
+func TestLocalBus_SettleBoundedByShutdownDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pub := &lgBlockingDLQ{}
+		cap := &lsCapture{}
+		bus := event.NewLocalBus(event.LocalBusOptions{
+			HandlerTimeout: time.Second,
+			DLQPublisher:   pub,
+			OnErr:          cap.fn,
+		})
+		if err := bus.Subscribe(context.Background(), "ls.evt", func(ctx context.Context, _ event.Event) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}, event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		bus.Emit(context.Background(), &lsEvent{})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := bus.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown = %v, want context.DeadlineExceeded", err)
+		}
+		if got := time.Since(start); got != 5*time.Second {
+			t.Errorf("Shutdown took %v of fake time, want 5s", got)
+		}
+		synctest.Wait() // the cancelled publish reports asynchronously
+
+		if got := pub.calls.Load(); got < 1 {
+			t.Errorf("DLQ publisher calls = %d, want at least 1", got)
+		}
+		errs := cap.all()
+		if len(errs) != 1 {
+			t.Fatalf("OnErr calls = %d (%v), want 1", len(errs), errs)
+		}
+		if !errors.Is(errs[0], event.ErrDeadLetterFailed) || !errors.Is(errs[0], event.ErrHandlerTimeout) {
+			t.Errorf("OnErr err = %v, want ErrDeadLetterFailed and ErrHandlerTimeout", errs[0])
+		}
+	})
+}
