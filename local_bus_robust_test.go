@@ -601,3 +601,296 @@ func TestLocalBus_PanicInOnErrRecovered(t *testing.T) {
 		}
 	})
 }
+
+// lrChild is the event a handler emits while the bus drains.
+type lrChild struct{}
+
+func (*lrChild) Name() string { return "lr.child" }
+
+// lrResult starts fn in a goroutine and returns the channel its result arrives
+// on. It must be called inside a synctest bubble.
+func lrResult(fn func() error) <-chan error {
+	ch := make(chan error, 1)
+	go func() { ch <- fn() }()
+	return ch
+}
+
+// TestLocalBus_ShutdownNestedEmitDuringDrain proves D-06: a handler may keep
+// emitting while the bus drains and Shutdown waits for the child, while an
+// external emit in the same window is refused.
+func TestLocalBus_ShutdownNestedEmitDuringDrain(t *testing.T) {
+	lrInstallLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		errs := &lrErrs{}
+		bus := event.NewLocalBus(event.LocalBusOptions{OnErr: errs.fn})
+
+		gate := make(chan struct{})
+		var childRuns, childDone atomic.Int32
+		if err := bus.Subscribe(context.Background(), "lr.evt", func(ctx context.Context, _ event.Event) error {
+			<-gate
+			bus.Emit(ctx, &lrChild{})
+			return nil
+		}, event.WithHandlerName("parent")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		if err := bus.Subscribe(context.Background(), "lr.child", func(context.Context, event.Event) error {
+			childRuns.Add(1)
+			time.Sleep(time.Second)
+			childDone.Add(1)
+			return nil
+		}, event.WithHandlerName("child")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		bus.Emit(context.Background(), &lrEvent{})
+		synctest.Wait()
+
+		res := lrResult(func() error { return bus.Shutdown(context.Background()) })
+		synctest.Wait()
+
+		// External emit during the drain: refused and reported.
+		bus.Emit(context.Background(), &lrEvent{})
+		got, handlers := errs.snapshot()
+		if len(got) != 1 || !errors.Is(got[0], event.ErrBusClosed) || handlers[0] != "" {
+			t.Fatalf("OnErr = %v handlers %q, want one ErrBusClosed with handler \"\"", got, handlers)
+		}
+		select {
+		case err := <-res:
+			t.Fatalf("Shutdown returned %v before the parent finished", err)
+		default:
+		}
+
+		close(gate) // the parent emits its child with its own handler ctx
+		if err := <-res; err != nil {
+			t.Fatalf("Shutdown = %v, want nil", err)
+		}
+		if n := childRuns.Load(); n != 1 {
+			t.Errorf("child runs = %d, want exactly 1", n)
+		}
+		if n := childDone.Load(); n != 1 {
+			t.Errorf("child finished %d times before Shutdown returned, want 1", n)
+		}
+		if got, _ := errs.snapshot(); len(got) != 1 {
+			t.Errorf("OnErr calls = %d, want only the external rejection", len(got))
+		}
+	})
+}
+
+// TestLocalBus_ShutdownDeadlineInterrupts proves D-05 and D-07: at the
+// deadline every handler ctx is cancelled with cause ErrShutdownInterrupted,
+// the running and the parked tasks are reported once as interrupted and are
+// never dead-lettered, and nothing is left running.
+func TestLocalBus_ShutdownDeadlineInterrupts(t *testing.T) {
+	logs := lrInstallLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		dlq := event.NewMemoryDLQ()
+		errs := &lrErrs{}
+		bus := event.NewLocalBus(event.LocalBusOptions{
+			MaxConcurrent: 1,
+			QueueSize:     4,
+			DLQPublisher:  dlq,
+			OnErr:         errs.fn,
+		})
+
+		var (
+			mu     sync.Mutex
+			causes []error
+			starts int
+		)
+		if err := bus.Subscribe(context.Background(), "lr.evt", func(ctx context.Context, _ event.Event) error {
+			mu.Lock()
+			starts++
+			mu.Unlock()
+			<-ctx.Done()
+			mu.Lock()
+			causes = append(causes, context.Cause(ctx))
+			mu.Unlock()
+			return ctx.Err()
+		}, event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		// e1 runs, e2 and e3 park for the only slot.
+		for _, id := range []string{"e1", "e2", "e3"} {
+			bus.Emit(context.Background(), &lrEvent{}, event.WithID(id))
+		}
+		synctest.Wait()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := bus.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown = %v, want context.DeadlineExceeded", err)
+		}
+		if got := time.Since(start); got != time.Second {
+			t.Errorf("Shutdown took %v of fake time, want 1s", got)
+		}
+		synctest.Wait() // the interrupted tasks report asynchronously
+
+		got, _ := errs.snapshot()
+		if len(got) != 3 {
+			t.Fatalf("OnErr calls = %d (%v), want 3", len(got), got)
+		}
+		for i, err := range got {
+			if !errors.Is(err, event.ErrShutdownInterrupted) || !errors.Is(err, context.Canceled) {
+				t.Errorf("OnErr[%d] = %v, want ErrShutdownInterrupted and context.Canceled", i, err)
+			}
+		}
+		mu.Lock()
+		if starts != 1 || len(causes) != 1 || !errors.Is(causes[0], event.ErrShutdownInterrupted) {
+			t.Errorf("handler starts = %d causes = %v, want one start cancelled with ErrShutdownInterrupted", starts, causes)
+		}
+		mu.Unlock()
+		if n := dlq.Len(); n != 0 {
+			t.Errorf("DLQ records = %d, want 0 (an interruption is never dead-lettered)", n)
+		}
+
+		interrupted := 0
+		for _, r := range logs.withOutcome() {
+			if r.attrs["outcome"] == "interrupted" {
+				interrupted++
+				if r.level != slog.LevelError {
+					t.Errorf("interrupted record level = %v, want Error", r.level)
+				}
+			}
+		}
+		if interrupted != 3 {
+			t.Errorf("interrupted slog records = %d, want 3", interrupted)
+		}
+
+		// After the deadline everything is refused.
+		bus.Emit(context.Background(), &lrEvent{})
+		if got, _ := errs.snapshot(); len(got) != 4 || !errors.Is(got[3], event.ErrBusClosed) {
+			t.Errorf("late emit OnErr = %v, want a fourth report matching ErrBusClosed", got)
+		}
+	})
+}
+
+func TestLocalBus_ShutdownAndCloseIdempotent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		bus := event.NewLocalBus(event.LocalBusOptions{})
+		if err := bus.Subscribe(context.Background(), "lr.evt",
+			func(context.Context, event.Event) error { time.Sleep(time.Second); return nil },
+			event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		bus.Emit(context.Background(), &lrEvent{})
+
+		for i := 0; i < 2; i++ {
+			if err := bus.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown #%d = %v, want nil", i+1, err)
+			}
+		}
+		if err := bus.Close(); err != nil {
+			t.Fatalf("Close after Shutdown = %v, want nil", err)
+		}
+		if err := bus.Close(); err != nil {
+			t.Fatalf("second Close = %v, want nil", err)
+		}
+	})
+}
+
+// TestLocalBus_CloseBoundedByShutdownTimeout proves that Close does not hang on
+// a handler that ignores its ctx: it returns at the ShutdownTimeout.
+func TestLocalBus_CloseBoundedByShutdownTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		bus := event.NewLocalBus(event.LocalBusOptions{ShutdownTimeout: time.Second})
+		if err := bus.Subscribe(context.Background(), "lr.evt",
+			func(context.Context, event.Event) error { time.Sleep(5 * time.Second); return nil },
+			event.WithHandlerName("stubborn")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		bus.Emit(context.Background(), &lrEvent{})
+		synctest.Wait()
+
+		start := time.Now()
+		if err := bus.Close(); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close = %v, want context.DeadlineExceeded", err)
+		}
+		if got := time.Since(start); got != time.Second {
+			t.Errorf("Close took %v of fake time, want 1s", got)
+		}
+
+		// The bus cannot stop a goroutine: once the stubborn handler returns,
+		// the bus drains and a later Shutdown reports success.
+		time.Sleep(5 * time.Second)
+		if err := bus.Shutdown(context.Background()); err != nil {
+			t.Errorf("Shutdown after the handler returned = %v, want nil", err)
+		}
+	})
+}
+
+// TestLocalBus_ShutdownWaitsForEmitSync proves that a running EmitSync is
+// in-flight work: Shutdown waits for its handler.
+func TestLocalBus_ShutdownWaitsForEmitSync(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		bus := event.NewLocalBus(event.LocalBusOptions{})
+		gate := make(chan struct{})
+		if err := bus.Subscribe(context.Background(), "lr.evt",
+			func(context.Context, event.Event) error { <-gate; return nil },
+			event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		syncRes := lrResult(func() error {
+			_, err := bus.EmitSync(context.Background(), &lrEvent{})
+			return err
+		})
+		synctest.Wait()
+
+		shutRes := lrResult(func() error { return bus.Shutdown(context.Background()) })
+		synctest.Wait()
+		select {
+		case err := <-shutRes:
+			t.Fatalf("Shutdown returned %v while an EmitSync handler was running", err)
+		default:
+		}
+
+		close(gate)
+		if err := <-syncRes; err != nil {
+			t.Errorf("EmitSync = %v, want nil", err)
+		}
+		if err := <-shutRes; err != nil {
+			t.Errorf("Shutdown = %v, want nil", err)
+		}
+	})
+}
+
+// TestLocalBus_SyncHandlerInterruptedAtDeadline proves that a sync handler is
+// cancelled with cause ErrShutdownInterrupted when the deadline fires and that
+// EmitSync reports it.
+func TestLocalBus_SyncHandlerInterruptedAtDeadline(t *testing.T) {
+	lrInstallLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		bus := event.NewLocalBus(event.LocalBusOptions{})
+		var cause atomic.Value
+		if err := bus.Subscribe(context.Background(), "lr.evt", func(ctx context.Context, _ event.Event) error {
+			<-ctx.Done()
+			cause.Store(context.Cause(ctx))
+			return ctx.Err()
+		}, event.WithHandlerName("h")); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		syncRes := lrResult(func() error {
+			_, err := bus.EmitSync(context.Background(), &lrEvent{})
+			return err
+		})
+		synctest.Wait()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := bus.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown = %v, want context.DeadlineExceeded", err)
+		}
+
+		err := <-syncRes
+		var he *event.HandlerError
+		if !errors.As(err, &he) || !errors.Is(err, event.ErrShutdownInterrupted) {
+			t.Errorf("EmitSync = %v, want a HandlerError matching ErrShutdownInterrupted", err)
+		}
+		if c, _ := cause.Load().(error); !errors.Is(c, event.ErrShutdownInterrupted) {
+			t.Errorf("sync handler ctx cause = %v, want ErrShutdownInterrupted", c)
+		}
+	})
+}
