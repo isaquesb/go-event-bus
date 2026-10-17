@@ -3,10 +3,13 @@ package event_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	event "github.com/isaquesb/go-event-bus"
 )
@@ -207,4 +210,213 @@ func TestSlogObserver_ExplicitLogger(t *testing.T) {
 	if n := len(def.records()); n != 0 {
 		t.Fatalf("default logger got %d records, want 0", n)
 	}
+}
+
+// soSummaries returns the summary records of recs.
+func soSummaries(recs []soRecord) []soRecord {
+	var out []soRecord
+	for _, r := range recs {
+		if r.Msg == "eventbus: repeated log records suppressed" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func soCheckSummary(t *testing.T, r soRecord, want map[string]any) {
+	t.Helper()
+	for k, v := range want {
+		if r.Attrs[k] != v {
+			t.Errorf("summary attr %s = %#v, want %#v", k, r.Attrs[k], v)
+		}
+	}
+}
+
+func TestSlogObserver_DedupWindowSummary(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		capt := newSoCapture()
+		obs := event.NewSlogObserver(slog.New(capt))
+		f := event.FailureContext{Handler: "billing", Outcome: event.OutcomeDeadLettered, Reason: "circuit_open", Cause: errors.New("x")}
+
+		for i := 0; i < 5; i++ {
+			obs.Failure(ctx, f)
+			time.Sleep(200 * time.Millisecond)
+		}
+		if n := len(capt.records()); n != 1 {
+			t.Fatalf("inside the window got %d records, want 1", n)
+		}
+
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		recs := capt.records()
+		if len(recs) != 2 {
+			t.Fatalf("after the window got %d records, want 2: %+v", len(recs), recs)
+		}
+		sums := soSummaries(recs)
+		if len(sums) != 1 {
+			t.Fatalf("got %d summaries, want 1", len(sums))
+		}
+		soCheckSummary(t, sums[0], map[string]any{
+			"handler": "billing", "signal": "failure", "outcome": "dead_lettered",
+			"reason": "circuit_open", "suppressed": int64(4), "window": 10 * time.Second,
+		})
+
+		obs.Failure(ctx, f)
+		if n := len(capt.records()); n != 3 {
+			t.Fatalf("sixth failure after the window: got %d records, want 3", n)
+		}
+	})
+}
+
+func TestSlogObserver_DedupKeysByReason(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		capt := newSoCapture()
+		obs := event.NewSlogObserver(slog.New(capt))
+		obs.Failure(ctx, event.FailureContext{Handler: "h", Outcome: event.OutcomeDropped, Reason: "terminal"})
+		obs.Failure(ctx, event.FailureContext{Handler: "h", Outcome: event.OutcomeDropped, Reason: "exhausted"})
+		if n := len(capt.records()); n != 2 {
+			t.Fatalf("got %d records, want 2 (distinct reasons are distinct keys)", n)
+		}
+		if n := event.SlogDedupKeys(obs); n != 2 {
+			t.Fatalf("tracked keys = %d, want 2", n)
+		}
+		obs.Flush()
+	})
+}
+
+func TestSlogObserver_TransitionsNeverDeduplicated(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		capt := newSoCapture()
+		obs := event.NewSlogObserver(slog.New(capt))
+		for i := 0; i < 5; i++ {
+			obs.BreakerTransition(ctx, event.BreakerTransition{Handler: "h", From: event.BreakerClosed, To: event.BreakerOpen, Seq: uint64(i + 1)})
+			time.Sleep(100 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Second)
+		synctest.Wait()
+		recs := capt.records()
+		if len(recs) != 5 {
+			t.Fatalf("got %d records, want 5", len(recs))
+		}
+		if n := len(soSummaries(recs)); n != 0 {
+			t.Fatalf("got %d summaries, want 0", n)
+		}
+		if n := event.SlogDedupKeys(obs); n != 0 {
+			t.Fatalf("tracked keys = %d, want 0", n)
+		}
+	})
+}
+
+func TestSlogObserver_LogEveryZeroDisables(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		capt := newSoCapture()
+		obs := event.NewSlogObserver(slog.New(capt), event.WithLogEvery(0))
+		for i := 0; i < 5; i++ {
+			obs.Failure(ctx, event.FailureContext{Handler: "h", Outcome: event.OutcomeDropped, Reason: "terminal"})
+		}
+		if n := len(capt.records()); n != 5 {
+			t.Fatalf("got %d records, want 5", n)
+		}
+		if n := event.SlogDedupKeys(obs); n != 0 {
+			t.Fatalf("tracked keys = %d, want 0 (no deduplication state)", n)
+		}
+	})
+}
+
+func TestSlogObserver_SingleOccurrenceNoSummary(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		capt := newSoCapture()
+		obs := event.NewSlogObserver(slog.New(capt))
+		obs.Failure(context.Background(), event.FailureContext{Handler: "h", Outcome: event.OutcomeDropped, Reason: "terminal"})
+		time.Sleep(30 * time.Second)
+		synctest.Wait()
+		recs := capt.records()
+		if len(recs) != 1 || len(soSummaries(recs)) != 0 {
+			t.Fatalf("got %d records (%d summaries), want 1 and 0", len(recs), len(soSummaries(recs)))
+		}
+	})
+}
+
+func TestSlogObserver_KeyCap(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		capt := newSoCapture()
+		obs := event.NewSlogObserver(slog.New(capt))
+		for i := 0; i < 1100; i++ {
+			obs.Failure(ctx, event.FailureContext{Handler: fmt.Sprintf("h-%d", i), Outcome: event.OutcomeDropped, Reason: "terminal"})
+		}
+		if n := len(capt.records()); n != 1100 {
+			t.Fatalf("got %d records, want 1100", n)
+		}
+		if n := event.SlogDedupKeys(obs); n > 1024 {
+			t.Fatalf("tracked keys = %d, want at most 1024", n)
+		}
+
+		// Elapsed, unsuppressed entries are swept to make room for new keys.
+		time.Sleep(11 * time.Second)
+		obs.Failure(ctx, event.FailureContext{Handler: "late", Outcome: event.OutcomeDropped, Reason: "terminal"})
+		if n := event.SlogDedupKeys(obs); n < 1 || n > 1024 {
+			t.Fatalf("tracked keys after sweep = %d, want 1..1024", n)
+		}
+		obs.Flush()
+	})
+}
+
+func TestSlogObserver_FlushEmitsPending(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		capt := newSoCapture()
+		obs := event.NewSlogObserver(slog.New(capt))
+		f := event.FailureContext{Handler: "billing", Outcome: event.OutcomeDropped, Reason: "terminal"}
+		for i := 0; i < 3; i++ {
+			obs.Failure(ctx, f)
+		}
+		if n := len(capt.records()); n != 1 {
+			t.Fatalf("before Flush got %d records, want 1", n)
+		}
+		obs.Flush()
+		recs := capt.records()
+		sums := soSummaries(recs)
+		if len(recs) != 2 || len(sums) != 1 {
+			t.Fatalf("after Flush got %d records (%d summaries), want 2 and 1", len(recs), len(sums))
+		}
+		soCheckSummary(t, sums[0], map[string]any{"handler": "billing", "suppressed": int64(2)})
+		if n := event.SlogDedupKeys(obs); n != 0 {
+			t.Fatalf("tracked keys after Flush = %d, want 0", n)
+		}
+		// The bubble ending without a pending timer goroutine is the leak check.
+	})
+}
+
+func TestSlogObserver_DedupPerSignal(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		capt := newSoCapture()
+		obs := event.NewSlogObserver(slog.New(capt))
+		for i := 0; i < 3; i++ {
+			obs.DecodeFailed(ctx, event.DecodeFailure{Handler: "h", Reason: "bad", Err: errors.New("e")})
+			obs.DLQPublishFailed(ctx, event.DLQPublishFailure{Handler: "h", Reason: "terminal", Err: errors.New("e")})
+		}
+		if n := len(capt.records()); n != 2 {
+			t.Fatalf("got %d immediate records, want 2", n)
+		}
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		sums := soSummaries(capt.records())
+		if len(sums) != 2 {
+			t.Fatalf("got %d summaries, want 2", len(sums))
+		}
+		signals := map[any]bool{}
+		for _, s := range sums {
+			signals[s.Attrs["signal"]] = true
+			soCheckSummary(t, s, map[string]any{"suppressed": int64(2)})
+		}
+		if !signals["decode_failed"] || !signals["dlq_publish_failed"] {
+			t.Fatalf("summary signals = %v, want decode_failed and dlq_publish_failed", signals)
+		}
+	})
 }

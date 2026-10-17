@@ -256,3 +256,6 @@ func (o *SlogObserver) RetryAttempt(ctx context.Context, info RetryAttemptInfo) 
 
 // HandlerDone logs nothing: metrics and traces cover it.
 func (o *SlogObserver) HandlerDone(context.Context, HandlerResult) {}
+
+// Flush is a placeholder until deduplication state exists.
+func (o *SlogObserver) Flush() {}
