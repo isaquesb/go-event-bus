@@ -501,10 +501,12 @@ func TestJetStreamBus_CloseWithImmediateDrain(t *testing.T) {
 
 // --- callback panic recovery (WR-01) ---
 
-// wrPanicObserver is a raw Observer (not wrapped in event.MultiObserver, which
-// would contain the panic) that records every signal, including the Failure it
-// is about to panic in. It stands for a bus whose observer misbehaves: the
-// msgHandler recover must still end the message.
+// wrPanicObserver is a raw Observer that records every signal, including the
+// Failure it panics in. WithObserver wraps it with event.MultiObserver (IN-03),
+// so the panic is logged once and never reaches the msgHandler recover: the
+// message gets the disposition it would get from a well-behaved observer. The
+// recover is exercised by panics that are not observer panics (Decode, the DLQ
+// publisher).
 type wrPanicObserver struct{ *joRecorder }
 
 func (o wrPanicObserver) Failure(ctx context.Context, f event.FailureContext) {
@@ -544,8 +546,8 @@ func wrFails(context.Context, event.Event) error { return errors.New("wr: failed
 func wrPermanent(context.Context, event.Event) error { return dispPermanent{} }
 
 // wrBus builds the bus under test over reg, recording into rec. A raw bus gets
-// wrPanicObserver in place of the MultiObserver NewBus installs, so the observer
-// panic reaches the msgHandler recover.
+// wrPanicObserver in place of the MultiObserver NewBus installs; WithObserver
+// isolates it again in every handler context.
 func wrBus(js *mdJS, reg event.Registry, opts BusOptions, rec *joRecorder, raw bool) *Bus {
 	opts.Observer = rec
 	bus := newMdBus(js, reg, opts)
@@ -556,9 +558,8 @@ func wrBus(js *mdJS, reg event.Registry, opts BusOptions, rec *joRecorder, raw b
 }
 
 // TestJetStreamBus_CallbackPanicRecoveredAndNaked covers the hand-back with
-// NakWithDelay: a non-final delivery with no settlement, and the final delivery
-// after settlement (the observer row). The final delivery without settlement is
-// reported and termed instead, see
+// NakWithDelay: a non-final delivery with no settlement. The final delivery
+// without settlement is reported and termed instead, see
 // TestJetStreamBus_CallbackPanicOnFinalDeliveryReported.
 func TestJetStreamBus_CallbackPanicRecoveredAndNaked(t *testing.T) {
 	for _, row := range []struct {
@@ -571,12 +572,6 @@ func TestJetStreamBus_CallbackPanicRecoveredAndNaked(t *testing.T) {
 		opts      BusOptions
 		fn        event.HandleFn
 	}{
-		{
-			name: "observer Failure", delivered: 3, wantDelay: 20 * time.Millisecond, wantPanic: "wr: observer boom",
-			raw: true,
-			reg: func() event.Registry { return newMdRegistry("rb.order") },
-			fn:  wrFails,
-		},
 		{
 			name: "DLQ publisher, first delivery", delivered: 1, wantDelay: 10 * time.Millisecond, wantPanic: "wr: dlq boom",
 			reg:  func() event.Registry { return newMdRegistry("rb.order") },
@@ -731,21 +726,27 @@ func TestJetStreamBus_CallbackPanicOnFinalDeliveryReported(t *testing.T) {
 	}
 }
 
-func TestJetStreamBus_CallbackPanicAfterSettleTermed(t *testing.T) {
+// TestJetStreamBus_ObserverPanicAfterSettleIsolated: the observer panics in
+// Failure after Settle dead-lettered or reported the message. WithObserver
+// isolates the panic, so the message keeps its settled disposition and the
+// recover has nothing to do.
+func TestJetStreamBus_ObserverPanicAfterSettleIsolated(t *testing.T) {
 	for _, row := range []struct {
 		name        string
 		wantDLQ     int
+		wantTerms   []string
+		wantAcks    int
 		wantOutcome event.Outcome
 		reg         func() event.Registry
 		fn          event.HandleFn
 	}{
 		{
-			name: "dead-lettered, observer Failure", wantDLQ: 1, wantOutcome: event.OutcomeDeadLettered,
+			name: "dead-lettered, observer Failure", wantDLQ: 1, wantTerms: []string{"dead_lettered: terminal"}, wantOutcome: event.OutcomeDeadLettered,
 			reg: func() event.Registry { return newMdRegistry("rb.order") },
 			fn:  wrPermanent,
 		},
 		{
-			name: "chain dead-lettered, observer Failure", wantDLQ: 0, wantOutcome: event.OutcomeDeadLettered,
+			name: "chain dead-lettered, observer Failure", wantDLQ: 0, wantAcks: 1, wantOutcome: event.OutcomeDeadLettered,
 			reg: func() event.Registry { return newMdRegistry("rb.order") },
 			fn: func(context.Context, event.Event) error {
 				return &event.DeadLetteredError{Cause: dispPermanent{}, Reason: event.ReasonTerminal}
@@ -764,17 +765,17 @@ func TestJetStreamBus_CallbackPanicAfterSettleTermed(t *testing.T) {
 				bus.msgHandler(context.Background(), "h", row.fn, rbPolicy())(msg)
 
 				got := msg.snapshot()
-				if want := []string{termReasonPanicAfterSettle}; !slices.Equal(got.termReasons, want) {
-					t.Errorf("termReasons = %q, want %q", got.termReasons, want)
+				if !slices.Equal(got.termReasons, row.wantTerms) {
+					t.Errorf("termReasons = %q, want %q", got.termReasons, row.wantTerms)
 				}
-				if got.naks != 0 || got.acks != 0 || got.plainTerms != 0 || len(got.nakDelays) != 0 {
-					t.Errorf("snapshot = %+v, want only a TermWithReason (no redelivery)", got)
+				if got.naks != 0 || got.acks != row.wantAcks || got.plainTerms != 0 || len(got.nakDelays) != 0 {
+					t.Errorf("snapshot = %+v, want the settled disposition only (no redelivery)", got)
 				}
 				if dlq.Len() != row.wantDLQ {
 					t.Errorf("DLQ records = %d, want %d", dlq.Len(), row.wantDLQ)
 				}
-				if !joPanicReported(rec, "wr: observer boom") {
-					t.Errorf("no InternalError with Op panic and value wr: observer boom, got %+v", rec.internalErrors())
+				if joPanicReported(rec, "wr: observer boom") {
+					t.Errorf("InternalError for an observer panic that WithObserver isolates: %+v", rec.internalErrors())
 				}
 				fails := rec.failures()
 				if len(fails) != 1 || fails[0].Outcome != row.wantOutcome {
@@ -791,10 +792,11 @@ func TestJetStreamBus_CallbackPanicAfterSettleTermed(t *testing.T) {
 	}
 }
 
-// TestJetStreamBus_DroppedThenObserverPanicTermed is the dropped row of the
-// after-settlement panic: no publisher, so Settle ends the message as dropped and
-// the observer panics on the Failure.
-func TestJetStreamBus_DroppedThenObserverPanicTermed(t *testing.T) {
+// TestJetStreamBus_DroppedThenObserverPanicIsolated is the dropped row of the
+// after-settlement observer panic: no publisher, so Settle ends the message as
+// dropped and the observer panics on the Failure. The panic is isolated and the
+// message is termed with the dropped reason.
+func TestJetStreamBus_DroppedThenObserverPanicIsolated(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		js := &mdJS{}
 		payload := rbEmit(t, newMdBus(js, newMdRegistry("rb.order"), BusOptions{}), js)
@@ -805,15 +807,15 @@ func TestJetStreamBus_DroppedThenObserverPanicTermed(t *testing.T) {
 		bus.msgHandler(context.Background(), "h", wrPermanent, rbPolicy())(msg)
 
 		got := msg.snapshot()
-		if want := []string{termReasonPanicAfterSettle}; !slices.Equal(got.termReasons, want) {
+		if want := []string{"dropped: terminal"}; !slices.Equal(got.termReasons, want) {
 			t.Errorf("termReasons = %q, want %q", got.termReasons, want)
 		}
 		fails := rec.failures()
 		if len(fails) != 1 || fails[0].Outcome != event.OutcomeDropped {
 			t.Errorf("Failure calls = %+v, want exactly one with outcome dropped", fails)
 		}
-		if !joPanicReported(rec, "wr: observer boom") {
-			t.Errorf("no InternalError with Op panic and value wr: observer boom, got %+v", rec.internalErrors())
+		if joPanicReported(rec, "wr: observer boom") {
+			t.Errorf("InternalError for an observer panic that WithObserver isolates: %+v", rec.internalErrors())
 		}
 	})
 }
@@ -967,6 +969,9 @@ func TestJetStreamBus_RecoverActsBeforeShutdownReturns(t *testing.T) {
 	}
 }
 
+// TestJetStreamBus_HandBackObserverPanicNakedOnce: the observer panics while a
+// message is handed back during Shutdown. The panic is isolated, so the message
+// is still Naked exactly once.
 func TestJetStreamBus_HandBackObserverPanicNakedOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rec := &joRecorder{}
@@ -984,8 +989,8 @@ func TestJetStreamBus_HandBackObserverPanicNakedOnce(t *testing.T) {
 		if got.naks != 1 || got.acks != 0 || got.plainTerms != 0 || len(got.termReasons) != 0 || len(got.nakDelays) != 0 {
 			t.Errorf("snapshot = %+v, want exactly one plain Nak", got)
 		}
-		if !joPanicReported(rec, "wr: observer boom") {
-			t.Errorf("no InternalError with Op panic and value wr: observer boom, got %+v", rec.internalErrors())
+		if joPanicReported(rec, "wr: observer boom") {
+			t.Errorf("InternalError for an observer panic that WithObserver isolates: %+v", rec.internalErrors())
 		}
 
 		cons.cc.finish()
