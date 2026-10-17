@@ -7,12 +7,15 @@
 #   --workspace: verify the selected modules (default all 9) against the local
 #           root through a temporary go.work over all 9 modules (D-24). Needs no
 #           golangci-lint (lint runs only when golangci-lint v2 is on PATH). This
-#           is the pre-release signal while json, nats and jetstream use root API
-#           that is not published yet, so their per-module GOWORK=off legs are red.
+#           is the pre-release signal: the per-module GOWORK=off legs of modules that
+#           use root API that is not published yet are red until the release (for
+#           v0.4.0: invoker, json, nats, jetstream, telemetry, prometheus, examples).
 #           The directive, toolchain, tidy and verify guards still run with GOWORK=off.
 #   --integration: also run the JetStream integration tests against nats:2.15.1
 #           (uses $NATS_URL as-is when already set, otherwise starts docker;
 #           override host ports with NATS_HOST_PORT / NATS_MON_PORT, default 4222 / 8222).
+#           They always run over the temporary go.work of all 9 modules, like the CI
+#           integration job, so they test the tree and not the published modules.
 #
 # Never touches ./go.work or ./go.work.sum, never pushes, never edits tracked files.
 set -euo pipefail
@@ -98,9 +101,7 @@ run_module() {
     if [ "$mod" = "jetstream" ]; then
       go vet -tags integration ./... || fail "$name" "vet-integration"
     fi
-    if [ "$mod" != "examples" ]; then
-      go test -race -count=1 ./... || fail "$name" "test"
-    fi
+    go test -race -count=1 ./... || fail "$name" "test"
     golangci-lint run ./... || fail "$name" "lint"
   )
   echo "PASS $name"
@@ -135,9 +136,7 @@ run_module_workspace() {
     if [ "$mod" = "jetstream" ]; then
       go vet -tags integration ./... || fail "$name" "vet-integration"
     fi
-    if [ "$mod" != "examples" ]; then
-      go test -race -count=1 ./... || fail "$name" "test"
-    fi
+    go test -race -count=1 ./... || fail "$name" "test"
     if [ "$HAVE_LINT" -eq 1 ]; then
       golangci-lint run ./... || fail "$name" "lint"
     else
@@ -196,9 +195,10 @@ if [ "$INTEGRATION" -eq 1 ]; then
     fi
     export NATS_URL="nats://localhost:${NATS_HOST_PORT}"
   fi
+  make_workspace
   (
     cd "$ROOT/jetstream"
-    if [ "$WORKSPACE_MODE" -eq 1 ]; then export GOWORK="$WS_FILE"; fi
+    export GOWORK="$WS_FILE"
     go test -tags integration -race -count=1 ./... || fail integration "test"
   )
   echo "PASS integration"
