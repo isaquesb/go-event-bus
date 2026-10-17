@@ -100,6 +100,8 @@ type BusOptions struct {
 	ShutdownTimeout time.Duration
 }
 
+var _ event.Shutdowner = (*Bus)(nil)
+
 type Bus struct {
 	js       jsBackend
 	registry event.Registry
@@ -109,6 +111,8 @@ type Bus struct {
 	inherit  []string
 	dlq      event.DLQPublisher
 	pubRetry PublishRetryPolicy
+
+	shutdownTimeout time.Duration
 
 	circuitOpenDelay time.Duration
 	rateLimitDelay   time.Duration
@@ -147,8 +151,12 @@ func NewBus(
 			"hint", "set BusOptions.DLQPublisher to the jetstream.NewDLQ value given to invoker.NewDLQ",
 		)
 	}
+	if opts.ShutdownTimeout <= 0 {
+		opts.ShutdownTimeout = event.DefaultShutdownTimeout
+	}
 	return &Bus{
 		pubRetry:         opts.PublishRetry.normalized(),
+		shutdownTimeout:  opts.ShutdownTimeout,
 		js:               js,
 		registry:         registry,
 		onErr:            opts.OnErr,
@@ -177,11 +185,20 @@ func (b *Bus) resolve(ctx context.Context, e event.Event, cfg event.EmitOptions)
 // minutes by default); an app-level re-Emit is deduplicated only when it
 // carries the same id (WithID or Event.Id()), because generated ids differ per
 // call. A publish acknowledged as a duplicate is not an error.
+//
+// Once Shutdown or Close began, Emit returns event.ErrBusClosed, except for a
+// handler emitting with its own ctx while its message is still in flight.
 func (b *Bus) Emit(
 	ctx context.Context,
 	evt event.Event,
 	opts ...event.EmitOption,
 ) error {
+	release, err := b.life.Admit(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	cfg := event.ApplyEmitOptions(evt, opts...)
 	md := b.resolve(ctx, evt, cfg)
 
@@ -336,6 +353,10 @@ func (b *Bus) Subscribe(
 	handler event.HandleFn,
 	opts ...event.SubscribeOption,
 ) error {
+	if b.life.Closing() {
+		return event.ErrBusClosed
+	}
+
 	cfg := event.ApplyOptions(opts...)
 
 	if cfg.Stream == "" {
@@ -406,7 +427,14 @@ func (b *Bus) Subscribe(
 		return err
 	}
 
+	// Shutdown may have begun while Consume ran: a consumer registered after
+	// the drain took its list would escape it.
 	b.mu.Lock()
+	if b.life.Closing() {
+		b.mu.Unlock()
+		cc.Stop()
+		return event.ErrBusClosed
+	}
 	b.consumers = append(b.consumers, cc)
 	b.mu.Unlock()
 
@@ -431,11 +459,19 @@ func (b *Bus) RegisterSubscribers(ctx context.Context, subs ...event.Subscriber)
 	return nil
 }
 
-// Shutdown is a stub until the GREEN step.
-func (b *Bus) Shutdown(ctx context.Context) error { return nil }
+// Shutdown stops accepting work and drains the bus bounded by ctx.
+//
+// New Emit and Subscribe calls return event.ErrBusClosed, except a handler
+// emitting with its own ctx while its message is in flight. Every consumer is
+// drained: messages already buffered are handed back to the server with Nak
+// instead of running (D-27), and Shutdown waits for each consumer to report
+// Closed and for the in-flight handlers to return. When ctx expires first, the
+// consumers are stopped, the running handlers are cancelled with cause
+// event.ErrShutdownInterrupted (their messages are Naked, never dead-lettered)
+// and Shutdown returns ctx.Err(). It is safe to call more than once.
+func (b *Bus) Shutdown(ctx context.Context) error {
+	b.life.BeginShutdown()
 
-// Close gracefully drains all consumers and waits for in-flight messages.
-func (b *Bus) Close() error {
 	b.mu.Lock()
 	consumers := b.consumers
 	b.consumers = nil
@@ -445,9 +481,26 @@ func (b *Bus) Close() error {
 		cc.Drain()
 	}
 	for _, cc := range consumers {
-		<-cc.Closed()
+		select {
+		case <-cc.Closed():
+		case <-ctx.Done():
+			for _, c := range consumers {
+				c.Stop()
+			}
+			b.life.Interrupt()
+			return ctx.Err()
+		}
 	}
-	return nil
+	return b.life.Wait(ctx)
+}
+
+// Close shuts the bus down with Shutdown, bounded by BusOptions.ShutdownTimeout
+// (event.DefaultShutdownTimeout when unset). It never waits without a bound: on
+// timeout it returns context.DeadlineExceeded after interrupting the handlers.
+func (b *Bus) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), b.shutdownTimeout)
+	defer cancel()
+	return b.Shutdown(ctx)
 }
 
 // deliveryPolicy is the redelivery configuration validated at Subscribe time.
@@ -506,6 +559,10 @@ func (b *Bus) msgHandler(
 	policy deliveryPolicy,
 ) jetstream.MessageHandler {
 	return func(msg jetstream.Msg) {
+		if b.life.Closing() {
+			b.handBack(ctx, msg, handlerName, policy)
+			return
+		}
 		release, ok := b.life.Track()
 		if !ok {
 			b.handBack(ctx, msg, handlerName, policy)
