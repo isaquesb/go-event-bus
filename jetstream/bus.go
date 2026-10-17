@@ -109,6 +109,9 @@ type Bus struct {
 	circuitOpenDelay time.Duration
 	rateLimitDelay   time.Duration
 
+	// life is the shutdown state machine shared with LocalBus and NATS Core.
+	life event.Lifecycle
+
 	mu        sync.Mutex
 	consumers []jetstream.ConsumeContext
 }
@@ -496,16 +499,30 @@ func (b *Bus) msgHandler(
 	policy deliveryPolicy,
 ) jetstream.MessageHandler {
 	return func(msg jetstream.Msg) {
+		release, ok := b.life.Track()
+		if !ok {
+			b.handBack(ctx, msg, handlerName, policy)
+			return
+		}
+		defer release()
+
+		// hctx keeps the Subscribe ctx values and cancellation and is also
+		// cancelled, with cause ErrShutdownInterrupted, when Shutdown gives up.
+		// It is the SubscriptionCtx of every Settle call, so a deadline
+		// cancellation is an interruption (Nak), never a dead-letter.
+		hctx, stop := b.life.HandlerContext(ctx, false)
+		defer stop()
+
 		d := b.delivery(msg, policy)
 
-		msgCtx, evt, err := b.registry.Decode(ctx, msg.Data())
+		msgCtx, evt, err := b.registry.Decode(hctx, msg.Data())
 		if err != nil {
 			// A decode failure has no event and no handler run. Settle
 			// dead-letters the raw bytes (permanent failures) or retries until
 			// the final delivery (ErrUnknownVersion), never a silent Term.
 			err = event.WrapDecodeError(err)
-			s := event.Settle(event.WithDelivery(ctx, d), event.SettleInput{
-				SubscriptionCtx: ctx,
+			s := event.Settle(event.WithDelivery(hctx, d), event.SettleInput{
+				SubscriptionCtx: hctx,
 				Evt:             nil,
 				Handler:         handlerName,
 				Err:             err,
@@ -519,12 +536,13 @@ func (b *Bus) msgHandler(
 		msgCtx = event.WithDelivery(msgCtx, d)
 		msgCtx = event.WithExecution(msgCtx, event.Execution{Handler: handlerName, StartedAt: time.Now()})
 
-		err = b.invoker.Invoke(msgCtx, evt, handlerName, func(ctx context.Context) error {
-			return fn(ctx, evt)
+		err = event.InvokeHandler(msgCtx, b.invoker, evt, handlerName, func(c context.Context) error {
+			return fn(c, evt)
 		})
+		err = event.WrapInterrupted(hctx, err)
 
 		s := event.Settle(msgCtx, event.SettleInput{
-			SubscriptionCtx: ctx,
+			SubscriptionCtx: hctx,
 			Evt:             evt,
 			Handler:         handlerName,
 			Err:             err,
@@ -533,6 +551,38 @@ func (b *Bus) msgHandler(
 		})
 		b.apply(msg, handlerName, s, err, d, policy)
 	}
+}
+
+// handBack gives an unstarted message back to the server with Nak while the bus
+// is closing or interrupted: the handler does not run, the message is
+// redelivered to another consumer and is never dead-lettered (Phase 8 D-07).
+//
+// Each hand-back consumes one delivery, the accepted D-27 cost. On the final
+// delivery the server will not redeliver, so the hand-back is reported once as
+// interrupted: Settle sees a cancelled subscription context, never publishes
+// and calls OnErr with a nil event. The Nak has already happened by then.
+func (b *Bus) handBack(ctx context.Context, msg jetstream.Msg, handlerName string, policy deliveryPolicy) {
+	d := b.delivery(msg, policy)
+	if err := msg.Nak(); err != nil {
+		slog.Warn("eventbus: handing back message failed, the broker may redeliver it",
+			"handler", handlerName,
+			"subject", d.Subject,
+			"error", err,
+		)
+	}
+	if !d.Final() {
+		return
+	}
+	cctx, cancel := context.WithCancelCause(ctx)
+	cancel(event.ErrShutdownInterrupted)
+	event.Settle(event.WithDelivery(ctx, d), event.SettleInput{
+		SubscriptionCtx: cctx,
+		Evt:             nil,
+		Handler:         handlerName,
+		Err:             fmt.Errorf("%w: %w", event.ErrShutdownInterrupted, context.Canceled),
+		Publisher:       b.dlq,
+		OnErr:           b.onErr,
+	})
 }
 
 // apply performs the one broker action for s. A failing ack call is logged and
