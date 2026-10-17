@@ -326,7 +326,7 @@ func ExampleErrorHandling() {
 | Terminal interface     | No          | Immediately           | No  |
 | Retryable interface    | Depends     | After exhaustion      | Yes |
 | ErrDuplicate           | No          | No (Acked)            | No  |
-| ErrDeadLettered        | No          | No (Acked, OnErr)     | No  |
+| ErrDeadLettered        | No          | No (Acked, Failure)   | No  |
 | ErrRateLimited         | No (delay)  | Final delivery only   | No  |
 | ErrCircuitOpen         | No (delay)  | Final delivery only   | N/A |
 | ErrInProgress          | No (delay)  | Final delivery only   | No  |
@@ -339,8 +339,9 @@ CB? = Counts as failure for Circuit Breaker
 After exhaustion = retried in-process, dead-lettered when retries run out on
   the final delivery.
 Immediately = dead-lettered on the first failure, no further attempts.
-Acked = the message is acknowledged and not reported as a failure; only
-  ErrDeadLettered is reported through OnErr.
+Acked = the message is acknowledged and not retried; a dead-lettered failure
+  (ErrDeadLettered) is reported once through Observer.Failure with outcome
+  dead_lettered.
 No (delay) = not retried in-process; the broker redelivers the message after a
   delay and it is dead-lettered only on the final delivery.
 Never = a cancelled subscription context is never dead-lettered (the handler
