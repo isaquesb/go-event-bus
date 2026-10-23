@@ -23,5 +23,6 @@ Several backends run side by side with `event.MultiObserver`, which also isolate
 ## Pages
 
 - [Observer]({{ site.baseurl }}/observability/observer/): the ten signals, when each fires, `Failure` exactly once per terminal outcome, writing and combining observers
+- [Metrics]({{ site.baseurl }}/observability/metrics/): the eleven metric families, their OpenTelemetry names, label vocabularies and what each `outcome` means
 - [Prometheus]({{ site.baseurl }}/observability/prometheus/): setup of `prometheus.NewObserver`
 - [Tracing]({{ site.baseurl }}/observability/tracing/): `telemetry.NewTracerInvoker`, spans and span events
