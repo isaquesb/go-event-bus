@@ -3,7 +3,7 @@ module github.com/isaquesb/go-event-bus/telemetry
 go 1.26.0
 
 require (
-	github.com/isaquesb/go-event-bus v0.3.0
+	github.com/isaquesb/go-event-bus v0.4.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
