@@ -51,7 +51,7 @@ bus := event.NewLocalBus(event.LocalBusOptions{
 })
 ```
 
-`MultiObserver` calls the children in order and isolates a panic in any of them from the handler. A `SlogObserver` that you create yourself is not flushed by the bus, so call its `Flush` on shutdown.
+`MultiObserver` calls the children in order and isolates a panic in any of them from the handler. A `SlogObserver` that you create yourself is not flushed by the bus, so call its `Flush` on shutdown. See [logs]({{ site.baseurl }}/observability/logs/).
 
 ## Rules
 

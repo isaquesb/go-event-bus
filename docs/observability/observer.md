@@ -159,7 +159,7 @@ A bus always wraps the observer you give it with `MultiObserver`. Outside a bus,
 
 ## Defaults
 
-- A `nil` `Observer` in the bus options installs `event.NewSlogObserver(nil)`, so failures are never silent with zero configuration. See the logs page.
+- A `nil` `Observer` in the bus options installs `event.NewSlogObserver(nil)`, so failures are never silent with zero configuration. See [logs]({{ site.baseurl }}/observability/logs/).
 - `event.NopObserver{}` silences everything.
 - The metric and trace backends are `prometheus.NewObserver` ([metrics]({{ site.baseurl }}/observability/metrics/), [Prometheus]({{ site.baseurl }}/observability/prometheus/)) and `telemetry.NewObserver` plus `telemetry.NewTracerInvoker` ([tracing]({{ site.baseurl }}/observability/tracing/)).
 
