@@ -62,7 +62,22 @@ type OnErr interface {
 }
 ```
 
-Called when a handler fails processing the event. Allows event-level error handling, useful for critical events that need custom failure notification.
+Called when a message of this event ends in a terminal failure. Allows event-level error handling, useful for critical events that need custom failure notification.
+
+`OnErr` is the **only** error callback left. There is no bus-level error callback option; a bus reports failures to its `Observer` instead (see [Bus Interface]({{ site.baseurl }}/core-concepts/bus-interface/#observing-failures)). The order is fixed:
+
+1. `Observer.Failure` runs first, once per terminal outcome of the message;
+2. the event's own `OnErr(ctx, err, listenerName)` runs after it, once per terminal failure, with `listenerName` the handler name.
+
+An intermediate retry or a redelivery that will still happen is not a terminal failure and does not call either. A decode failure has no event, so only `Observer.Failure` is called. A panic inside `OnErr` is isolated and reported as an `InternalError` signal; it never reaches the transport. The `ctx` it receives is the message context, so it carries the event [Metadata](#event-metadata) and trace:
+
+```go
+func (e ReportRequested) OnErr(ctx context.Context, err error, listenerName string) {
+    slog.Error("report failed", "report_id", e.ReportID, "handler", listenerName, "error", err)
+}
+```
+
+Like all hooks it runs synchronously on the handler goroutine, so it must be fast and must never block. See [Observability]({{ site.baseurl }}/observability/).
 
 ### WithIdempotencyKey (invoker package)
 

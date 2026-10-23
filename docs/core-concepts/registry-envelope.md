@@ -25,6 +25,24 @@ Where `Factory` creates a new empty event instance:
 type Factory func() Event
 ```
 
+### Decode and the context
+
+`Decode` returns three values: a context, the event and an error. Once the envelope has parsed, the returned context carries the envelope **Metadata** (`event.MetadataFromContext` reads the id, correlation id, causation id and headers) and the extracted trace context **even when decoding then fails**: an unknown event, a missing upcaster or an upcaster error still leave the context with the ids of the message. Only a malformed envelope (it does not parse, or it has no name) returns the context it was given, unchanged.
+
+Transports rely on this: a decode failure has no event and no handler run, so the transport settles it on the context `Decode` returned, not on the one it passed in. The failure therefore keeps the event id, the correlation id and the trace of the undecodable message, `Observer.Failure` receives them in its `FailureContext`, and the dead-letter record keeps its `Eventbus-Dlq-Event-Id`, `Eventbus-Dlq-Event-Name` and traceparent headers. A custom transport must do the same: keep the context `Decode` returned, never discard it.
+
+Every decode failure is a `*event.DecodeError` carrying the envelope name and the version reached, classified by a sentinel you match with `errors.Is`. The class decides the reason code reported for the message and the disposition:
+
+| Error | Reason | Disposition |
+|---|---|---|
+| `event.ErrMalformedEnvelope` | `decode_malformed` | Terminal: dead-lettered on any delivery, never retried |
+| `event.ErrUnknownEvent` | `decode_unknown_event` | Terminal |
+| `event.ErrMissingUpcaster` | `decode_missing_upcaster` | Terminal |
+| `event.ErrUnknownVersion` | `unknown_version` | Retried until the final delivery (the producer may be newer than this consumer), then terminal |
+| any other decode error (an upcaster's own error) | `decode_failed` | Terminal |
+
+The disposition of each reason on every transport is in the [Failure Model]({{ site.baseurl }}/architecture/failure-model/). See [JSON Registry]({{ site.baseurl }}/serialization/json-registry/#decode-errors) for the registry that produces them.
+
 ### EnvelopeEncoder
 
 A registry can also implement the optional `EnvelopeEncoder` interface:
