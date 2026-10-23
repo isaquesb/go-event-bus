@@ -2,7 +2,7 @@
 layout: default
 title: Prometheus
 parent: Observability
-nav_order: 2
+nav_order: 4
 ---
 
 # Prometheus Provider

@@ -2,7 +2,7 @@
 layout: default
 title: Tracing
 parent: Observability
-nav_order: 1
+nav_order: 5
 ---
 
 # Tracing
