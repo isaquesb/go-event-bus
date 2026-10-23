@@ -321,6 +321,7 @@ Alert rules that sum `eventbus_circuit_blocked_total` or `eventbus_ratelimit_blo
 - `MetricProvider`, `NoopProvider` (with `IncCounter`, `ObserveHistogram` and `SetGauge`) and `Labels`: implement `event.Observer` (embed `event.NopObserver`) instead
 - The `metrics MetricProvider` parameter of `NewRetry`, `NewCircuitBreaker`, `NewRateLimiter`, `NewIdempotency` and `NewDLQ`
 - `DLQPublisher.Publish(ctx, evt, cause)`: the method is now `Publish(ctx, rec event.DLQRecord)` (`invoker.DLQPublisher` is an alias of `event.DLQPublisher`)
+- `IdempotencyConfig.KeyFunc`: the invoker never read it. Delete the assignment; the key comes from the event's `IdempotencyKey()` (`WithIdempotencyKey`) or its id (`WithId`), as before
 
 #### JetStream Transport (`github.com/isaquesb/go-event-bus/jetstream`)
 - `NewDQL`: use `NewDLQ(js, prefix, opts...)`; set the prefix to `dql.` to keep the v0.3.0 subjects

@@ -200,7 +200,7 @@ The names below also have error values re-exported from the root package: `ErrDu
 - [`RateLimitStore`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#RateLimitStore) - Token-bucket store interface
 - [`Idempotency`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#Idempotency) - Duplicate detection
 - [`NewIdempotency`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#NewIdempotency) - Creates the `Idempotency` invoker over a store
-- [`IdempotencyConfig`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#IdempotencyConfig) - Processing TTL of the invoker (`KeyFunc` is declared but has no effect)
+- [`IdempotencyConfig`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#IdempotencyConfig) - Processing TTL of the invoker
 - [`IdempotencyStore`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#IdempotencyStore) - Idempotency record store interface
 - [`IdempotencyRecord`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#IdempotencyRecord) - Status and times of one execution record
 - [`IdempotencyStatus`](https://pkg.go.dev/github.com/isaquesb/go-event-bus/invoker#IdempotencyStatus) - Status of a record: processing, completed, failed or dead_lettered

@@ -23,7 +23,8 @@ invoker.NewIdempotency(
 | Field | Type | Description |
 |---|---|---|
 | `ProcessingTTL` | `time.Duration` | How long a `processing` marker is respected before another execution may take it over (default: 5m) |
-| `KeyFunc` | `func(Event, string) string` | Declared on the config but not consulted by the invoker: the key always comes from the event, see [Key Extraction](#key-extraction) |
+
+The key always comes from the event, see [Key Extraction](#key-extraction).
 
 Idempotency sits outside the DLQ invoker, so it sees the `ErrDeadLettered` the DLQ returns. The reason for each position is on the [composition page]({{ site.baseurl }}/invoker-chain/composition/).
 

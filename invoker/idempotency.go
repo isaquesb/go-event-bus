@@ -40,7 +40,6 @@ type IdempotencyRecord struct {
 }
 
 type IdempotencyConfig struct {
-	KeyFunc       func(evt event.Event, handler string) string
 	ProcessingTTL time.Duration
 }
 
