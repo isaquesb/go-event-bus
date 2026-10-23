@@ -121,7 +121,7 @@ The publish carries no message id, so the DLQ stream deduplicates nothing: dupli
 ### Rules for the DLQ stream
 
 - Never set `MaxMsgsPerSubject` on the DLQ stream. Many records share one subject (`dlq.` plus the original subject), and that limit would silently delete the older ones to make room for the newer ones.
-- Never compact or truncate the stream. It holds the only copy of the failed messages. Choose retention with `MaxAge` or `MaxBytes`, on purpose.
+- Never compact or truncate the stream. It holds the only copy of the failed messages. Choose retention with `MaxAge` or `MaxBytes`, on purpose. The [log-compaction guide]({{ site.baseurl }}/guides/log-compaction/) explains why compaction suits entity streams and never the DLQ.
 
 ## Publisher on the invoker and on the bus
 

@@ -57,6 +57,7 @@ See [Redis Idempotency Store]({{ site.baseurl }}/distributed-stores/redis-idempo
 - DLQ records are **at-least-once**. A crash between the dead-letter publish and the acknowledgement, or a lost acknowledgement, can publish the same record twice. The publish carries no message id, so the DLQ stream does not deduplicate. Whatever consumes the DLQ must tolerate duplicates.
 - The bus needs the same publisher as the DLQ invoker so failures the chain cannot see (undecodable messages, rate-limit and in-progress rejections on the final delivery) are dead-lettered too. See [DLQ Invoker]({{ site.baseurl }}/invoker-chain/dlq-invoker/).
 - A replay runs the handler again, from scratch. Combined with idempotency this is intended: a `dead_lettered` record does not block it.
+- A stream that is compacted (one message kept per subject) changes what a consumer can see and what a replay can restore, and it must never hold the DLQ. See the [log-compaction guide]({{ site.baseurl }}/guides/log-compaction/).
 
 ## Publishing and duplicates
 
