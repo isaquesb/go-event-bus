@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - 2026-10-17
+## [0.4.0] - 2026-10-23
 
 v0.4.0 is a breaking release. It gives every event an identity and a causal lineage, defines what happens to a message that fails (one disposition shared by all transports, a dead-letter record you can replay), makes the bus safe to stop and to overload, and replaces the metrics plumbing with one `Observer`. **This section is the migration guide**: there is no separate migration page. Every signature break has a **Breaking:** entry with a before and an after snippet, and every behavior change has a short note.
 
