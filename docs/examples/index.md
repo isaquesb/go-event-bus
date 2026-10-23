@@ -19,5 +19,6 @@ Complete, runnable examples demonstrating key features of Go Event Bus.
 | [Subscriber Pattern]({{ site.baseurl }}/examples/subscriber-pattern/) | Modular handler organization |
 | [Redis Stores]({{ site.baseurl }}/examples/redis-stores/) | Distributed idempotency and rate limiting |
 | [Error Handling]({{ site.baseurl }}/examples/error-handling/) | Error classification and DLQ patterns |
+| [Causation & Correlation]({{ site.baseurl }}/examples/causation-correlation/) | Event ids, causal lineage and header inheritance |
 
 All examples are available in the [`examples/`](https://github.com/isaquesb/go-event-bus/tree/main/examples) directory.
