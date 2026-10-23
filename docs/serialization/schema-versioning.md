@@ -105,4 +105,13 @@ registry.RegisterUpcaster(&UserRegisteredV2ToV3{})
 
 When decoding a V1 message, the registry automatically chains: V1 → V2 → V3. Handlers always receive the latest version.
 
-If an upcaster is missing for any step, `Decode` returns an error: `"no upcaster for user.registered v1 → v3"`.
+If an upcaster is missing for any step, `Decode` returns an `*event.DecodeError` that wraps `event.ErrMissingUpcaster` (for example `"event: decode user.registered v1: event: missing upcaster: v1 to v3"`).
+
+### Version rules
+
+- **Version 0 is treated as version 1.** An envelope with `"version":0`, or without a `version` key, decodes as version 1. `Register` treats a version <= 0 as 1, so an event whose `Version()` is 0 round-trips, and registering 0 and 1 for one name keeps the last factory. `Encode` writes the event's `Version()` unchanged, so such an event still carries `"version":0`. An upcaster whose `FromVersion()` is 0 counts as an upcaster from version 1, and one that only reaches version 1 is ignored.
+- **Newer than the latest registered version** returns `event.ErrUnknownVersion`, which is distinct from `event.ErrMissingUpcaster`. This is the rolling-deploy case where a newer producer is ahead of the consumer, so a later retry can succeed once the consumer is upgraded.
+- **Upcasters must advance the version.** An upcaster whose `ToVersion()` is not greater than its `FromVersion()`, or goes past the latest registered version, makes `Decode` return an error instead of looping.
+- **Upcasters run without the registry lock**, so an upcaster may call `Register` or `Decode` on the same registry.
+
+See [JSON Registry]({{ site.baseurl }}/serialization/json-registry/#decode-errors) for the full error table.

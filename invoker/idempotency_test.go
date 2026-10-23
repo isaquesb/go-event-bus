@@ -37,7 +37,7 @@ func (e *eventWithoutKey) Name() string { return e.name }
 
 func TestIdempotency_FirstExecutionAllowed(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
 
 	called := false
 	err := idempotency.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", func(ctx context.Context) error {
@@ -55,7 +55,7 @@ func TestIdempotency_FirstExecutionAllowed(t *testing.T) {
 
 func TestIdempotency_DuplicateBlocked(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
 
 	evt := &eventWithId{id: "evt-1", name: "test"}
 
@@ -81,7 +81,7 @@ func TestIdempotency_DuplicateBlocked(t *testing.T) {
 
 func TestIdempotency_DifferentEventsAllowed(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
 
 	// First event
 	called1 := false
@@ -104,7 +104,7 @@ func TestIdempotency_DifferentEventsAllowed(t *testing.T) {
 
 func TestIdempotency_WithIdempotencyKeyInterface(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
 
 	evt := &eventWithIdempotencyKey{key: "custom-key-1", name: "test"}
 
@@ -130,7 +130,7 @@ func TestIdempotency_WithIdempotencyKeyInterface(t *testing.T) {
 
 func TestIdempotency_NoKeySkipsCheck(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
 
 	evt := &eventWithoutKey{name: "test"}
 
@@ -154,7 +154,7 @@ func TestIdempotency_NoKeySkipsCheck(t *testing.T) {
 
 func TestIdempotency_HandlerNameInKey(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
 
 	evt := &eventWithId{id: "evt-1", name: "test"}
 
@@ -182,7 +182,7 @@ func TestIdempotency_StaleLockAllowsReprocessing(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
 	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{
 		ProcessingTTL: 10 * time.Millisecond,
-	}, nil)
+	})
 
 	evt := &eventWithId{id: "evt-1", name: "test"}
 
@@ -211,7 +211,7 @@ func TestIdempotency_ActiveLockBlocks(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
 	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{
 		ProcessingTTL: time.Hour,
-	}, nil)
+	})
 
 	evt := &eventWithId{id: "evt-1", name: "test"}
 
@@ -228,17 +228,111 @@ func TestIdempotency_ActiveLockBlocks(t *testing.T) {
 		return nil
 	})
 
-	if !errors.Is(err, invoker.ErrDuplicate) {
-		t.Errorf("expected ErrDuplicate for active lock, got '%v'", err)
+	if !errors.Is(err, event.ErrInProgress) {
+		t.Errorf("expected ErrInProgress for active lock, got '%v'", err)
 	}
 	if called {
 		t.Error("active processing lock should block execution")
 	}
 }
 
+func TestIdempotency_InProgressIsNotDuplicate(t *testing.T) {
+	store := invoker.NewMemoryIdempotencyStore()
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{ProcessingTTL: time.Hour})
+
+	_ = store.Put(context.Background(), "evt-1:handler", invoker.IdempotencyRecord{
+		Status:    invoker.StatusProcessing,
+		StartedAt: time.Now(),
+	})
+
+	called := false
+	err := idempotency.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", func(context.Context) error {
+		called = true
+		return nil
+	})
+
+	if called {
+		t.Error("the handler must not run while another execution is in progress")
+	}
+	if !errors.Is(err, event.ErrInProgress) {
+		t.Errorf("expected ErrInProgress, got '%v'", err)
+	}
+	if errors.Is(err, event.ErrDuplicate) {
+		t.Errorf("an in-progress record must not look like a duplicate (the transport would Ack it): %v", err)
+	}
+}
+
+func TestIdempotency_DeadLetteredRecorded(t *testing.T) {
+	store := invoker.NewMemoryIdempotencyStore()
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
+
+	dead := &event.DeadLetteredError{Cause: errors.New("bad"), Reason: event.ReasonTerminal}
+	err := idempotency.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", func(context.Context) error {
+		return dead
+	})
+
+	if !errors.Is(err, event.ErrDeadLettered) {
+		t.Errorf("expected the dead-lettered error to pass through, got '%v'", err)
+	}
+	rec, ok, _ := store.Get(context.Background(), "evt-1:handler")
+	if !ok || rec.Status != invoker.StatusDeadLettered {
+		t.Errorf("stored status = %q (found %v), want %q", rec.Status, ok, invoker.StatusDeadLettered)
+	}
+}
+
+func TestIdempotency_DeadLetteredReplayExecutes(t *testing.T) {
+	store := invoker.NewMemoryIdempotencyStore()
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
+
+	_ = store.Put(context.Background(), "evt-1:handler", invoker.IdempotencyRecord{
+		Status:    invoker.StatusDeadLettered,
+		StartedAt: time.Now(),
+	})
+
+	called := false
+	err := idempotency.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", func(context.Context) error {
+		called = true
+		return nil
+	})
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Error("a dead_lettered record must re-execute on replay")
+	}
+	rec, _, _ := store.Get(context.Background(), "evt-1:handler")
+	if rec.Status != invoker.StatusCompleted {
+		t.Errorf("stored status = %q, want completed", rec.Status)
+	}
+}
+
+func TestIdempotency_CompletedIsDuplicate(t *testing.T) {
+	store := invoker.NewMemoryIdempotencyStore()
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
+
+	_ = store.Put(context.Background(), "evt-1:handler", invoker.IdempotencyRecord{
+		Status:    invoker.StatusCompleted,
+		StartedAt: time.Now(),
+	})
+
+	called := false
+	err := idempotency.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", func(context.Context) error {
+		called = true
+		return nil
+	})
+
+	if called {
+		t.Error("a completed record must not re-execute")
+	}
+	if !errors.Is(err, event.ErrDuplicate) {
+		t.Errorf("expected ErrDuplicate, got '%v'", err)
+	}
+}
+
 func TestIdempotency_FailedExecutionAllowsRetry(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
 
 	evt := &eventWithId{id: "evt-1", name: "test"}
 
@@ -255,36 +349,6 @@ func TestIdempotency_FailedExecutionAllowsRetry(t *testing.T) {
 	}
 	if rec.Status != invoker.StatusFailed {
 		t.Errorf("expected status Failed, got %v", rec.Status)
-	}
-}
-
-func TestIdempotency_MetricsTracked(t *testing.T) {
-	store := invoker.NewMemoryIdempotencyStore()
-	metrics := &testMetricProvider{}
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, metrics)
-
-	evt := &eventWithId{id: "evt-1", name: "test"}
-
-	// First execution
-	_ = idempotency.Invoke(context.Background(), evt, "handler", func(ctx context.Context) error {
-		return nil
-	})
-
-	if metrics.counters["eventbus_idempotency_lock_acquired_total"] != 1 {
-		t.Errorf("expected 1 lock acquired, got %d", metrics.counters["eventbus_idempotency_lock_acquired_total"])
-	}
-
-	if metrics.counters["eventbus_idempotency_executed_total"] != 1 {
-		t.Errorf("expected 1 execution, got %d", metrics.counters["eventbus_idempotency_executed_total"])
-	}
-
-	// Duplicate
-	_ = idempotency.Invoke(context.Background(), evt, "handler", func(ctx context.Context) error {
-		return nil
-	})
-
-	if metrics.counters["eventbus_idempotency_duplicate_total"] != 1 {
-		t.Errorf("expected 1 duplicate, got %d", metrics.counters["eventbus_idempotency_duplicate_total"])
 	}
 }
 
@@ -348,8 +412,7 @@ func TestMemoryIdempotencyStore_Delete(t *testing.T) {
 func TestIdempotency_StoreError(t *testing.T) {
 	storeErr := errors.New("store error")
 	store := &failingStore{err: storeErr}
-	metrics := &testMetricProvider{}
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, metrics)
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
 
 	evt := &eventWithId{id: "evt-1", name: "test"}
 
@@ -359,10 +422,6 @@ func TestIdempotency_StoreError(t *testing.T) {
 
 	if !errors.Is(err, storeErr) {
 		t.Errorf("expected store error, got '%v'", err)
-	}
-
-	if metrics.counters["eventbus_idempotency_error_total"] != 1 {
-		t.Errorf("expected error metric to be tracked")
 	}
 }
 
@@ -385,7 +444,7 @@ func (s *failingStore) Delete(_ context.Context, _ string) error {
 // Verify idempotency key extraction precedence
 func TestIdempotency_IdempotencyKeyTakesPrecedence(t *testing.T) {
 	store := invoker.NewMemoryIdempotencyStore()
-	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{}, nil)
+	idempotency := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
 
 	// Event that implements both WithId and WithIdempotencyKey
 	evt := &eventWithBothKeys{id: "id-1", idempotencyKey: "custom-key"}
@@ -418,3 +477,45 @@ func (e *eventWithBothKeys) IdempotencyKey() string { return e.idempotencyKey }
 // Verify that WithIdempotencyKey is checked before WithId
 var _ event.WithId = (*eventWithBothKeys)(nil)
 var _ invoker.WithIdempotencyKey = (*eventWithBothKeys)(nil)
+
+// The completed or failed record written after the handler keeps the StartedAt
+// of the processing marker; a fresh key must not end up with the zero time.
+func TestIdempotency_FinalRecordKeepsStartedAt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handle  func(context.Context) error
+		want    invoker.IdempotencyStatus
+		wantErr bool
+	}{
+		{"success", func(context.Context) error { return nil }, invoker.StatusCompleted, false},
+		{"failure", func(context.Context) error { return errors.New("boom") }, invoker.StatusFailed, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := invoker.NewMemoryIdempotencyStore()
+			inv := invoker.NewIdempotency(store, invoker.IdempotencyConfig{})
+			before := time.Now()
+
+			err := inv.Invoke(context.Background(), &eventWithId{id: "evt-1", name: "test"}, "handler", tc.handle)
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Invoke error = %v, wantErr %v", err, tc.wantErr)
+			}
+			rec, ok, gerr := store.Get(context.Background(), "evt-1:handler")
+			if gerr != nil || !ok {
+				t.Fatalf("Get = %v, %v, %v, want a stored record", rec, ok, gerr)
+			}
+			if rec.Status != tc.want {
+				t.Fatalf("Status = %q, want %q", rec.Status, tc.want)
+			}
+			if rec.StartedAt.IsZero() {
+				t.Fatal("StartedAt is the zero time, want the start of the execution")
+			}
+			if rec.StartedAt.Before(before) {
+				t.Errorf("StartedAt = %v is before the call at %v", rec.StartedAt, before)
+			}
+			if rec.EndedAt == nil || rec.StartedAt.After(*rec.EndedAt) {
+				t.Errorf("StartedAt = %v, EndedAt = %v, want StartedAt <= EndedAt", rec.StartedAt, rec.EndedAt)
+			}
+		})
+	}
+}

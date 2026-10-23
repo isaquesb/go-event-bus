@@ -5,14 +5,20 @@
 # (see RELEASING.md).
 #
 # Usage: scripts/release.sh [--dry-run] VERSION LAYER
+#        scripts/release.sh --check-layers
 #   VERSION  vMAJOR.MINOR.PATCH
 #   LAYER    1 root
-#            2 invoker json nats telemetry            (require root)
-#            3 jetstream redis prometheus             (require root invoker)
-#            4 examples                               (require root invoker jetstream json redis telemetry)
-#   --dry-run  run the preflight checks (printing OK/FAIL per check) and print the planned go get,
-#              commit and tag actions; changes no file, commit or tag. Exits non-zero if any
-#              preflight check failed.
+#            2 invoker json nats telemetry prometheus  (require root)
+#            3 jetstream redis                         (require root invoker)
+#            4 examples                                (require root invoker jetstream json redis telemetry)
+#   --dry-run       run the preflight checks (printing OK/FAIL per check) and print the planned go get,
+#                   commit and tag actions; changes no file, commit or tag. Exits non-zero if any
+#                   preflight check failed.
+#   --check-layers  compare the in-repo requires of every module's go.mod with the layer table above
+#                   and the layer order (a module may only require modules of lower layers); print one
+#                   OK/FAIL line per module and exit 0 or 1. It reads go.mod files only and needs no
+#                   VERSION or LAYER, no git state and no network. Every real and dry run repeats it
+#                   in the preflight.
 set -euo pipefail
 
 ROOT_PATH="github.com/isaquesb/go-event-bus"
@@ -22,39 +28,18 @@ die() {
   exit 2
 }
 
-DRY=0
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --dry-run)
-      DRY=1
-      shift
-      ;;
-    -h | --help)
-      sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
-      exit 0
-      ;;
-    --*) die "unknown option: $1" ;;
-    *) break ;;
-  esac
-done
-[ $# -eq 2 ] || die "usage: scripts/release.sh [--dry-run] VERSION LAYER"
-VERSION="$1"
-LAYER="$2"
-[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION must look like vMAJOR.MINOR.PATCH, got: $VERSION"
-[[ "$LAYER" =~ ^[1-4]$ ]] || die "LAYER must be 1, 2, 3 or 4, got: $LAYER"
-
-# --- the D-22 layer table, encoded once ---------------------------------------------------------
+# --- the D-26 layer table, encoded once --------------------------------------------------------
 layer_modules() {
   case "$1" in
     1) echo "root" ;;
-    2) echo "invoker json nats telemetry" ;;
-    3) echo "jetstream redis prometheus" ;;
+    2) echo "invoker json nats telemetry prometheus" ;;
+    3) echo "jetstream redis" ;;
     4) echo "examples" ;;
   esac
 }
 
 # In-repo dependencies a layer's modules must require at VERSION. Root is named explicitly for
-# layer 3 because redis and prometheus carry it only as a stale indirect line.
+# layer 3 because redis carries it only as an indirect line.
 layer_deps() {
   case "$1" in
     1) echo "" ;;
@@ -73,6 +58,116 @@ mod_dir() {
 mod_tag() {
   if [ "$1" = root ]; then echo "$VERSION"; else echo "$1/$VERSION"; fi
 }
+
+# The layer number of module $1, empty when it is in no layer.
+layer_of() {
+  local want="$1" l x
+  for l in 1 2 3 4; do
+    for x in $(layer_modules "$l"); do
+      if [ "$x" = "$want" ]; then
+        echo "$l"
+        return 0
+      fi
+    done
+  done
+  return 0
+}
+
+# check_layers: the layer table must agree with the real in-repo requires of every go.mod (R1: a
+# layer-3 tidy drops a require the module does not import, which aborts a layer after the earlier
+# tags are public). Per module: (a) the set of in-repo requires, direct and indirect, equals
+# layer_deps of its layer; (b) every required module is in a lower layer. Reads go.mod only, from
+# the current directory (the repository top level); it never runs go get or go mod tidy.
+check_layers() {
+  local l m dir listing p name got want d g k bad rc=0 shown
+  for l in 1 2 3 4; do
+    for m in $(layer_modules "$l"); do
+      dir="$(mod_dir "$m")"
+      if [ ! -f "$dir/go.mod" ]; then
+        echo "FAIL layers: $m (layer $l): $dir/go.mod not found"
+        rc=1
+        continue
+      fi
+      listing="$(cd "$dir" && GOWORK=off go mod edit -print | awk -v m="$ROOT_PATH" '
+        { if ($1 == "require") { p = $2; v = $3 } else { p = $1; v = $2 }
+          if (index(p, m) == 1 && v ~ /^v[0-9]/) print p }')"
+      got=""
+      while read -r p; do
+        [ -n "$p" ] || continue
+        if [ "$p" = "$ROOT_PATH" ]; then name=root; else name="${p#"$ROOT_PATH"/}"; fi
+        got="$got $name"
+      done <<<"$listing"
+      got="$(printf '%s\n' $got | sort -u | tr '\n' ' ')"
+      want="$(layer_deps "$l")"
+      bad=0
+      for d in $want; do
+        case " $got " in
+          *" $d "*) ;;
+          *)
+            echo "FAIL layers: $m (layer $l): missing $d"
+            bad=1
+            ;;
+        esac
+      done
+      for g in $got; do
+        case " $want " in
+          *" $g "*) ;;
+          *)
+            echo "FAIL layers: $m (layer $l): unexpected $g"
+            bad=1
+            ;;
+        esac
+        k="$(layer_of "$g")"
+        if [ -z "$k" ]; then
+          echo "FAIL layers: $m (layer $l): $g is in no layer"
+          bad=1
+        elif [ "$k" -ge "$l" ]; then
+          echo "FAIL layers: $m (layer $l): $g is in layer $k, not below $l"
+          bad=1
+        fi
+      done
+      if [ "$bad" -eq 0 ]; then
+        shown="${got% }"
+        echo "OK   layers: $m (layer $l) requires: ${shown:-none}"
+      else
+        rc=1
+      fi
+    done
+  done
+  return "$rc"
+}
+
+CHECK_ONLY=0
+DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)
+      DRY=1
+      shift
+      ;;
+    --check-layers)
+      CHECK_ONLY=1
+      shift
+      ;;
+    -h | --help)
+      sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    --*) die "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  [ $# -eq 0 ] || die "--check-layers takes no VERSION or LAYER"
+  TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || die "--check-layers must run inside the repository"
+  cd "$TOP"
+  if check_layers; then exit 0; else exit 1; fi
+fi
+[ $# -eq 2 ] || die "usage: scripts/release.sh [--dry-run] VERSION LAYER | --check-layers"
+VERSION="$1"
+LAYER="$2"
+[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION must look like vMAJOR.MINOR.PATCH, got: $VERSION"
+[[ "$LAYER" =~ ^[1-4]$ ]] || die "LAYER must be 1, 2, 3 or 4, got: $LAYER"
 
 read -r -a MODS <<<"$(layer_modules "$LAYER")"
 read -r -a DEPS <<<"$(layer_deps "$LAYER")"
@@ -123,6 +218,12 @@ if [ -z "$(git ls-files CLAUDE.md .planning)" ]; then
   pf ok "CLAUDE.md and .planning are untracked"
 else
   pf fail "CLAUDE.md or .planning is tracked"
+fi
+
+if check_layers; then
+  pf ok "layer table matches every go.mod"
+else
+  pf fail "layer table disagrees with go.mod (run scripts/release.sh --check-layers)"
 fi
 
 # Branch only: no tag fetch, no prune, so unpushed local tags survive.

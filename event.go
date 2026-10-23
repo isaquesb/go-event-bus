@@ -16,6 +16,13 @@ type Event interface {
 	Name() string
 }
 
+// WithId lets an event choose its own message id.
+//
+// Id() becomes the message id of every envelope emitted for the event, so it
+// must be unique per message, not per entity: two emits of events with the
+// same Id() are the same message to anything that deduplicates on the id. The
+// idempotency invoker keys on the same value. An empty Id() falls back to a
+// generated id.
 type WithId interface {
 	Id() string
 }

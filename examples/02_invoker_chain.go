@@ -1,7 +1,7 @@
 // Example: Full Invoker Chain
 //
 // This example demonstrates how to build a production-ready invoker chain
-// with all middleware components: tracing, metrics, rate limiting,
+// with all middleware components: tracing, rate limiting,
 // idempotency, retry, circuit breaker, and DLQ.
 package examples
 
@@ -52,10 +52,13 @@ func (e PaymentProcessed) RateLimitKey() string {
 // mockDLQPublisher simulates DLQ publishing
 type mockDLQPublisher struct{}
 
-func (m *mockDLQPublisher) Publish(ctx context.Context, evt event.Event, cause error) error {
+func (m *mockDLQPublisher) Publish(ctx context.Context, rec event.DLQRecord) error {
 	slog.Warn("event sent to DLQ",
-		"event", evt.Name(),
-		"cause", cause.Error(),
+		"event", rec.EventName,
+		"reason", rec.Reason,
+		"attempts", rec.Attempts,
+		"delivery_count", rec.Delivery.Count,
+		"cause", rec.Cause.Error(),
 	)
 	return nil
 }
@@ -73,42 +76,24 @@ func (m *mockRateLimitStore) Allow(ctx context.Context, key string, rate int, pe
 	return m.counts[key] <= burst, nil
 }
 
-// mockMetricProvider collects metrics
-type mockMetricProvider struct{}
-
-func (m *mockMetricProvider) IncCounter(name string, n int64, labels invoker.Labels) {
-	slog.Debug("metric counter", "name", name, "value", n, "labels", labels)
-}
-
-func (m *mockMetricProvider) ObserveHistogram(name string, value float64, labels invoker.Labels) {
-	slog.Debug("metric histogram", "name", name, "value", value, "labels", labels)
-}
-
-func (m *mockMetricProvider) SetGauge(name string, value float64, labels invoker.Labels) {
-	slog.Debug("metric gauge", "name", name, "value", value, "labels", labels)
-}
-
 // =============================================================================
 // Building the Invoker Chain
 // =============================================================================
 
 func ExampleFullInvokerChain() {
-	metrics := &mockMetricProvider{}
 	tracer := otel.Tracer("payment-service")
 
 	// Build the chain in recommended order:
-	// 1. Observability (tracing, metrics) - wrap everything
+	// 1. Observability (tracing) - wrap everything
 	// 2. Cheap rejections (rate limit, idempotency) - fail fast
-	// 3. Resilience (retry, circuit breaker) - handle failures
-	// 4. Terminal (DLQ) - last resort
+	// 3. DLQ - outside Retry, so it dead-letters the final outcome once
+	// 4. Resilience (retry, circuit breaker) - handle failures
+	dlq := &mockDLQPublisher{}
 	chain := invoker.NewChain(
 		// 1. Tracing - creates spans for each handler
 		telemetry.NewTracerInvoker(tracer),
 
-		// 2. Metrics - records latency and success/failure
-		invoker.NewMetrics(metrics),
-
-		// 3. Rate Limiting - prevents abuse
+		// 2. Rate Limiting - prevents abuse
 		invoker.NewRateLimiter(
 			&mockRateLimitStore{},
 			invoker.RateLimitConfig{
@@ -120,17 +105,18 @@ func ExampleFullInvokerChain() {
 					slog.Warn("rate limit exceeded", "key", key)
 				},
 			},
-			metrics,
 		),
 
-		// 4. Idempotency - prevents duplicate processing
+		// 3. Idempotency - prevents duplicate processing
 		invoker.NewIdempotency(
 			invoker.NewMemoryIdempotencyStore(), // Use Redis in production
 			invoker.IdempotencyConfig{
 				ProcessingTTL: 5 * time.Minute,
 			},
-			metrics,
 		),
+
+		// 4. DLQ - outside Retry: dead-letters the final outcome once
+		invoker.NewDLQ(dlq),
 
 		// 5. Retry - handles transient failures
 		invoker.NewRetry(
@@ -139,7 +125,6 @@ func ExampleFullInvokerChain() {
 				BaseDelay:   100 * time.Millisecond,
 				MaxDelay:    5 * time.Second,
 			},
-			metrics,
 		),
 
 		// 6. Circuit Breaker - prevents cascade failures
@@ -149,16 +134,14 @@ func ExampleFullInvokerChain() {
 				SuccessThreshold: 2,
 				OpenTimeout:      30 * time.Second,
 			},
-			metrics,
 		),
-
-		// 7. DLQ - handles terminal failures
-		invoker.NewDLQ(&mockDLQPublisher{}, metrics),
 	)
 
-	// Create the bus with the chain
+	// Create the bus with the chain. The same publisher is the bus backstop
+	// for failures the chain DLQ did not dead-letter.
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:       chain,
+		DLQPublisher:  dlq,
 		MaxConcurrent: 16,
 	})
 

@@ -2,12 +2,13 @@ package invoker
 
 import (
 	"context"
-	"errors"
 	"github.com/isaquesb/go-event-bus"
 	"time"
 )
 
-var ErrRateLimited = errors.New("rate limit exceeded")
+// ErrRateLimited is the root sentinel event.ErrRateLimited, kept here for
+// source compatibility.
+var ErrRateLimited = event.ErrRateLimited
 
 type RateLimitStore interface {
 	Allow(
@@ -34,23 +35,20 @@ type RateLimitConfig struct {
 func NewRateLimiter(
 	store RateLimitStore,
 	cfg RateLimitConfig,
-	metrics MetricProvider,
 ) *RateLimiter {
-	if metrics == nil {
-		metrics = &NoopProvider{}
-	}
-
 	return &RateLimiter{
-		store:   store,
-		cfg:     cfg,
-		metrics: metrics,
+		store: store,
+		cfg:   cfg,
 	}
 }
 
+// RateLimiter rejects events over their rate with ErrRateLimited. A failing
+// store is returned as is and reported to the Observer in the context as a
+// StoreError{Store: "rate_limit", Op: "allow"}; a rejected event emits no
+// diagnostic signal, because it is a HandlerDone outcome.
 type RateLimiter struct {
-	store   RateLimitStore
-	cfg     RateLimitConfig
-	metrics MetricProvider
+	store RateLimitStore
+	cfg   RateLimitConfig
 }
 
 func (i *RateLimiter) Invoke(
@@ -79,33 +77,23 @@ func (i *RateLimiter) Invoke(
 		i.cfg.Burst,
 	)
 	if err != nil {
-		i.metrics.IncCounter(
-			"eventbus_ratelimit_error_total",
-			1,
-			Labels{"handler": handler},
-		)
+		event.ObserverFromContext(ctx).StoreError(ctx, event.StoreErrorInfo{
+			Handler: handler,
+			Event:   evt.Name(),
+			Store:   "rate_limit",
+			Op:      "allow",
+			Err:     err,
+		})
 		return err
 	}
 
 	if !allowed {
-		i.metrics.IncCounter(
-			"eventbus_ratelimit_blocked_total",
-			1,
-			Labels{"handler": handler},
-		)
-
 		if i.cfg.OnLimit != nil {
 			i.cfg.OnLimit(ctx, evt, key)
 		}
 
 		return ErrRateLimited
 	}
-
-	i.metrics.IncCounter(
-		"eventbus_ratelimit_allowed_total",
-		1,
-		Labels{"handler": handler},
-	)
 
 	return next(ctx)
 }

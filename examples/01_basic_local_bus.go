@@ -68,22 +68,17 @@ func NotifyWarehouse(ctx context.Context, evt event.Event) error {
 // =============================================================================
 
 func ExampleBasicLocalBus() {
-	// Create a simple invoker chain (just metrics for this example)
-	chain := invoker.NewChain(
-		invoker.NewMetrics(nil), // Uses NoopProvider
-	)
+	// Create a simple invoker chain (empty here; see 02_invoker_chain.go for the
+	// recommended order of the resilience invokers)
+	chain := invoker.NewChain()
 
 	// Create the LocalBus
 	bus := event.NewLocalBus(event.LocalBusOptions{
 		Invoker:       chain,
 		MaxConcurrent: 10,
-		OnErr: func(ctx context.Context, evt event.Event, err error, handler string) {
-			slog.Error("handler failed",
-				"event", evt.Name(),
-				"handler", handler,
-				"error", err,
-			)
-		},
+		// Observer receives every terminal failure once (Observer.Failure). The slog
+		// observer is also the default when Observer is nil.
+		Observer: event.NewSlogObserver(nil),
 	})
 
 	ctx := context.Background()

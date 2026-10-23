@@ -3,9 +3,11 @@ package event_test
 import (
 	"context"
 	"errors"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/isaquesb/go-event-bus"
@@ -151,17 +153,13 @@ func TestLocalBus_MultipleHandlers(t *testing.T) {
 	}
 }
 
-func TestLocalBus_OnErrCallback(t *testing.T) {
+func TestLocalBus_ObserverFailureCallback(t *testing.T) {
 	ctx := context.Background()
-	var capturedErr error
-	var capturedHandler string
+	rec := &obsRecorder{}
 
 	bus := event.NewLocalBus(event.LocalBusOptions{
-		Invoker: &passthroughInvoker{},
-		OnErr: func(ctx context.Context, evt event.Event, err error, handler string) {
-			capturedErr = err
-			capturedHandler = handler
-		},
+		Invoker:  &passthroughInvoker{},
+		Observer: rec,
 	})
 
 	handlerErr := errors.New("handler failed")
@@ -174,11 +172,18 @@ func TestLocalBus_OnErrCallback(t *testing.T) {
 	evt := &testEvent{name: "user.created"}
 	_, _ = bus.EmitSync(ctx, evt)
 
-	if capturedErr != handlerErr {
-		t.Errorf("expected error '%v', got '%v'", handlerErr, capturedErr)
+	failures := rec.Failures()
+	if len(failures) != 1 {
+		t.Fatalf("expected 1 Failure, got %d", len(failures))
 	}
-	if capturedHandler != "failing-handler" {
-		t.Errorf("expected handler 'failing-handler', got '%s'", capturedHandler)
+	if failures[0].Cause != handlerErr {
+		t.Errorf("expected error '%v', got '%v'", handlerErr, failures[0].Cause)
+	}
+	if failures[0].Handler != "failing-handler" {
+		t.Errorf("expected handler 'failing-handler', got '%s'", failures[0].Handler)
+	}
+	if failures[0].Event != event.Event(evt) {
+		t.Errorf("expected the emitted event, got %v", failures[0].Event)
 	}
 }
 
@@ -220,38 +225,45 @@ func TestLocalBus_NoHandlers(t *testing.T) {
 	_, _ = bus.EmitSync(context.Background(), evt)
 }
 
+// TestLocalBus_ContextCancellation pins CORE-03 (D-09): async handlers are
+// detached from the emitter ctx, so a ctx that is already cancelled when Emit is
+// called neither skips nor cancels any handler. Shutdown waits for all of them.
 func TestLocalBus_ContextCancellation(t *testing.T) {
-	ctx := context.Background()
-	bus := event.NewLocalBus(event.LocalBusOptions{
-		Invoker:       &passthroughInvoker{},
-		MaxConcurrent: 1,
-	})
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		bus := event.NewLocalBus(event.LocalBusOptions{
+			Invoker:       &passthroughInvoker{},
+			MaxConcurrent: 1,
+		})
 
-	var count atomic.Int32
+		var count atomic.Int32
 
-	// Register multiple handlers
-	for i := 0; i < 5; i++ {
-		if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
-			time.Sleep(50 * time.Millisecond)
-			count.Add(1)
-			return nil
-		}, event.WithHandlerName("handler")); err != nil {
-			t.Fatalf("subscribe: %v", err)
+		// Register multiple handlers
+		for i := 0; i < 5; i++ {
+			if err := bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+				time.Sleep(50 * time.Millisecond)
+				count.Add(1)
+				return nil
+			}, event.WithHandlerName("handler")); err != nil {
+				t.Fatalf("subscribe: %v", err)
+			}
 		}
-	}
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
 
-	evt := &testEvent{name: "user.created"}
-	bus.Emit(cancelCtx, evt)
+		evt := &testEvent{name: "user.created"}
+		bus.Emit(cancelCtx, evt)
 
-	time.Sleep(100 * time.Millisecond)
+		if err := bus.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
 
-	// With context already cancelled, handlers should not execute
-	if count.Load() > 0 {
-		t.Errorf("expected no handlers to be called with cancelled context, got %d", count.Load())
-	}
+		// The emitter ctx no longer bounds the handlers: all of them ran.
+		if got := count.Load(); got != 5 {
+			t.Errorf("expected all 5 handlers to run with a cancelled emitter ctx, got %d", got)
+		}
+	})
 }
 
 func TestLocalBus_ConcurrencyLimit(t *testing.T) {
@@ -435,12 +447,10 @@ func TestLocalBus_RegisterSubscribers_MultipleSubscribers(t *testing.T) {
 func TestLocalBus_RegisterSubscribers_HandlerNameFromSubscriberName(t *testing.T) {
 	ctx := context.Background()
 
-	var capturedHandler string
+	rec := &obsRecorder{}
 	bus := event.NewLocalBus(event.LocalBusOptions{
-		Invoker: &passthroughInvoker{},
-		OnErr: func(_ context.Context, _ event.Event, _ error, handler string) {
-			capturedHandler = handler
-		},
+		Invoker:  &passthroughInvoker{},
+		Observer: rec,
 	})
 
 	err := bus.RegisterSubscribers(ctx, &testSubscriber{
@@ -457,8 +467,9 @@ func TestLocalBus_RegisterSubscribers_HandlerNameFromSubscriberName(t *testing.T
 
 	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created"})
 
-	if capturedHandler != "my-service" {
-		t.Errorf("expected handler name 'my-service', got '%s'", capturedHandler)
+	failures := rec.Failures()
+	if len(failures) != 1 || failures[0].Handler != "my-service" {
+		t.Errorf("expected one Failure for handler name 'my-service', got %+v", failures)
 	}
 }
 
@@ -537,5 +548,156 @@ func TestLocalBus_EmitSync_ReturnsEventAndNil(t *testing.T) {
 	}
 	if got != evt {
 		t.Errorf("expected same event back, got %v", got)
+	}
+}
+
+func TestLocalBus_Metadata_EmitSyncHandlerReadsMetadata(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	var (
+		got event.Metadata
+		ok  bool
+	)
+	_ = bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		got, ok = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created"},
+		event.WithID("id-1"), event.WithCorrelationID("corr-1"))
+
+	if !ok {
+		t.Fatal("expected metadata in handler ctx")
+	}
+	if got.ID != "id-1" || got.CorrelationID != "corr-1" {
+		t.Errorf("got ID %q CorrelationID %q", got.ID, got.CorrelationID)
+	}
+	if got.CausationID != "" {
+		t.Errorf("expected empty CausationID, got %q", got.CausationID)
+	}
+	if got.Name != "user.created" || got.Version != 1 {
+		t.Errorf("got Name %q Version %d", got.Name, got.Version)
+	}
+	if got.Timestamp.IsZero() {
+		t.Error("expected non-zero Timestamp")
+	}
+}
+
+var uuidV7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+func TestLocalBus_Metadata_AsyncEmit(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	ch := make(chan event.Metadata, 1)
+	_ = bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		md, _ := event.MetadataFromContext(ctx)
+		ch <- md
+		return nil
+	})
+
+	bus.Emit(ctx, &testEvent{name: "user.created"})
+
+	select {
+	case md := <-ch:
+		if !uuidV7Re.MatchString(md.ID) {
+			t.Errorf("ID %q is not a UUIDv7", md.ID)
+		}
+		if md.CorrelationID != md.ID {
+			t.Errorf("root CorrelationID %q should equal ID %q", md.CorrelationID, md.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for handler")
+	}
+}
+
+func TestLocalBus_Metadata_NestedEmitLineage(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	var order, invoice event.Metadata
+	_ = bus.Subscribe(ctx, "order.created", func(ctx context.Context, e event.Event) error {
+		order, _ = event.MetadataFromContext(ctx)
+		_, err := bus.EmitSync(ctx, &testEvent{name: "invoice.created"})
+		return err
+	})
+	_ = bus.Subscribe(ctx, "invoice.created", func(ctx context.Context, e event.Event) error {
+		invoice, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "order.created"})
+
+	if order.ID == "" {
+		t.Fatal("order metadata missing")
+	}
+	if invoice.CausationID != order.ID {
+		t.Errorf("CausationID %q, want order ID %q", invoice.CausationID, order.ID)
+	}
+	if invoice.CorrelationID != order.CorrelationID || order.CorrelationID != order.ID {
+		t.Errorf("CorrelationID invoice %q order %q order ID %q",
+			invoice.CorrelationID, order.CorrelationID, order.ID)
+	}
+	if invoice.ID == order.ID {
+		t.Error("child must have its own id")
+	}
+}
+
+func TestLocalBus_Metadata_WithIdEventIsMessageID(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{})
+
+	var got event.Metadata
+	_ = bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		got, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created", id: "evt-7"})
+
+	if got.ID != "evt-7" {
+		t.Errorf("ID %q, want evt-7", got.ID)
+	}
+}
+
+func TestLocalBus_Metadata_IDGeneratorOption(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{
+		IDGenerator: func() string { return "gen-1" },
+	})
+
+	var got event.Metadata
+	_ = bus.Subscribe(ctx, "user.created", func(ctx context.Context, e event.Event) error {
+		got, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "user.created"})
+
+	if got.ID != "gen-1" {
+		t.Errorf("ID %q, want gen-1", got.ID)
+	}
+}
+
+func TestLocalBus_Metadata_InheritHeadersAllowlist(t *testing.T) {
+	ctx := context.Background()
+	bus := event.NewLocalBus(event.LocalBusOptions{InheritHeaders: []string{"tenant"}})
+
+	var child event.Metadata
+	_ = bus.Subscribe(ctx, "order.created", func(ctx context.Context, e event.Event) error {
+		_, err := bus.EmitSync(ctx, &testEvent{name: "invoice.created"})
+		return err
+	})
+	_ = bus.Subscribe(ctx, "invoice.created", func(ctx context.Context, e event.Event) error {
+		child, _ = event.MetadataFromContext(ctx)
+		return nil
+	})
+
+	_, _ = bus.EmitSync(ctx, &testEvent{name: "order.created"},
+		event.WithHeader("tenant", "acme"), event.WithHeader("secret", "s"))
+
+	if len(child.Headers) != 1 || child.Headers["tenant"] != "acme" {
+		t.Errorf("child headers %v, want only tenant=acme", child.Headers)
 	}
 }

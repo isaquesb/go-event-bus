@@ -60,7 +60,6 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        if: matrix.module != 'examples'
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
       - name: Upload coverage to Codecov
@@ -121,8 +120,10 @@ jobs:
   integration:
     name: integration (nats-server)
     runs-on: ubuntu-latest
+    # The per-module legs keep GOWORK=off (the consumer view). This job tests the tree: it runs over
+    # an ephemeral go.work so it builds against the in-repo modules and is green before a new root
+    # version is published (D-21).
     env:
-      GOWORK: "off"
       NATS_URL: nats://localhost:4222
     steps:
       - name: Checkout
@@ -133,6 +134,9 @@ jobs:
         with:
           go-version: "1.26"
           cache-dependency-path: "**/go.sum"
+
+      - name: Generate ephemeral go.work (9 modules)
+        run: go work init . invoker json nats jetstream redis telemetry prometheus examples
 
       - name: Start nats-server with JetStream
         run: |

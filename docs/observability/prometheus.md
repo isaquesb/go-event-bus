@@ -2,97 +2,68 @@
 layout: default
 title: Prometheus
 parent: Observability
-nav_order: 2
+nav_order: 4
 ---
 
-# Prometheus Provider
+# Prometheus
 
-The `prometheus.Provider` implements `invoker.MetricProvider` using Prometheus client libraries.
+The `prometheus` module provides `prometheus.NewObserver`, an `event.Observer` that records a fixed set of eleven Prometheus metric families from the bus signals. It replaces the `Provider` of earlier versions: metrics are no longer created on demand from names, so the set cannot drift and a label mismatch cannot panic on the handler goroutine.
+
+```bash
+go get github.com/isaquesb/go-event-bus/prometheus
+```
 
 ## Setup
 
-```go
-import eventprom "github.com/isaquesb/go-event-bus/prometheus"
-
-provider := eventprom.NewProvider("myapp")
-```
-
-The namespace is prepended to all metric names: `myapp_eventbus_invoker_calls_total`.
-
-### Options
+Build one Observer per registry and pass it as the bus Observer:
 
 ```go
-// Custom registerer (useful for testing)
-provider := eventprom.NewProvider("myapp",
-    eventprom.WithRegisterer(customRegistry),
+import (
+	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	event "github.com/isaquesb/go-event-bus"
+	eventbusprom "github.com/isaquesb/go-event-bus/prometheus"
 )
+
+reg := prometheus.NewRegistry()
+obs := eventbusprom.NewObserver(reg, eventbusprom.WithNamespace("myapp"))
+
+bus := event.NewLocalBus(event.LocalBusOptions{Observer: obs})
+
+http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 ```
 
-## How It Works
+`WithNamespace("myapp")` prefixes every name with `myapp_`, so the handler counter is `myapp_eventbus_handler_total`. The same option works on `nats.BusOptions.Observer` and `jetstream.BusOptions.Observer`.
 
-The provider dynamically creates and caches Prometheus metrics (counters, histograms, gauges) based on the metric names and labels provided by invokers. Metrics are created on first use and reused thereafter.
+### Next to the log observer
 
-## Metric Names
+Setting an Observer replaces the default `SlogObserver`. To keep the log lines as well, combine both with `event.MultiObserver`:
 
-All invokers emit metrics with the `eventbus_` prefix:
-
-### Core Metrics
-
-| Metric | Type | Labels | Source |
-|---|---|---|---|
-| `eventbus_invoker_calls_total` | Counter | event, handler, result | Metrics invoker |
-| `eventbus_invoker_latency_seconds` | Histogram | event, handler, result | Metrics invoker |
-
-### Retry Metrics
-
-| Metric | Type | Labels | Source |
-|---|---|---|---|
-| `eventbus_retry_attempt_total` | Counter | handler | Retry invoker |
-| `eventbus_retry_success_total` | Counter | handler | Retry invoker |
-| `eventbus_retry_terminal_total` | Counter | handler | Retry invoker |
-| `eventbus_retry_exhausted_total` | Counter | handler | Retry invoker |
-| `eventbus_retry_backoff_ms` | Histogram | handler | Retry invoker |
-
-### Circuit Breaker Metrics
-
-| Metric | Type | Labels | Source |
-|---|---|---|---|
-| `eventbus_circuit_state` | Gauge | handler | Circuit breaker |
-| `eventbus_circuit_open_total` | Counter | handler | Circuit breaker |
-| `eventbus_circuit_half_open_total` | Counter | handler | Circuit breaker |
-| `eventbus_circuit_blocked_total` | Counter | handler | Circuit breaker |
-
-### Rate Limit Metrics
-
-| Metric | Type | Labels | Source |
-|---|---|---|---|
-| `eventbus_ratelimit_allowed_total` | Counter | handler | Rate limiter |
-| `eventbus_ratelimit_blocked_total` | Counter | handler | Rate limiter |
-| `eventbus_ratelimit_error_total` | Counter | handler | Rate limiter |
-
-### Idempotency Metrics
-
-| Metric | Type | Labels | Source |
-|---|---|---|---|
-| `eventbus_idempotency_duplicate_total` | Counter | handler, reason | Idempotency |
-| `eventbus_idempotency_lock_acquired_total` | Counter | handler | Idempotency |
-| `eventbus_idempotency_executed_total` | Counter | handler | Idempotency |
-| `eventbus_idempotency_processing_stale_total` | Counter | handler | Idempotency |
-| `eventbus_idempotency_error_total` | Counter | handler, stage | Idempotency |
-
-### DLQ Metrics
-
-| Metric | Type | Labels | Source |
-|---|---|---|---|
-| `eventbus_dlq_published_total` | Counter | handler | DLQ invoker |
-| `eventbus_dlq_publish_error_total` | Counter | handler | DLQ invoker |
-
-## Histogram Buckets
-
-The `eventbus_invoker_latency_seconds` histogram uses custom buckets optimized for event processing:
-
-```
-0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
+```go
+bus := event.NewLocalBus(event.LocalBusOptions{
+	Observer: event.MultiObserver(
+		event.NewSlogObserver(nil),
+		obs,
+	),
+})
 ```
 
-All other histograms use Prometheus default buckets.
+`MultiObserver` calls the children in order and isolates a panic in any of them from the handler. A `SlogObserver` that you create yourself is not flushed by the bus, so call its `Flush` on shutdown. See [logs]({{ site.baseurl }}/observability/logs/).
+
+## Rules
+
+- **A nil registry** means `prometheus.DefaultRegisterer`.
+- **Registering twice on one registry panics**, like `prometheus.MustRegister`. Build one Observer per registry, or give each its own `WithNamespace`.
+- **The histogram buckets** are `prometheus.DefaultBuckets` (`0.001` to `10` seconds), the same as the OpenTelemetry Observer.
+- **`Failure` adds no series, by design.** Terminal outcomes are already in `eventbus_handler_total` (`dropped`, `dead_lettered`) and `eventbus_dlq_records_total`, and counting them again would double count.
+- **`eventbus_breaker_state` is absent** for a handler whose breaker never changed state. Absent means closed.
+- **Labels are bounded.** Handler and event names, plus the closed outcome, reason and state sets. No event id, subject or error text.
+
+## Metrics
+
+Every family, with its labels, its OpenTelemetry twin and the meaning of each `outcome`, is on the [metric reference]({{ site.baseurl }}/observability/metrics/).
+
+The OpenTelemetry metrics API of the `telemetry` module exposes the same set. Pick one backend per process.

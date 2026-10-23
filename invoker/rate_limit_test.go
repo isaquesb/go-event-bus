@@ -61,7 +61,7 @@ func TestRateLimiter_AllowsWithinLimit(t *testing.T) {
 		Rate:   1,
 		Period: time.Second,
 		Burst:  3,
-	}, nil)
+	})
 
 	evt := &eventWithRateLimitKey{key: "user-1", name: "test"}
 
@@ -88,7 +88,7 @@ func TestRateLimiter_BlocksOverLimit(t *testing.T) {
 		Rate:   1,
 		Period: time.Second,
 		Burst:  2,
-	}, nil)
+	})
 
 	evt := &eventWithRateLimitKey{key: "user-1", name: "test"}
 
@@ -120,7 +120,7 @@ func TestRateLimiter_NoKeySkipsCheck(t *testing.T) {
 		Rate:   1,
 		Period: time.Second,
 		Burst:  1,
-	}, nil)
+	})
 
 	// Event without rate limit key
 	evt := &testEvent{name: "test"}
@@ -148,7 +148,7 @@ func TestRateLimiter_EmptyKeySkipsCheck(t *testing.T) {
 		Rate:   1,
 		Period: time.Second,
 		Burst:  1,
-	}, nil)
+	})
 
 	evt := &eventWithEmptyRateLimitKey{name: "test"}
 
@@ -180,7 +180,7 @@ func TestRateLimiter_KeyPrefix(t *testing.T) {
 		Period:    time.Second,
 		Burst:     10,
 		KeyPrefix: "myapp:",
-	}, nil)
+	})
 
 	evt := &eventWithRateLimitKey{key: "user-1", name: "test"}
 
@@ -208,7 +208,7 @@ func TestRateLimiter_OnLimitCallback(t *testing.T) {
 			capturedEvt = evt
 			capturedKey = key
 		},
-	}, nil)
+	})
 
 	evt := &eventWithRateLimitKey{key: "user-1", name: "test"}
 
@@ -233,13 +233,11 @@ func TestRateLimiter_OnLimitCallback(t *testing.T) {
 func TestRateLimiter_StoreError(t *testing.T) {
 	storeErr := errors.New("store error")
 	store := &errorRateLimitStore{err: storeErr}
-	metrics := &testMetricProvider{}
-
 	limiter := invoker.NewRateLimiter(store, invoker.RateLimitConfig{
 		Rate:   1,
 		Period: time.Second,
 		Burst:  10,
-	}, metrics)
+	})
 
 	evt := &eventWithRateLimitKey{key: "user-1", name: "test"}
 
@@ -250,44 +248,6 @@ func TestRateLimiter_StoreError(t *testing.T) {
 	if !errors.Is(err, storeErr) {
 		t.Errorf("expected store error, got '%v'", err)
 	}
-
-	if metrics.counters["eventbus_ratelimit_error_total"] != 1 {
-		t.Error("expected error metric to be tracked")
-	}
-}
-
-func TestRateLimiter_MetricsTracked(t *testing.T) {
-	store := newMemoryRateLimitStore(2)
-	metrics := &testMetricProvider{}
-
-	limiter := invoker.NewRateLimiter(store, invoker.RateLimitConfig{
-		Rate:   1,
-		Period: time.Second,
-		Burst:  2,
-	}, metrics)
-
-	evt := &eventWithRateLimitKey{key: "user-1", name: "test"}
-
-	// Two allowed
-	_ = limiter.Invoke(context.Background(), evt, "handler", func(ctx context.Context) error {
-		return nil
-	})
-	_ = limiter.Invoke(context.Background(), evt, "handler", func(ctx context.Context) error {
-		return nil
-	})
-
-	// One blocked
-	_ = limiter.Invoke(context.Background(), evt, "handler", func(ctx context.Context) error {
-		return nil
-	})
-
-	if metrics.counters["eventbus_ratelimit_allowed_total"] != 2 {
-		t.Errorf("expected 2 allowed, got %d", metrics.counters["ratelimit_allowed_total"])
-	}
-
-	if metrics.counters["eventbus_ratelimit_blocked_total"] != 1 {
-		t.Errorf("expected 1 blocked, got %d", metrics.counters["ratelimit_blocked_total"])
-	}
 }
 
 func TestRateLimiter_PerKeyLimit(t *testing.T) {
@@ -296,7 +256,7 @@ func TestRateLimiter_PerKeyLimit(t *testing.T) {
 		Rate:   1,
 		Period: time.Second,
 		Burst:  1,
-	}, nil)
+	})
 
 	// User 1 exhausts limit
 	evt1 := &eventWithRateLimitKey{key: "user-1", name: "test"}

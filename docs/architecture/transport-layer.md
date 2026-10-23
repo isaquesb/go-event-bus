@@ -42,14 +42,8 @@ nav_order: 2
 
 ### JetStream Error Handling
 
-The JetStream bus classifies invoker errors to decide message acknowledgment:
-
-- **Success or duplicate** → ACK (message processed)
-- **Circuit open** → NAK with delay (wait for recovery)
-- **Rate limited** → NAK with delay (wait for window)
-- **Other errors** → NAK (immediate retry, bounded by MaxDeliver)
-- **Decode failure** → Term (malformed, never retry)
+The JetStream bus maps every handler result to exactly one broker action (`Ack`, `Nak`, `NakWithDelay` or `TermWithReason`) through `event.Dispose` and `event.Settle`, the same code every transport uses. The complete table of each error and each broker action is in the [Failure Model]({{ site.baseurl }}/architecture/failure-model/#disposition-table), and the rules a new transport has to follow are in the [Adapter Contract]({{ site.baseurl }}/architecture/adapter-contract/).
 
 ### Design Decision
 
-JetStream is used **only for transport**, never for business logic concerns like DLQ or retries. Those are handled by the invoker chain, keeping the transport layer thin and focused.
+JetStream is used **only for transport**. Retry policy, circuit breaking and the dead-letter decision belong to the invoker chain. The bus only applies the shared `event.Settle` policy to what the chain returned, and publishes through its `DLQPublisher` what the chain did not dead-letter, so the transport layer stays thin and every transport behaves the same way.

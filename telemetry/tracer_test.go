@@ -28,6 +28,13 @@ func TestSpanCreation(t *testing.T) {
 	tracer, sr := newTestTracer()
 	invoker := NewTracerInvoker(tracer)
 
+	// A Delivery subject names the span; without one the event name is used.
+	ctx := event.WithDelivery(context.Background(), event.Delivery{Subject: "orders.created"})
+	_ = invoker.Invoke(ctx, stubEvent{"test.event"}, "myHandler", func(context.Context) error { return nil })
+	if got := sr.Ended()[0].Name(); got != "process orders.created" {
+		t.Errorf("span name from Delivery subject: got %q", got)
+	}
+
 	err := invoker.Invoke(context.Background(), stubEvent{"test.event"}, "myHandler", func(ctx context.Context) error {
 		return nil
 	})
@@ -36,12 +43,12 @@ func TestSpanCreation(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	spans := sr.Ended()
+	spans := sr.Ended()[1:]
 	if len(spans) != 1 {
 		t.Fatalf("expected 1 span, got %d", len(spans))
 	}
-	if spans[0].Name() != "event.handle" {
-		t.Errorf("expected span name 'event.handle', got %q", spans[0].Name())
+	if spans[0].Name() != "process test.event" {
+		t.Errorf("expected span name 'process test.event', got %q", spans[0].Name())
 	}
 	if spans[0].SpanKind() != trace.SpanKindConsumer {
 		t.Errorf("expected SpanKindConsumer, got %v", spans[0].SpanKind())
@@ -63,14 +70,26 @@ func TestAttributeMapping(t *testing.T) {
 
 	attrs := map[string]string{}
 	for _, a := range spans[0].Attributes() {
-		attrs[string(a.Key)] = a.Value.AsString()
+		attrs[string(a.Key)] = a.Value.String()
 	}
 
-	if attrs["event.name"] != "order.created" {
-		t.Errorf("event.name: expected 'order.created', got %q", attrs["event.name"])
+	want := map[string]string{
+		"messaging.system":           "eventbus",
+		"messaging.operation.name":   "process",
+		"messaging.operation.type":   "process",
+		"messaging.destination.name": "order.created",
+		"eventbus.handler":           "sendEmail",
+		"eventbus.delivery_count":    "0",
 	}
-	if attrs["handler.name"] != "sendEmail" {
-		t.Errorf("handler.name: expected 'sendEmail', got %q", attrs["handler.name"])
+	for k, v := range want {
+		if attrs[k] != v {
+			t.Errorf("%s: expected %q, got %q", k, v, attrs[k])
+		}
+	}
+	for _, absent := range []string{"event.name", "handler.name", "messaging.message.id", "eventbus.correlation_id"} {
+		if _, ok := attrs[absent]; ok {
+			t.Errorf("attribute %s must be absent, got %q", absent, attrs[absent])
+		}
 	}
 }
 

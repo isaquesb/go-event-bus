@@ -1,92 +1,506 @@
 package jetstream
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"math"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	event "github.com/isaquesb/go-event-bus"
-	"github.com/isaquesb/go-event-bus/invoker"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// mockJSForDLQ implements jsBackend and records Publish calls.
-type mockJSForDLQ struct {
-	publishCalls int
-	publishErr   error
+// dlqtJS is a capturing dlqBackend. errs scripts the result of each PublishMsg
+// call in order; a call beyond the script succeeds.
+type dlqtJS struct {
+	mu   sync.Mutex
+	msgs []*nats.Msg
+	opts [][]jetstream.PublishOpt
+	errs []error
 }
 
-func (m *mockJSForDLQ) Publish(_ context.Context, _ string, _ []byte, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
-	m.publishCalls++
-	return nil, m.publishErr
-}
-
-func (m *mockJSForDLQ) CreateOrUpdateConsumer(_ context.Context, _ string, _ jetstream.ConsumerConfig) (jetstream.Consumer, error) {
-	return nil, nil
-}
-
-// unmarshalableEvent holds a value that json.Marshal cannot encode (math.Inf).
-type unmarshalableEvent struct {
-	name string
-	Bad  float64
-}
-
-func newUnmarshalableEvent() *unmarshalableEvent {
-	return &unmarshalableEvent{name: "bad.event", Bad: math.Inf(1)}
-}
-
-func (e *unmarshalableEvent) Name() string { return e.name }
-
-// marshalableEvent is a normal event for success-path tests.
-type marshalableEvent struct {
-	name string
-}
-
-func (e *marshalableEvent) Name() string { return e.name }
-
-// compile-time checks
-var _ event.Event = (*marshalableEvent)(nil)
-var _ event.Event = (*unmarshalableEvent)(nil)
-
-func TestDLQ_Publish_MarshalError(t *testing.T) {
-	mock := &mockJSForDLQ{}
-	dlq := &DLQ{
-		js:      mock,
-		metrics: &invoker.NoopProvider{},
-		prefix:  "dlq.",
+func (j *dlqtJS) PublishMsg(_ context.Context, msg *nats.Msg, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.msgs = append(j.msgs, msg)
+	j.opts = append(j.opts, opts)
+	n := len(j.msgs)
+	if n <= len(j.errs) && j.errs[n-1] != nil {
+		return nil, j.errs[n-1]
 	}
+	return &jetstream.PubAck{Stream: "DLQ", Sequence: uint64(n)}, nil
+}
 
-	evt := newUnmarshalableEvent()
-	origErr := errors.New("handler failed")
+func (j *dlqtJS) calls() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return len(j.msgs)
+}
 
-	err := dlq.Publish(context.Background(), evt, origErr)
+func (j *dlqtJS) msg(i int) *nats.Msg {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.msgs[i]
+}
 
-	if err == nil {
-		t.Fatal("expected non-nil error when marshal fails, got nil")
-	}
-	if mock.publishCalls != 0 {
-		t.Errorf("expected 0 js.Publish calls when marshal fails, got %d", mock.publishCalls)
+var dlqtRaw = []byte(`{"name":"orders.created","version":1,"id":"evt-1","payload":{"n":1}}`)
+
+func dlqtRecord() event.DLQRecord {
+	return event.DLQRecord{
+		Raw: bytes.Clone(dlqtRaw),
+		Headers: map[string][]string{
+			"Nats-Msg-Id":          {"evt-1"},
+			"Nats-Expected-Stream": {"S"},
+			"tenant":               {"acme"},
+			"traceparent":          {"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"},
+		},
+		EventID:   "evt-1",
+		EventName: "orders.created",
+		Cause:     errors.New("boom"),
+		Reason:    event.ReasonTerminal,
+		Handler:   "h",
+		Subject:   "orders.created",
+		Attempts:  2,
+		Delivery:  event.Delivery{Count: 3, Max: 3, Stream: "S", StreamSeq: 42},
+		FailedAt:  time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC),
 	}
 }
 
-func TestDLQ_Publish_Success(t *testing.T) {
-	mock := &mockJSForDLQ{}
-	dlq := &DLQ{
-		js:      mock,
-		metrics: &invoker.NoopProvider{},
-		prefix:  "dlq.",
+func TestDLQ_PublishesRawVerbatimWithFailureHeaders(t *testing.T) {
+	js := &dlqtJS{}
+	d := NewDLQ(js, "")
+
+	rec := dlqtRecord()
+	if err := d.Publish(context.Background(), rec); err != nil {
+		t.Fatalf("Publish: %v", err)
 	}
+	if js.calls() != 1 {
+		t.Fatalf("publish calls = %d, want 1", js.calls())
+	}
+	m := js.msg(0)
+	if m.Subject != "dlq.orders.created" {
+		t.Errorf("subject = %q, want dlq.orders.created", m.Subject)
+	}
+	if !bytes.Equal(m.Data, dlqtRaw) {
+		t.Errorf("data = %q, want the original envelope byte for byte", m.Data)
+	}
+	for _, k := range []string{"Nats-Msg-Id", "Nats-Expected-Stream"} {
+		if _, ok := m.Header[k]; ok {
+			t.Errorf("header %s must be stripped (D-28)", k)
+		}
+	}
+	want := map[string]string{
+		"tenant":                        "acme",
+		"traceparent":                   "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+		event.HeaderDLQOriginalMsgID:    "evt-1",
+		event.HeaderDLQReason:           event.ReasonTerminal,
+		event.HeaderDLQCause:            "boom",
+		event.HeaderDLQAttempts:         "2",
+		event.HeaderDLQDeliveryCount:    "3",
+		event.HeaderDLQHandler:          "h",
+		event.HeaderDLQOriginalSubject:  "orders.created",
+		event.HeaderDLQOriginalStream:   "S",
+		event.HeaderDLQOriginalSequence: "42",
+		event.HeaderDLQEventID:          "evt-1",
+		event.HeaderDLQEventName:        "orders.created",
+	}
+	for k, v := range want {
+		if got := m.Header.Get(k); got != v {
+			t.Errorf("header %s = %q, want %q", k, got, v)
+		}
+	}
+	// The record the caller passed in is not mutated.
+	if _, ok := rec.Headers["Nats-Msg-Id"]; !ok {
+		t.Error("Publish mutated rec.Headers")
+	}
+}
 
-	evt := &marshalableEvent{name: "ok.event"}
-	origErr := errors.New("handler failed")
+func TestDLQ_DefaultPrefix(t *testing.T) {
+	js := &dlqtJS{}
+	d := NewDLQ(js, "")
+	if DefaultDLQPrefix != "dlq." {
+		t.Fatalf("DefaultDLQPrefix = %q", DefaultDLQPrefix)
+	}
+	if err := d.Publish(context.Background(), dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if got := js.msg(0).Subject; got != "dlq.orders.created" {
+		t.Errorf("subject = %q, want dlq.orders.created", got)
+	}
+}
 
-	err := dlq.Publish(context.Background(), evt, origErr)
+func TestDLQ_CustomPrefix(t *testing.T) {
+	js := &dlqtJS{}
+	d := NewDLQ(js, "legacy.")
+	if err := d.Publish(context.Background(), dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if got := js.msg(0).Subject; got != "legacy.orders.created" {
+		t.Errorf("subject = %q, want legacy.orders.created", got)
+	}
+}
 
+func TestDLQ_NoMessageIDOnPublish(t *testing.T) {
+	js := &dlqtJS{}
+	d := NewDLQ(js, "")
+	if err := d.Publish(context.Background(), dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(js.opts[0]) != 0 {
+		t.Errorf("publish options = %d, want none (no WithMsgID, D-13)", len(js.opts[0]))
+	}
+	for k := range js.msg(0).Header {
+		if len(k) >= 5 && (k[:5] == "Nats-" || k[:5] == "nats-") {
+			t.Errorf("published header %s carries a broker system header", k)
+		}
+	}
+}
+
+func TestDLQ_LocalBusRecordEncodedWithRegistry(t *testing.T) {
+	js := &dlqtJS{}
+	reg := newMdRegistry("orders.created")
+	d := NewDLQ(js, "", WithDLQRegistry(reg))
+
+	evt := &mdEvent{name: "orders.created", EventID: "m-1", Payload: "p"}
+	ctx := event.WithMetadata(context.Background(), event.Metadata{ID: "m-1", Name: "orders.created"})
+	rec := event.DLQRecord{
+		Evt:       evt,
+		EventID:   "m-1",
+		EventName: "orders.created",
+		Cause:     errors.New("boom"),
+		Reason:    event.ReasonTerminal,
+		Handler:   "h",
+		Subject:   "orders.created",
+		Attempts:  1,
+	}
+	if err := d.Publish(ctx, rec); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if js.calls() != 1 {
+		t.Fatalf("publish calls = %d, want 1", js.calls())
+	}
+	m := js.msg(0)
+	if m.Subject != "dlq.orders.created" {
+		t.Errorf("subject = %q", m.Subject)
+	}
+	dctx, got, err := reg.Decode(context.Background(), m.Data)
 	if err != nil {
-		t.Fatalf("expected nil error for valid event, got %v", err)
+		t.Fatalf("published data does not decode: %v", err)
 	}
-	if mock.publishCalls != 1 {
-		t.Errorf("expected 1 js.Publish call, got %d", mock.publishCalls)
+	if got.Name() != "orders.created" {
+		t.Errorf("decoded name = %q", got.Name())
+	}
+	md, ok := event.MetadataFromContext(dctx)
+	if !ok || md.ID != "m-1" {
+		t.Errorf("decoded Metadata = %+v ok=%v, want ID m-1", md, ok)
+	}
+}
+
+func TestDLQ_NoEnvelopeWithoutRegistry(t *testing.T) {
+	js := &dlqtJS{}
+	d := NewDLQ(js, "")
+	rec := event.DLQRecord{Evt: &mdEvent{name: "orders.created"}, Subject: "orders.created"}
+	err := d.Publish(context.Background(), rec)
+	if !errors.Is(err, ErrNoEnvelope) {
+		t.Fatalf("err = %v, want ErrNoEnvelope", err)
+	}
+	if js.calls() != 0 {
+		t.Errorf("publish calls = %d, want 0", js.calls())
+	}
+}
+
+// TestDLQ_DecodeFailureEmptyBodyPublishedVerbatim is the invariant for
+// 08-REVIEW CR-02: a record without an event is a decode failure whose Raw is
+// the complete wire form, so it is published as it is, even when empty, and
+// never gets ErrNoEnvelope or a registry lookup. Every record shape a transport
+// builds for a decode failure is a row.
+func TestDLQ_DecodeFailureEmptyBodyPublishedVerbatim(t *testing.T) {
+	decodeErr := &event.DecodeError{Err: event.ErrMalformedEnvelope}
+	for _, tc := range []struct {
+		name     string
+		rec      event.DLQRecord
+		registry event.Registry
+		subject  string
+		want     map[string]string
+		absent   []string
+	}{
+		{
+			name: "jetstream delivery",
+			rec: event.DLQRecord{
+				Headers: map[string][]string{"tenant": {"acme"}, "Nats-Msg-Id": {"m-1"}},
+				Subject: "orders.created",
+				Cause:   decodeErr,
+				Reason:  event.ReasonDecodeMalformed,
+				Handler: "h",
+				Delivery: event.Delivery{
+					Count: 1, Max: 3, Subject: "orders.created", Stream: "S", StreamSeq: 42,
+				},
+			},
+			subject: "dlq.orders.created",
+			want: map[string]string{
+				event.HeaderDLQReason:           event.ReasonDecodeMalformed,
+				event.HeaderDLQOriginalStream:   "S",
+				event.HeaderDLQOriginalSequence: "42",
+				event.HeaderDLQOriginalMsgID:    "m-1",
+				"tenant":                        "acme",
+			},
+			absent: []string{"Nats-Msg-Id"},
+		},
+		{
+			name: "nats core delivery",
+			rec: event.DLQRecord{
+				Raw:      []byte{},
+				Headers:  map[string][]string{"tenant": {"acme"}},
+				Subject:  "orders.created",
+				Cause:    decodeErr,
+				Reason:   event.ReasonDecodeMalformed,
+				Delivery: event.Delivery{Count: 1, Max: 1, Subject: "orders.created"},
+			},
+			subject: "dlq.orders.created",
+			want: map[string]string{
+				event.HeaderDLQReason: event.ReasonDecodeMalformed,
+				"tenant":              "acme",
+			},
+			absent: []string{event.HeaderDLQOriginalSequence},
+		},
+		{
+			name:     "bare record with registry",
+			rec:      event.DLQRecord{Subject: "orders.created", Reason: event.ReasonDecodeMalformed},
+			registry: newMdRegistry("orders.created"),
+			subject:  "dlq.orders.created",
+			want:     map[string]string{event.HeaderDLQReason: event.ReasonDecodeMalformed},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			js := &dlqtJS{}
+			var opts []DLQOption
+			if tc.registry != nil {
+				opts = append(opts, WithDLQRegistry(tc.registry))
+			}
+			d := NewDLQ(js, "", opts...)
+
+			err := d.Publish(context.Background(), tc.rec)
+			if errors.Is(err, ErrNoEnvelope) {
+				t.Fatalf("Publish = %v, a record without an event must not get ErrNoEnvelope", err)
+			}
+			if err != nil {
+				t.Fatalf("Publish: %v", err)
+			}
+			if js.calls() != 1 {
+				t.Fatalf("publish calls = %d, want 1", js.calls())
+			}
+			m := js.msg(0)
+			if m.Subject != tc.subject {
+				t.Errorf("subject = %q, want %q", m.Subject, tc.subject)
+			}
+			if len(m.Data) != 0 {
+				t.Errorf("data = %q, want a zero-length body", m.Data)
+			}
+			for k, v := range tc.want {
+				if got := m.Header.Get(k); got != v {
+					t.Errorf("header %s = %q, want %q", k, got, v)
+				}
+			}
+			for _, k := range tc.absent {
+				if _, ok := m.Header[k]; ok {
+					t.Errorf("header %s must be absent", k)
+				}
+			}
+		})
+	}
+}
+
+func TestDLQ_MaxPayloadFallsBackToMinimalHeaders(t *testing.T) {
+	js := &dlqtJS{errs: []error{nats.ErrMaxPayload}}
+	d := NewDLQ(js, "")
+	rec := dlqtRecord()
+	rec.Cause = errors.New(strings.Repeat("c", 600))
+	rec.Execution = event.Execution{Handler: "h", StartedAt: time.Date(2026, 10, 16, 11, 59, 0, 0, time.UTC)}
+
+	if err := d.Publish(context.Background(), rec); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if js.calls() != 2 {
+		t.Fatalf("publish calls = %d, want 2", js.calls())
+	}
+	first, second := js.msg(0), js.msg(1)
+	if first.Header.Get(event.HeaderDLQFirstAttemptAt) == "" {
+		t.Fatal("first attempt should carry the full header set")
+	}
+	if !bytes.Equal(second.Data, dlqtRaw) || second.Subject != "dlq.orders.created" {
+		t.Errorf("retry data/subject changed: %q %q", second.Data, second.Subject)
+	}
+	for k, want := range map[string]string{
+		event.HeaderDLQReason:          event.ReasonTerminal,
+		event.HeaderDLQOriginalSubject: "orders.created",
+		event.HeaderDLQEventID:         "evt-1",
+		event.HeaderDLQHandler:         "h",
+	} {
+		if got := second.Header.Get(k); got != want {
+			t.Errorf("minimal header %s = %q, want %q", k, got, want)
+		}
+	}
+	if c := second.Header.Get(event.HeaderDLQCause); c == "" || len(c) > 128 {
+		t.Errorf("minimal cause length = %d, want 1..128", len(c))
+	}
+	for _, k := range []string{event.HeaderDLQFirstAttemptAt, event.HeaderDLQFailedAt, event.HeaderDLQAttempts} {
+		if _, ok := second.Header[k]; ok {
+			t.Errorf("minimal retry still carries %s", k)
+		}
+	}
+	if second.Header.Get("tenant") != "acme" {
+		t.Error("minimal retry dropped the original user headers")
+	}
+}
+
+func TestDLQ_MaxPayloadTwiceReturnsError(t *testing.T) {
+	js := &dlqtJS{errs: []error{nats.ErrMaxPayload, nats.ErrMaxPayload}}
+	d := NewDLQ(js, "")
+	err := d.Publish(context.Background(), dlqtRecord())
+	if !errors.Is(err, nats.ErrMaxPayload) {
+		t.Fatalf("err = %v, want nats.ErrMaxPayload", err)
+	}
+	if js.calls() != 2 {
+		t.Errorf("publish calls = %d, want 2", js.calls())
+	}
+}
+
+func TestDLQ_LongCauseTruncated(t *testing.T) {
+	js := &dlqtJS{}
+	d := NewDLQ(js, "")
+	rec := dlqtRecord()
+	rec.Cause = errors.New(strings.Repeat("x", 5000))
+	if err := d.Publish(context.Background(), rec); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	c := js.msg(0).Header.Get(event.HeaderDLQCause)
+	if len(c) > 1024 {
+		t.Errorf("cause length = %d, want <= 1024", len(c))
+	}
+	if !strings.HasSuffix(c, event.TruncationMarker) {
+		t.Errorf("cause %q does not end with the truncation marker", c[len(c)-20:])
+	}
+}
+
+func TestDLQ_StaleFailureHeadersReplaced(t *testing.T) {
+	js := &dlqtJS{}
+	d := NewDLQ(js, "")
+	rec := dlqtRecord()
+	rec.Headers["Eventbus-Dlq-Reason"] = []string{"stale"}
+	rec.Headers["eventbus-dlq-handler"] = []string{"old"}
+	rec.Headers["Eventbus-Trace"] = []string{"keep-me"}
+	if err := d.Publish(context.Background(), rec); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	h := js.msg(0).Header
+	if got := h.Values(event.HeaderDLQReason); len(got) != 1 || got[0] != event.ReasonTerminal {
+		t.Errorf("Reason values = %v, want single %q", got, event.ReasonTerminal)
+	}
+	if got := h.Values(event.HeaderDLQHandler); len(got) != 1 || got[0] != "h" {
+		t.Errorf("Handler values = %v, want single h", got)
+	}
+	if got := h.Get("Eventbus-Trace"); got != "keep-me" {
+		t.Errorf("other Eventbus-* header = %q, want kept verbatim", got)
+	}
+}
+
+// oxFakeSpanContext builds a valid, sampled span context from fixed ids.
+func oxFakeSpanContext(t testing.TB, traceID, spanID string) trace.SpanContext {
+	t.Helper()
+	tid, err := trace.TraceIDFromHex(traceID)
+	if err != nil {
+		t.Fatalf("trace id %q: %v", traceID, err)
+	}
+	sid, err := trace.SpanIDFromHex(spanID)
+	if err != nil {
+		t.Fatalf("span id %q: %v", spanID, err)
+	}
+	return trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled})
+}
+
+const (
+	oxDeadTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	oxDeadSpanID  = "00f067aa0ba902b7"
+	oxDeadTP      = "00-" + oxDeadTraceID + "-" + oxDeadSpanID + "-01"
+)
+
+func TestDLQ_TraceparentFromSpan(t *testing.T) {
+	js := &dlqtJS{}
+	ctx := trace.ContextWithSpanContext(context.Background(), oxFakeSpanContext(t, oxDeadTraceID, oxDeadSpanID))
+
+	if err := NewDLQ(js, "").Publish(ctx, dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if got := js.msg(0).Header.Get(event.HeaderDLQTraceparent); got != oxDeadTP {
+		t.Errorf("%s = %q, want %q", event.HeaderDLQTraceparent, got, oxDeadTP)
+	}
+	if !bytes.Equal(js.msg(0).Data, dlqtRaw) {
+		t.Error("trace data must travel in headers only: the envelope changed")
+	}
+}
+
+func TestDLQ_NoSpanNoTraceparent(t *testing.T) {
+	js := &dlqtJS{}
+
+	if err := NewDLQ(js, "").Publish(context.Background(), dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if _, ok := js.msg(0).Header[event.HeaderDLQTraceparent]; ok {
+		t.Errorf("%s present without a span in ctx: %v", event.HeaderDLQTraceparent, js.msg(0).Header)
+	}
+
+	// A span context that is not valid (zero ids) counts as no span.
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.SpanContext{})
+	if err := NewDLQ(js, "").Publish(ctx, dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if _, ok := js.msg(1).Header[event.HeaderDLQTraceparent]; ok {
+		t.Errorf("%s present for an invalid span context", event.HeaderDLQTraceparent)
+	}
+}
+
+func TestDLQ_StaleTraceparentReplaced(t *testing.T) {
+	const stale = "00-11111111111111111111111111111111-2222222222222222-01"
+	rec := dlqtRecord()
+	rec.Headers[event.HeaderDLQTraceparent] = []string{stale}
+
+	js := &dlqtJS{}
+	ctx := trace.ContextWithSpanContext(context.Background(), oxFakeSpanContext(t, oxDeadTraceID, oxDeadSpanID))
+	if err := NewDLQ(js, "").Publish(ctx, rec); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if got := js.msg(0).Header.Values(event.HeaderDLQTraceparent); len(got) != 1 || got[0] != oxDeadTP {
+		t.Errorf("%s = %v, want the single fresh value %q", event.HeaderDLQTraceparent, got, oxDeadTP)
+	}
+
+	// Without a span the stale value is dropped, not carried along.
+	if err := NewDLQ(js, "").Publish(context.Background(), rec); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if got := js.msg(1).Header.Values(event.HeaderDLQTraceparent); len(got) != 0 {
+		t.Errorf("stale %s survived: %v", event.HeaderDLQTraceparent, got)
+	}
+}
+
+func TestDLQ_MaxPayloadKeepsTraceparent(t *testing.T) {
+	js := &dlqtJS{errs: []error{nats.ErrMaxPayload}}
+	ctx := trace.ContextWithSpanContext(context.Background(), oxFakeSpanContext(t, oxDeadTraceID, oxDeadSpanID))
+
+	if err := NewDLQ(js, "").Publish(ctx, dlqtRecord()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if js.calls() != 2 {
+		t.Fatalf("publish calls = %d, want 2", js.calls())
+	}
+	if got := js.msg(0).Header.Get(event.HeaderDLQTraceparent); got != oxDeadTP {
+		t.Errorf("full header set: %s = %q, want %q", event.HeaderDLQTraceparent, got, oxDeadTP)
+	}
+	if got := js.msg(1).Header.Get(event.HeaderDLQTraceparent); got != oxDeadTP {
+		t.Errorf("minimal retry: %s = %q, want %q", event.HeaderDLQTraceparent, got, oxDeadTP)
 	}
 }

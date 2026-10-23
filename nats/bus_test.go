@@ -23,6 +23,7 @@ type mockNatsConn struct {
 	subscribed   []string // subjects passed to Subscribe
 	subscribeErr error
 	lastCb       natsgo.MsgHandler // capture the most recent callback
+	publishedMsg []*natsgo.Msg     // messages passed to PublishMsg
 }
 
 func (m *mockNatsConn) Subscribe(subj string, cb natsgo.MsgHandler) (*natsgo.Subscription, error) {
@@ -49,9 +50,15 @@ func (r *contextCapturingRegistry) Decode(ctx context.Context, _ []byte) (contex
 }
 func (r *contextCapturingRegistry) Register(_ string, _ event.Factory, _ int) {}
 
-func (m *mockNatsConn) Publish(_ string, _ []byte) error           { return nil }
+func (m *mockNatsConn) Publish(_ string, _ []byte) error { return nil }
 func (m *mockNatsConn) Request(_ string, _ []byte, _ time.Duration) (*natsgo.Msg, error) {
 	return nil, nil
+}
+func (m *mockNatsConn) PublishMsg(msg *natsgo.Msg) error {
+	m.mu.Lock()
+	m.publishedMsg = append(m.publishedMsg, msg)
+	m.mu.Unlock()
+	return nil
 }
 func (m *mockNatsConn) Close() {}
 
@@ -62,8 +69,8 @@ type subscriberWithOpts struct {
 	opts   []event.SubscribeOption
 }
 
-func (s *subscriberWithOpts) Name() string                      { return s.name }
-func (s *subscriberWithOpts) Events() map[string]event.HandleFn { return s.events }
+func (s *subscriberWithOpts) Name() string                              { return s.name }
+func (s *subscriberWithOpts) Events() map[string]event.HandleFn         { return s.events }
 func (s *subscriberWithOpts) SubscribeOptions() []event.SubscribeOption { return s.opts }
 
 // --- helpers ---

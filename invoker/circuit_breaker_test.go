@@ -14,7 +14,7 @@ func TestCircuitBreaker_StartsInClosedState(t *testing.T) {
 		FailureThreshold: 3,
 		SuccessThreshold: 2,
 		OpenTimeout:      time.Second,
-	}, nil)
+	})
 
 	called := false
 	err := cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
@@ -35,7 +35,7 @@ func TestCircuitBreaker_OpensAfterFailures(t *testing.T) {
 		FailureThreshold: 3,
 		SuccessThreshold: 2,
 		OpenTimeout:      time.Second,
-	}, nil)
+	})
 
 	handlerErr := errors.New("handler failed")
 
@@ -66,7 +66,7 @@ func TestCircuitBreaker_ResetFailuresOnSuccess(t *testing.T) {
 		FailureThreshold: 3,
 		SuccessThreshold: 2,
 		OpenTimeout:      time.Second,
-	}, nil)
+	})
 
 	handlerErr := errors.New("handler failed")
 
@@ -109,7 +109,7 @@ func TestCircuitBreaker_HalfOpenAfterTimeout(t *testing.T) {
 		FailureThreshold: 2,
 		SuccessThreshold: 2,
 		OpenTimeout:      50 * time.Millisecond,
-	}, nil)
+	})
 
 	handlerErr := errors.New("handler failed")
 
@@ -151,7 +151,7 @@ func TestCircuitBreaker_ClosesAfterSuccessesInHalfOpen(t *testing.T) {
 		FailureThreshold: 2,
 		SuccessThreshold: 2,
 		OpenTimeout:      50 * time.Millisecond,
-	}, nil)
+	})
 
 	handlerErr := errors.New("handler failed")
 
@@ -194,7 +194,7 @@ func TestCircuitBreaker_ReopensOnHalfOpenFailure(t *testing.T) {
 		FailureThreshold: 2,
 		SuccessThreshold: 2,
 		OpenTimeout:      50 * time.Millisecond,
-	}, nil)
+	})
 
 	handlerErr := errors.New("handler failed")
 
@@ -228,7 +228,7 @@ func TestCircuitBreaker_PerHandlerState(t *testing.T) {
 		FailureThreshold: 2,
 		SuccessThreshold: 1,
 		OpenTimeout:      time.Second,
-	}, nil)
+	})
 
 	handlerErr := errors.New("handler failed")
 
@@ -262,74 +262,38 @@ func TestCircuitBreaker_PerHandlerState(t *testing.T) {
 	}
 }
 
-func TestCircuitBreaker_DLQErrorNotCountedAsFailure(t *testing.T) {
-	cb := invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
-		FailureThreshold: 2,
-		SuccessThreshold: 1,
-		OpenTimeout:      time.Second,
-	}, nil)
+func TestCircuitBreaker_TerminalErrorsNotCounted(t *testing.T) {
+	// Terminal errors are neutral: they never open the breaker.
+	for name, terminal := range map[string]error{
+		"PermanentError": invoker.PermanentError{Err: errors.New("bad")},
+		"ErrSendToDLQ":   invoker.ErrSendToDLQ,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cb := invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
+				FailureThreshold: 2,
+				SuccessThreshold: 1,
+				OpenTimeout:      time.Second,
+			})
 
-	// ErrSendToDLQ should not count as failure
-	for i := 0; i < 5; i++ {
-		_ = cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-			return invoker.ErrSendToDLQ
+			for i := 0; i < 5; i++ {
+				_ = cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
+					return terminal
+				})
+			}
+
+			// Circuit should still be closed
+			called := false
+			err := cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
+				called = true
+				return nil
+			})
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if !called {
+				t.Errorf("handler should be called, %s should not trip the circuit", name)
+			}
 		})
-	}
-
-	// Circuit should still be closed
-	called := false
-	err := cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-		called = true
-		return nil
-	})
-
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if !called {
-		t.Error("handler should be called, ErrSendToDLQ should not trip circuit")
-	}
-}
-
-func TestCircuitBreaker_MetricsEmitted(t *testing.T) {
-	metrics := &testMetricProvider{}
-
-	cb := invoker.NewCircuitBreaker(invoker.CircuitBreakerConfig{
-		FailureThreshold: 2,
-		SuccessThreshold: 1,
-		OpenTimeout:      50 * time.Millisecond,
-	}, metrics)
-
-	handlerErr := errors.New("handler failed")
-
-	// Open the circuit
-	for i := 0; i < 2; i++ {
-		_ = cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-			return handlerErr
-		})
-	}
-
-	if metrics.counters["eventbus_circuit_open_total"] != 1 {
-		t.Errorf("expected 1 circuit_open_total, got %d", metrics.counters["eventbus_circuit_open_total"])
-	}
-
-	// Try while open
-	_ = cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-		return nil
-	})
-
-	if metrics.counters["eventbus_circuit_blocked_total"] != 1 {
-		t.Errorf("expected 1 circuit_blocked_total, got %d", metrics.counters["eventbus_circuit_blocked_total"])
-	}
-
-	// Wait for half-open
-	time.Sleep(60 * time.Millisecond)
-
-	_ = cb.Invoke(context.Background(), &testEvent{}, "handler", func(ctx context.Context) error {
-		return nil
-	})
-
-	if metrics.counters["eventbus_circuit_half_open_total"] != 1 {
-		t.Errorf("expected 1 circuit_half_open_total, got %d", metrics.counters["eventbus_circuit_half_open_total"])
 	}
 }

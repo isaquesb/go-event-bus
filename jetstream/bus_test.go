@@ -9,6 +9,7 @@ import (
 
 	"github.com/isaquesb/go-event-bus"
 	"github.com/isaquesb/go-event-bus/invoker"
+	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -36,8 +37,8 @@ type mockJS struct {
 	consumerFactory func() jetstream.Consumer
 }
 
-func (m *mockJS) Publish(_ context.Context, _ string, _ []byte, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
-	return nil, nil
+func (m *mockJS) PublishMsg(_ context.Context, _ *natsgo.Msg, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	return &jetstream.PubAck{}, nil
 }
 
 func (m *mockJS) CreateOrUpdateConsumer(
@@ -80,12 +81,28 @@ func (c *mockConsumer) Consume(jetstream.MessageHandler, ...jetstream.PullConsum
 	return &mockConsumeCtx{}, nil
 }
 
-// mockConsumeCtx implements jetstream.ConsumeContext.
-type mockConsumeCtx struct{}
+// mockConsumeCtx implements jetstream.ConsumeContext. Drain and Stop complete
+// immediately: they close the channel Closed returns, once.
+type mockConsumeCtx struct {
+	mu     sync.Mutex
+	closed chan struct{}
+	once   sync.Once
+}
 
-func (c *mockConsumeCtx) Stop()                    {}
-func (c *mockConsumeCtx) Drain()                   {}
-func (c *mockConsumeCtx) Closed() <-chan struct{}   { return make(chan struct{}) }
+// closedCh returns the lazily created closed channel.
+func (c *mockConsumeCtx) closedCh() chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed == nil {
+		c.closed = make(chan struct{})
+	}
+	return c.closed
+}
+
+func (c *mockConsumeCtx) finish()                 { c.once.Do(func() { close(c.closedCh()) }) }
+func (c *mockConsumeCtx) Stop()                   { c.finish() }
+func (c *mockConsumeCtx) Drain()                  { c.finish() }
+func (c *mockConsumeCtx) Closed() <-chan struct{} { return c.closedCh() }
 
 // subscriberWithOpts implements event.SubscribeOptionsProvider.
 type subscriberWithOpts struct {
@@ -94,8 +111,8 @@ type subscriberWithOpts struct {
 	opts   []event.SubscribeOption
 }
 
-func (s *subscriberWithOpts) Name() string                      { return s.name }
-func (s *subscriberWithOpts) Events() map[string]event.HandleFn { return s.events }
+func (s *subscriberWithOpts) Name() string                              { return s.name }
+func (s *subscriberWithOpts) Events() map[string]event.HandleFn         { return s.events }
 func (s *subscriberWithOpts) SubscribeOptions() []event.SubscribeOption { return s.opts }
 
 func noopHandler(_ context.Context, _ event.Event) error { return nil }

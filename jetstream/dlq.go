@@ -2,62 +2,215 @@ package jetstream
 
 import (
 	"context"
-	"encoding/json"
-	"github.com/isaquesb/go-event-bus"
-	"github.com/isaquesb/go-event-bus/invoker"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
 
+	event "github.com/isaquesb/go-event-bus"
+
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
+// DefaultDLQPrefix is the subject prefix NewDLQ uses when it is given an empty
+// prefix. A dead-lettered message is published to the prefix plus its original
+// subject. Users with an existing DLQ stream on the v0.3.0 prefix pass that
+// prefix explicitly.
+const DefaultDLQPrefix = "dlq."
+
+// dlqBackend is the part of jetstream.JetStream the DLQ publisher needs. It is
+// satisfied by jetstream.JetStream; tests use a capturing fake.
+type dlqBackend interface {
+	PublishMsg(ctx context.Context, msg *nats.Msg, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error)
+}
+
+// DLQ publishes dead-lettered messages to JetStream. The record holds the
+// original envelope bytes untouched, the original user headers, and the
+// failure context in bounded Eventbus-Dlq-* headers. It implements
+// event.DLQPublisher.
+//
+// Delivery to the DLQ stream is at-least-once: the publish carries no message
+// id, so a record can be duplicated after a crash or a failed acknowledgement
+// and consumers of the DLQ stream must tolerate that.
 type DLQ struct {
-	js      jsBackend
-	metrics invoker.MetricProvider
-	prefix  string
+	js       dlqBackend
+	prefix   string
+	registry event.Registry
 }
 
-func NewDQL(js jetstream.JetStream, metrics invoker.MetricProvider, prefix string) *DLQ {
-	if metrics == nil {
-		metrics = &invoker.NoopProvider{}
-	}
+var _ event.DLQPublisher = (*DLQ)(nil)
+
+// DLQOption configures a DLQ.
+type DLQOption func(*DLQ)
+
+// NewDLQ returns a DLQ that publishes through js. An empty prefix is
+// DefaultDLQPrefix.
+//
+// The publisher counts nothing itself: dead-letter successes and failures are
+// reported by event.PublishDeadLetter through the bus Observer
+// (Observer.DeadLettered and Observer.DLQPublishFailed).
+func NewDLQ(js dlqBackend, prefix string, opts ...DLQOption) *DLQ {
 	if prefix == "" {
-		prefix = "dql."
+		prefix = DefaultDLQPrefix
 	}
-	return &DLQ{
-		js:      js,
-		prefix:  prefix,
-		metrics: metrics,
+	d := &DLQ{js: js, prefix: prefix}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
+}
+
+// WithDLQRegistry sets the registry the DLQ uses to encode a record that has
+// no envelope bytes, which is the case for records from LocalBus or NATS Core.
+func WithDLQRegistry(reg event.Registry) DLQOption {
+	return func(d *DLQ) { d.registry = reg }
+}
+
+// ErrNoEnvelope is returned by Publish for a record that has an event but no
+// envelope bytes, when the DLQ has no registry to encode the event. A record
+// without an event never gets it: it is a decode failure and its Raw is
+// published as it is.
+var ErrNoEnvelope = errors.New("jetstream: DLQ record has no envelope bytes and no registry to encode its event")
+
+// natsHeaderPrefix marks broker system headers (Nats-Msg-Id, Nats-Expected-*,
+// ...) that must not follow a message into the DLQ stream.
+const natsHeaderPrefix = "Nats-"
+
+// dlqMinimalCauseLimit bounds the cause in the minimal max-payload retry.
+const dlqMinimalCauseLimit = 128
+
+// Publish publishes rec to the prefix plus the original subject.
+//
+// A record with a nil Evt is a decode failure: its Raw is the complete wire
+// form and is published unchanged even when empty, so an undecodable empty
+// message is still dead-lettered. A record with an event publishes rec.Raw when
+// present. Without Raw (LocalBus and NATS Core records) the event is encoded
+// through the registry given with WithDLQRegistry; without a registry Publish
+// returns ErrNoEnvelope and publishes nothing.
+//
+// When the broker rejects the message for exceeding its max payload, Publish
+// retries once with only the minimal failure headers, because the failure
+// headers add to the envelope size.
+//
+// The record carries Eventbus-Dlq-Traceparent, the W3C traceparent of the span
+// active in ctx, so the Replayer can link its replay span to the place where the
+// message died. When the chain DLQ invoker dead-letters inside the tracing
+// invoker, that span is the handler span; otherwise it is the span in the
+// transport ctx. The header is omitted when ctx has no valid span, and it is one
+// of the minimal headers of the max-payload retry.
+func (d *DLQ) Publish(ctx context.Context, rec event.DLQRecord) error {
+	data := rec.Raw
+	if rec.Evt != nil && len(data) == 0 {
+		if d.registry == nil {
+			return ErrNoEnvelope
+		}
+		md, ok := event.MetadataFromContext(ctx)
+		if !ok {
+			md = event.ResolveOutbound(ctx, rec.Evt, event.ApplyEmitOptions(rec.Evt))
+		}
+		enc, err := event.EncodeEvent(ctx, d.registry, rec.Evt, md)
+		if err != nil {
+			return fmt.Errorf("jetstream: DLQ encode %q: %w", rec.Evt.Name(), err)
+		}
+		data = enc
+	}
+
+	h, origMsgID := dlqCopyHeaders(rec.Headers)
+	for k, v := range rec.FailureHeaders() {
+		h.Set(k, v)
+	}
+	if origMsgID != "" {
+		h.Set(event.HeaderDLQOriginalMsgID, event.TruncateHeader(origMsgID, event.DLQHeaderValueLimit))
+	}
+	tp := oxTraceparent(ctx)
+	if tp != "" {
+		h.Set(event.HeaderDLQTraceparent, tp)
+	}
+	subject := d.prefix + dlqSubject(rec)
+
+	err := d.send(ctx, subject, h, data)
+	if errors.Is(err, nats.ErrMaxPayload) {
+		err = d.send(ctx, subject, dlqMinimalHeaders(rec, tp), data)
+	}
+	return err
+}
+
+// send publishes one message with no publish options, so no message id is set.
+func (d *DLQ) send(ctx context.Context, subject string, h nats.Header, data []byte) error {
+	_, err := d.js.PublishMsg(ctx, &nats.Msg{Subject: subject, Header: h, Data: data})
+	return err
+}
+
+// dlqMinimalHeaders is the header set of the max-payload retry: the original
+// headers plus only the reason, original subject, event id, handler, a
+// shortened cause and the dead-letter traceparent tp when it is not empty.
+func dlqMinimalHeaders(rec event.DLQRecord, tp string) nats.Header {
+	h, _ := dlqCopyHeaders(rec.Headers)
+	if tp != "" {
+		h.Set(event.HeaderDLQTraceparent, tp)
+	}
+	full := rec.FailureHeaders()
+	for _, k := range []string{
+		event.HeaderDLQReason,
+		event.HeaderDLQOriginalSubject,
+		event.HeaderDLQEventID,
+		event.HeaderDLQHandler,
+	} {
+		if v, ok := full[k]; ok {
+			h.Set(k, v)
+		}
+	}
+	if v, ok := full[event.HeaderDLQCause]; ok {
+		h.Set(event.HeaderDLQCause, event.TruncateHeader(v, dlqMinimalCauseLimit))
+	}
+	return h
+}
+
+// dlqSubject is the original subject of rec, falling back to the event name.
+func dlqSubject(rec event.DLQRecord) string {
+	switch {
+	case rec.Subject != "":
+		return rec.Subject
+	case rec.EventName != "":
+		return rec.EventName
+	default:
+		return "unknown"
 	}
 }
 
-func (d *DLQ) Publish(
-	ctx context.Context,
-	evt event.Event,
-	err error,
-) error {
-	data, marshalErr := json.Marshal(map[string]any{
-		"event": evt,
-		"error": err.Error(),
-	})
-	if marshalErr != nil {
-		return marshalErr
+// dlqCopyHeaders copies the original headers of a record into a fresh
+// nats.Header. Broker system headers (Nats- prefix) and stale Eventbus-Dlq-*
+// failure headers are dropped; the first Nats-Msg-Id value is returned so the
+// caller can preserve it under HeaderDLQOriginalMsgID.
+func dlqCopyHeaders(src map[string][]string) (nats.Header, string) {
+	h := make(nats.Header, len(src)+16)
+	var origMsgID string
+	for k, vs := range src {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, strings.ToLower(natsHeaderPrefix)) {
+			if lk == "nats-msg-id" && origMsgID == "" && len(vs) > 0 {
+				origMsgID = vs[0]
+			}
+			continue
+		}
+		if strings.HasPrefix(lk, strings.ToLower(event.HeaderDLQPrefix)) {
+			continue
+		}
+		h[k] = slices.Clone(vs)
 	}
+	return h, origMsgID
+}
 
-	_, err = d.js.Publish(ctx, d.prefix+evt.Name(), data)
-
-	if err != nil {
-		d.metrics.IncCounter(
-			"dlq_publish_error_total",
-			1,
-			invoker.Labels{},
-		)
-		return err
+// oxTraceparent returns the W3C traceparent of the span active in ctx, injected
+// with the W3C TraceContext propagator, or "" when ctx has no valid span.
+func oxTraceparent(ctx context.Context) string {
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		return ""
 	}
-
-	d.metrics.IncCounter(
-		"dlq_published_total",
-		1,
-		invoker.Labels{},
-	)
-
-	return nil
+	c := propagation.MapCarrier{}
+	propagation.TraceContext{}.Inject(ctx, c)
+	return c.Get("traceparent")
 }

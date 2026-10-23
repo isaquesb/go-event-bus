@@ -15,8 +15,8 @@ Source: [`examples/05_subscriber_pattern.go`](https://github.com/isaquesb/go-eve
 
 ```go
 type Subscriber interface {
-    Name() string
-    Events() map[string]HandleFn
+	Name() string
+	Events() map[string]HandleFn
 }
 ```
 
@@ -24,94 +24,113 @@ type Subscriber interface {
 
 ```go
 type EmailSubscriber struct {
-    smtpHost string
-    from     string
+	smtpHost string
+	from     string
 }
 
-func (s *EmailSubscriber) Name() string { return "email-subscriber" }
+func NewEmailSubscriber(smtpHost, from string) *EmailSubscriber {
+	return &EmailSubscriber{smtpHost: smtpHost, from: from}
+}
 
+// Name identifies this subscriber for logging and metrics
+func (s *EmailSubscriber) Name() string {
+	return "email-subscriber"
+}
+
+// Events returns the event handlers this subscriber provides
 func (s *EmailSubscriber) Events() map[string]event.HandleFn {
-    return map[string]event.HandleFn{
-        "user.signed_up": s.handleUserSignedUp,
-        "user.upgraded":  s.handleUserUpgraded,
-        "user.deleted":   s.handleUserDeleted,
-    }
+	return map[string]event.HandleFn{
+		"user.signed_up": s.handleUserSignedUp,
+		"user.upgraded":  s.handleUserUpgraded,
+		"user.deleted":   s.handleUserDeleted,
+	}
 }
 
 func (s *EmailSubscriber) handleUserSignedUp(ctx context.Context, evt event.Event) error {
-    e := evt.(UserSignedUp)
-    slog.Info("sending welcome email", "email", e.Email)
-    return nil
+	e := evt.(UserSignedUp)
+	slog.Info("sending welcome email",
+		"user_id", e.UserID,
+		"email", e.Email,
+		"plan", e.Plan,
+	)
+	// ... send welcome email
+	return nil
 }
 ```
 
 ## Bulk Registration
 
 ```go
-bus.RegisterSubscribers(ctx,
-    NewEmailSubscriber("smtp.example.com", "noreply@example.com"),
-    NewAnalyticsSubscriber(),
-    NewBillingSubscriber("sk_test_xxx"),
+chain := invoker.NewChain(
+	invoker.NewRetry(invoker.RetryPolicy{
+		MaxAttempts: 3,
+		BaseDelay:   100,
+		MaxDelay:    1000,
+	}),
 )
+
+bus := event.NewLocalBus(event.LocalBusOptions{
+	Invoker:       chain,
+	MaxConcurrent: 16,
+	// Observer receives every terminal failure once (Observer.Failure). The slog
+	// observer is also the default when Observer is nil.
+	Observer: event.NewSlogObserver(nil),
+})
+
+ctx := context.Background()
+
+// Register all subscribers at once
+if err := bus.RegisterSubscribers(ctx,
+	NewEmailSubscriber("smtp.example.com", "noreply@example.com"),
+	NewAnalyticsSubscriber(),
+	NewBillingSubscriber("sk_test_xxx"),
+); err != nil {
+	slog.Error("register subscribers failed", "error", err)
+	return
+}
 ```
 
-Each subscriber's `Name()` is used as the handler name for metrics and logging.
+Each subscriber's `Name()` is used as the handler name for logs and the `handler` label on metrics.
 
-## JetStream Subscribers with SubscribeOptionsProvider
+## Subscribers with transport options
 
-For JetStream buses, subscribers must provide stream configuration. Implement `SubscribeOptionsProvider` to carry these options:
+A transport may need options for every handler of a subscriber, for example the JetStream stream name (`WithStream` is required on every JetStream `Subscribe`). A subscriber carries them by implementing the optional `SubscribeOptionsProvider` interface:
 
 ```go
-type ChatSubscriber struct{}
-
-func (s *ChatSubscriber) Name() string { return "chat-subscriber" }
-
-func (s *ChatSubscriber) Events() map[string]event.HandleFn {
-    return map[string]event.HandleFn{
-        "chat.message.*": s.handleMessage,
-    }
-}
-
-// SubscribeOptions provides JetStream-specific options for all handlers.
-func (s *ChatSubscriber) SubscribeOptions() []event.SubscribeOption {
-    return []event.SubscribeOption{
-        event.WithStream("CHAT_EVENTS"),
-        event.WithConsumer("chat-processor"),
-        event.WithMaxDeliver(5),
-    }
-}
-
-func (s *ChatSubscriber) handleMessage(ctx context.Context, evt event.Event) error {
-    msg := evt.(*ChatMessage)
-    slog.Info("processing message", "id", msg.MessageID, "room", msg.RoomID)
-    return nil
+// SubscribeOptionsProvider can be implemented by Subscriber to provide
+// additional subscribe options (e.g. stream name for JetStream).
+type SubscribeOptionsProvider interface {
+	SubscribeOptions() []SubscribeOption
 }
 ```
 
-Registration is identical across all buses:
-
-```go
-jsBus.RegisterSubscribers(ctx, &ChatSubscriber{})
-```
-
-`RegisterSubscribers` automatically detects `SubscribeOptionsProvider` and merges the provided options with the handler name.
+`RegisterSubscribers` detects the interface and merges the returned options with the handler name, identically on the LocalBus, NATS and JetStream buses. A JetStream subscriber that does not implement it fails with `ErrStreamRequired`. See [JetStream Bus]({{ site.baseurl }}/transports/jetstream-bus/).
 
 ## OnErr Interface
 
 Events can implement `OnErr` for event-level error notification:
 
 ```go
+// CriticalEvent demonstrates the OnErr interface for event-level error handling
 type CriticalEvent struct {
-    ID      string
-    Payload string
+	ID      string
+	Payload string
+	onErr   func(err error)
 }
 
 func (e *CriticalEvent) Name() string { return "critical.event" }
 
+// OnErr is called when any handler fails
 func (e *CriticalEvent) OnErr(ctx context.Context, err error, listenerName string) {
-    slog.Error("critical event failed", "event_id", e.ID, "handler", listenerName, "error", err)
-    // Alert, notify, etc.
+	slog.Error("critical event handler failed",
+		"event_id", e.ID,
+		"handler", listenerName,
+		"error", err,
+	)
+	if e.onErr != nil {
+		e.onErr(err)
+	}
 }
 ```
 
-`OnErr` is called by the bus after the global `OnErr` callback, giving the event itself a chance to react to failures.
+The event's own `OnErr` runs after `Observer.Failure`, once per terminal failure, giving the event itself a chance to react. It is optional and independent of the bus `Observer`. See [Failure Hooks]({{ site.baseurl }}/examples/failure-hooks/).
