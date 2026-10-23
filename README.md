@@ -16,12 +16,15 @@ This project provides:
 - A **JetStreamBus** for distributed, durable events
 - A **pluggable Invoker Chain** for cross-cutting concerns such as:
   - tracing
-  - metrics
   - retries
   - circuit breaking
   - rate limiting
   - idempotency
   - DLQ handling
+- One **Observer** per bus that receives every failure and resilience signal, with
+  backends for logs, Prometheus metrics and OpenTelemetry
+- A **failure model** shared by every transport: each failed message is retried,
+  dead-lettered or dropped by the same code, and reported exactly once
 
 The core goal is to **decouple application modules** while keeping **explicit control**
 over execution, failure semantics, and observability.
@@ -40,49 +43,76 @@ go get github.com/isaquesb/go-event-bus
 
 ## Quick Start
 
+Compiled from [`examples/01_basic_local_bus.go`](https://github.com/isaquesb/go-event-bus/blob/main/examples/01_basic_local_bus.go):
+
 ```go
 package main
 
 import (
-    "context"
-    "fmt"
-    "log/slog"
+	"context"
+	"fmt"
+	"log/slog"
 
-    event "github.com/isaquesb/go-event-bus"
-    "github.com/isaquesb/go-event-bus/invoker"
+	"github.com/isaquesb/go-event-bus"
+	"github.com/isaquesb/go-event-bus/invoker"
 )
 
-// Define an event
+// UserCreated is emitted when a new user registers
 type UserCreated struct {
-    UserID string
-    Email  string
+	UserID   string
+	Email    string
+	UserName string
 }
 
 func (e UserCreated) Name() string { return "user.created" }
 
+// SendWelcomeEmail handles user.created events
+func SendWelcomeEmail(ctx context.Context, evt event.Event) error {
+	e := evt.(UserCreated)
+	slog.Info("sending welcome email", "user_id", e.UserID, "email", e.Email)
+	// ... send email logic
+	return nil
+}
+
 func main() {
-    // Create a bus with a minimal invoker chain
-    bus := event.NewLocalBus(event.LocalBusOptions{
-        Invoker:       invoker.NewChain(invoker.NewMetrics(nil)),
-        MaxConcurrent: 10,
-        OnErr: func(ctx context.Context, evt event.Event, err error, handler string) {
-            slog.Error("handler failed", "event", evt.Name(), "handler", handler, "error", err)
-        },
-    })
+	// An empty chain; see the invoker chain section for the recommended order
+	// of the resilience invokers
+	chain := invoker.NewChain()
 
-    ctx := context.Background()
+	// Create the LocalBus
+	bus := event.NewLocalBus(event.LocalBusOptions{
+		Invoker:       chain,
+		MaxConcurrent: 10,
+		// Observer receives every terminal failure once (Observer.Failure). The slog
+		// observer is also the default when Observer is nil.
+		Observer: event.NewSlogObserver(nil),
+	})
 
-    // Subscribe to events
-    bus.Subscribe(ctx, "user.created", func(ctx context.Context, evt event.Event) error {
-        e := evt.(UserCreated)
-        fmt.Printf("Welcome %s!\n", e.Email)
-        return nil
-    }, event.WithHandlerName("send-welcome"))
+	ctx := context.Background()
 
-    // Emit an event
-    bus.EmitSync(ctx, UserCreated{UserID: "123", Email: "john@example.com"})
+	// Register a handler
+	if err := bus.Subscribe(ctx, "user.created", SendWelcomeEmail, event.WithHandlerName("send-welcome-email")); err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return
+	}
+
+	// Synchronous - waits for all handlers to complete
+	if _, err := bus.EmitSync(ctx, UserCreated{
+		UserID:   "user-123",
+		Email:    "john@example.com",
+		UserName: "John Doe",
+	}); err != nil {
+		slog.Error("emit sync failed", "error", err)
+	}
+
+	// Asynchronous - fire and forget
+	bus.Emit(ctx, UserCreated{UserID: "user-456", Email: "jane@example.com", UserName: "Jane Doe"})
+
+	fmt.Println("Events emitted successfully")
 }
 ```
+
+Upgrading from v0.3.0? The [CHANGELOG](CHANGELOG.md) is the migration guide.
 
 ---
 
@@ -90,10 +120,12 @@ func main() {
 
 - Explicit, composable execution pipeline (Invoker Chain)
 - No hidden magic or framework lock-in
-- First-class observability (metrics + tracing)
+- First-class observability (one Observer: logs, metrics and traces)
+- Failures are never silent: every terminal outcome reaches the Observer exactly once
 - Works equally well for in-process and distributed events
 - Optional dependencies via subpackages
 - Production-grade resilience patterns
+- One transport-neutral contract that every adapter follows
 
 ---
 
@@ -139,11 +171,11 @@ Events are plain Go structs. Behavior is opt-in via interfaces.
 An in-process event dispatcher.
 
 - Fire-and-forget
-- No delivery guarantees
+- No delivery guarantees: a delivery never repeats, so it is always the final one
 - Suitable for domain events and internal decoupling
 
-Supports synchronous and asynchronous dispatch, concurrency limits,
-and a shared invoker chain.
+Supports synchronous and asynchronous dispatch, concurrency limits, an overflow
+policy, graceful shutdown and a shared invoker chain.
 
 ---
 
@@ -220,14 +252,17 @@ A distributed event bus backed by NATS JetStream.
 
 - Durable messages
 - Fan-out and consumer groups
-- Replay support
+- Replay of dead-lettered messages
 - Integrated invoker chain
 
 Responsibilities:
 - publish serialized events
 - decode and dispatch handlers
-- ACK / NAK handling
-- DLQ via invoker
+- ACK / NAK / Term handling through the shared failure model
+- DLQ via the invoker, with a transport backstop
+
+If you compact a stream by subject, read the
+[log-compaction guide](https://isaquesb.github.io/go-event-bus/guides/log-compaction/) first.
 
 ---
 
@@ -246,9 +281,13 @@ The Registry is responsible for:
   "name": "user.created",
   "version": 2,
   "ts": "2026-02-05T12:00:00Z",
-  "payload": {},
+  "id": "0194f3c2-8a41-7c3e-9d52-1b6f0e7a4c10",
+  "correlation_id": "0194f3c2-7e10-7a2b-8c11-5d0e3f9b2a64",
+  "causation_id": "0194f3c2-7e10-7a2b-8c11-5d0e3f9b2a64",
+  "headers": {"tenant": "acme"},
   "trace_id": "...",
-  "span_id": "..."
+  "span_id": "...",
+  "payload": {}
 }
 ```
 
@@ -269,61 +308,79 @@ type Invoker interface {
 }
 ```
 
-Example chain:
+Recommended order, outermost first:
+
+```
+Tracer → RateLimit → Idempotency → DLQ → Retry → CircuitBreaker → Handler
+```
 
 ```go
-invoker := NewChain(
-    TracingInvoker,
-    MetricsInvoker,
-    RateLimitInvoker,
-    IdempotencyInvoker,
-    RetryInvoker,
-    CircuitBreakerInvoker,
-    DLQInvoker,
+chain := invoker.NewChain(
+    telemetry.NewTracerInvoker(tracer),
+    invoker.NewRateLimiter(rateStore, rateCfg),
+    invoker.NewIdempotency(idemStore, idemCfg),
+    invoker.NewDLQ(dlqPublisher),
+    invoker.NewRetry(retryPolicy),
+    invoker.NewCircuitBreaker(breakerCfg),
 )
 ```
+
+The handler is the last link and is not part of `NewChain`. The reason for each position is on the
+[composition page](https://isaquesb.github.io/go-event-bus/invoker-chain/composition/).
 
 ---
 
 ## Built-in Invokers
 
-### Tracing
+### Tracer (`telemetry.NewTracerInvoker`)
 - OpenTelemetry compatible
-- One span per handler
+- One consumer span per handler invocation
 - Context propagated via envelope
 
-### Metrics
-- Latency histograms
-- Success/error counters
-- State gauges
-
-Metrics are per-pod and aggregated by Prometheus.
-
-### Retry
-- Exponential backoff
-- Error classification
-- Terminal errors forwarded to DLQ
-
-### Circuit Breaker
-- Closed / Open / Half-open
-- Per-handler isolation
-- Business terminal errors do not count as failures
-
 ### Rate Limiting
-- Distributed
-- Dynamic keys (e.g. userId)
-- Burst control
+- Token bucket, per-key, with dynamic keys (e.g. userId)
+- A rejected event fails with `ErrRateLimited` and the handler does not run
 
 ### Idempotency
-- Distributed
-- Store-backed
-- Handler-scoped
-- TTL-based recovery
+- Store-backed, handler-scoped, with a TTL for stale in-progress markers
+- A duplicate fails with `ErrDuplicate`, which the transport acknowledges
 
 ### DLQ
-- Transport-agnostic
-- Terminal invoker
-- Pluggable publisher
+- Publishes a terminal failure through a pluggable `DLQPublisher`, once, with the original bytes
+- Sits outside Retry, so only the final outcome is dead-lettered
+- Returns an error that tells the transport to acknowledge
+
+### Retry
+- Exponential backoff with error classification
+- Keeps the history of the attempts in the failure error and the DLQ record
+- Gives up with `event.ErrRetriesExhausted`; a terminal error is never retried
+
+### Circuit Breaker
+- Closed / Open / Half-open, per handler
+- Business terminal errors do not count as failures
+- Every transition is reported to the Observer
+
+There is no metrics invoker: latency and outcome come from the `HandlerDone` signal
+that every transport emits to the Observer.
+
+---
+
+## Failure Semantics
+
+Every transport settles a failed message with the same code:
+
+- `event.InvokeHandler` runs the chain around the handler and emits `HandlerDone` for every invocation.
+- `event.Settle` runs exactly once per handled message and maps the result through `event.Dispose` to
+  Ack, Retry, RetryDelayed or Terminal.
+- The DLQ invoker sits outside Retry. When the chain did not dead-letter a terminal failure, the
+  transport backstop (`DLQPublisher` in the bus options) publishes it, and a message is never
+  published twice.
+- Dead-lettering is at-least-once, and the DLQ record keeps the original envelope bytes, so
+  `jetstream.NewReplayer` can republish it unchanged.
+- Every terminal outcome reaches `Observer.Failure` exactly once. A retry is not a failure.
+
+See the [failure model](https://isaquesb.github.io/go-event-bus/architecture/failure-model/) for the
+disposition table of every error on every transport, and the [DLQ and replay example](https://isaquesb.github.io/go-event-bus/examples/dlq-replay/).
 
 ---
 
@@ -333,7 +390,7 @@ Production-ready implementations for distributed scenarios:
 
 ### RedisIdempotencyStore
 - Get-then-Put pattern with SET
-- TTL per status (processing: 5m, completed: 24h, failed: 1h)
+- TTL per status (processing: 5m, completed: 24h, failed: 1h, dead_lettered: 1h)
 - Automatic key expiration for stale lock recovery
 
 ### RedisRateLimitStore
@@ -343,12 +400,34 @@ Production-ready implementations for distributed scenarios:
 
 ---
 
-## Observability Guarantees
+## Observability
 
-- Metrics from every invoker
+A bus reports everything that happens to a message through one `event.Observer`, set in the bus
+options. Invokers and transports only call it, and each backend implements it:
+
+| What you want | Backend |
+|---|---|
+| Logs | `event.NewSlogObserver`, the default when the bus has no Observer |
+| Metrics | `prometheus.NewObserver`, or `telemetry.NewObserver` with `WithMeterProvider` for OpenTelemetry metrics |
+| Traces | `telemetry.NewTracerInvoker` as the first invoker of the chain, plus `telemetry.NewObserver` for span events |
+
+```go
+bus := event.NewLocalBus(event.LocalBusOptions{
+    Observer: event.MultiObserver(
+        event.NewSlogObserver(nil),
+        prometheus.NewObserver(reg),
+    ),
+})
+```
+
+Guarantees:
+- Every terminal failure reaches `Observer.Failure` exactly once
+- A panic in an observer never reaches the handler
 - Trace propagation across buses
 - Safe in multi-pod deployments
-- Explicit failure semantics
+
+See [Observability](https://isaquesb.github.io/go-event-bus/observability/) for the signals, the
+metric families and the log levels.
 
 ---
 
@@ -361,9 +440,14 @@ github.com/isaquesb/go-event-bus/
 ├── options.go            # EmitOption and SubscribeOption functional options
 ├── registry.go           # Registry interface & Envelope
 ├── local-bus.go          # In-process event bus
+├── observer.go           # Observer interface, NopObserver, MultiObserver
+├── slog_observer.go      # Default log Observer
+├── settle.go             # Settle: the post-chain failure policy shared by every transport
+├── invoke.go             # InvokeHandler: the single handler entry point
+├── dlq.go                # DLQPublisher, DLQRecord, MemoryDLQ
+├── lifecycle.go          # Shutdown state machine shared by every bus
 ├── invoker/              # Execution pipeline components
 │   ├── chain.go          # Invoker chain composition
-│   ├── metrics.go        # Latency & counter metrics
 │   ├── retry.go          # Exponential backoff retries
 │   ├── circuit-breaker.go # Circuit breaker pattern
 │   ├── rate-limit.go     # Rate limiting invoker
@@ -374,16 +458,19 @@ github.com/isaquesb/go-event-bus/
 ├── jetstream/            # NATS JetStream transport
 │   ├── bus.go            # JetStream event bus
 │   ├── dlq.go            # JetStream DLQ publisher
-│   └── replayer.go       # Event replay from streams
+│   └── replayer.go       # Replay of dead-lettered messages
 ├── nats/                 # NATS Core transport
-│   └── bus.go            # Simple NATS bus (fire-and-forget)
+│   ├── bus.go            # Simple NATS bus (fire-and-forget)
+│   └── errors.go         # Remote error type
 ├── redis/                # Redis-backed stores
 │   ├── idempotency.go    # Redis idempotency store
 │   └── rate-limit.go     # Redis rate limiter (token bucket)
-├── telemetry/            # Observability
-│   └── tracer.go         # OpenTelemetry tracing invoker
+├── telemetry/            # OpenTelemetry
+│   ├── tracer.go         # Tracing invoker
+│   ├── observer.go       # Observer: span events and OTel metrics
+│   └── semconv.go        # Attribute and span event names
 └── prometheus/           # Metrics
-    └── provider.go       # Prometheus MetricProvider implementation
+    └── observer.go       # Observer with a fixed Prometheus metric set
 ```
 
 ---
@@ -411,5 +498,12 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Documentation
 
 For full documentation, visit [https://isaquesb.github.io/go-event-bus/](https://isaquesb.github.io/go-event-bus/).
+
+- [Getting started](https://isaquesb.github.io/go-event-bus/getting-started/)
+- [Examples](https://isaquesb.github.io/go-event-bus/examples/), compiled from the [`examples/`](examples/) directory
+- [Observability](https://isaquesb.github.io/go-event-bus/observability/)
+- [Guides](https://isaquesb.github.io/go-event-bus/guides/), including the [JetStream log-compaction guide](https://isaquesb.github.io/go-event-bus/guides/log-compaction/)
+- [Adapter contract](https://isaquesb.github.io/go-event-bus/architecture/adapter-contract/): the rules a new transport adapter must follow
+- [CHANGELOG](CHANGELOG.md): release notes and the v0.3.0 to v0.4.0 migration guide
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for deeper design details.
