@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the internal architecture and design rationale of the Event Bus.
+This document describes the internal architecture and design rationale of the Event Bus (v0.4.0).
 
 ---
 
@@ -12,7 +12,28 @@ The Event Bus is composed of three orthogonal layers:
 2. **Execution Pipeline (Invoker Chain)**
 3. **Transport / Delivery Mechanism**
 
-These layers are intentionally decoupled.
+These layers are intentionally decoupled. Two concerns cut across all of them: the
+[failure model](https://isaquesb.github.io/go-event-bus/architecture/failure-model/) (what happens to
+a message that fails) and the `event.Observer` (how everything that happens is reported).
+
+---
+
+## Modules
+
+The root module defines every core interface and `LocalBus`. Every other capability is a separate
+module, so you depend only on what you use.
+
+| Module | Purpose |
+|--------|---------|
+| root (`github.com/isaquesb/go-event-bus`) | Core interfaces, `LocalBus`, `Observer`, `SlogObserver`, `InvokeHandler`, `Settle` |
+| `invoker` | Execution pipeline: retry, circuit breaker, rate limit, idempotency, DLQ |
+| `json` | Envelope serialization with trace propagation and the upcaster chain |
+| `nats` | NATS Core bus (fire-and-forget) |
+| `jetstream` | NATS JetStream bus (at-least-once, durable), DLQ publisher and replayer |
+| `redis` | Redis-backed idempotency and rate-limit stores |
+| `telemetry` | OpenTelemetry: `TracerInvoker` and an `event.Observer` for span events and metrics |
+| `prometheus` | An `event.Observer` with a fixed Prometheus metric set |
+| `examples` | Runnable examples, compiled and tested with the repository |
 
 ---
 
@@ -25,14 +46,17 @@ Every event is serialized into an `Envelope` containing:
 - Name
 - Version
 - Timestamp
+- Identity: id, correlation id and causation id
+- Headers
 - Payload
 - Trace identifiers
 
 This allows:
 
 - Versioned schema evolution
+- Causal lineage across events
 - Trace correlation across transports
-- Safe replay and DLQ handling
+- Safe replay and DLQ handling: a dead letter keeps the original envelope bytes
 
 ---
 
@@ -44,11 +68,25 @@ The Registry owns:
 - Decoding envelopes back into events
 - Upcasting older versions to newer ones
 
-Upcasters are pure functions and deterministic.
+Upcasters are pure functions and deterministic. A decode failure is a `*event.DecodeError` with a
+sentinel you match with `errors.Is`.
 
 ---
 
 ## 2. Execution Pipeline
+
+### Pipeline stages
+
+A transport never calls a handler directly. Every delivery goes through the same three stages,
+shared by LocalBus, NATS Core and JetStream:
+
+```
+Decode → InvokeHandler (chain, HandlerDone) → Settle (Dispose → broker action)
+```
+
+- `event.InvokeHandler` runs the invoker chain around the handler and emits `HandlerDone`.
+- `event.Settle` runs once per handled message, maps the result through `event.Dispose` to a
+  disposition and reports a terminal outcome once.
 
 ### Invoker Chain
 
@@ -62,29 +100,28 @@ Each Invoker:
 
 - Has a single responsibility
 - Is stateless or externally backed
-- Emits its own metrics
+- Reports what it does to the Observer (retry attempts, breaker transitions, store errors)
 
 ---
 
 ### Ordering Rationale
 
-Recommended order:
+Recommended order, outermost first:
 
-1. Tracing
-2. Metrics
-3. Rate Limiting
-4. Idempotency
-5. Retry
-6. Circuit Breaker
-7. DLQ
-8. Handler
+```
+Tracer → RateLimit → Idempotency → DLQ → Retry → CircuitBreaker → Handler
+```
 
 **Why?**
 
 - Observability must wrap everything
 - Cheap rejections happen early
-- Retries occur before health decisions
-- DLQ is terminal and isolated
+- DLQ is outside Retry, so only the final outcome is dead-lettered
+- An open circuit stops the retries
+
+The reason for each position is on the
+[composition page](https://isaquesb.github.io/go-event-bus/invoker-chain/composition/). There is no
+metrics invoker: latency and outcome come from the `HandlerDone` signal.
 
 ---
 
@@ -94,7 +131,7 @@ Recommended order:
 
 - In-process
 - Async or sync dispatch
-- No delivery guarantees
+- No delivery guarantees: every delivery is the final one
 - Ideal for monoliths or local orchestration
 
 ---
@@ -111,11 +148,14 @@ Recommended order:
 ### JetStream Bus
 
 - At-least-once delivery
-- Consumer-managed retries
+- Consumer-managed redelivery and backoff
 - Horizontal scalability
-- Replay support
+- Replay of dead-lettered messages
 
-JetStream is used only for **transport**, never for business logic concerns like DLQ or retries.
+JetStream owns the redelivery, the invoker chain owns the in-process policy, and `event.Settle`
+decides the broker action (Ack, Nak, NakWithDelay or Term) so the result is the same code on every
+transport. Rules for a new transport are in the
+[adapter contract](https://isaquesb.github.io/go-event-bus/architecture/adapter-contract/).
 
 ---
 
@@ -130,7 +170,7 @@ JetStream is used only for **transport**, never for business logic concerns like
 
 **Redis Implementation:**
 - Get-then-Put pattern with SET command
-- Status-based TTL (processing: 5m, completed: 24h, failed: 1h)
+- Status-based TTL (processing: 5m, completed: 24h, failed: 1h, dead_lettered: 1h)
 - Stale lock recovery via TTL expiration
 - Invoker checks existence via Get before Put
 
@@ -151,25 +191,35 @@ JetStream is used only for **transport**, never for business logic concerns like
 
 Errors are classified into:
 
-- **Transient**: retried
-- **Terminal**: sent to DLQ
-- **Policy**: rejected (rate limit, duplicate)
+- **Transient**: retried, then dead-lettered or dropped on the final delivery
+- **Terminal**: dead-lettered at once, never retried
+- **Flow control**: the handler did not run (rate limit, circuit open, idempotency in progress);
+  retried until the final delivery
 
+A duplicate is acknowledged, and a message the chain already dead-lettered is acknowledged too.
 Circuit Breaker reacts only to **transient failures**.
+
+Every terminal outcome is reported to `Observer.Failure` exactly once, then to the event's own
+`OnErr` method. Dead-lettering is at-least-once. The disposition of every error on every transport
+is in the [failure model](https://isaquesb.github.io/go-event-bus/architecture/failure-model/).
 
 ---
 
 ## Observability Model
 
-### Metrics
+### Observer
 
-- Counters for attempts, failures, retries
-- Histograms for latency
-- Low-cardinality labels only
+One `event.Observer` per bus receives ten typed signals. Invokers and transports only call it; the
+backends implement it:
+
+- `event.SlogObserver`: structured logs, the default when a bus has no Observer
+- `prometheus.NewObserver`: a fixed set of Prometheus metric families
+- `telemetry.NewObserver`: span events and, with a meter provider, OpenTelemetry metrics
+- `event.MultiObserver`: several backends side by side, with a panic in one isolated from the rest
 
 ### Tracing
 
-- Spans started per handler
+- `telemetry.NewTracerInvoker` starts one consumer span per handler invocation
 - Context propagated via envelopes
 - Transport-agnostic correlation
 
@@ -178,7 +228,8 @@ Circuit Breaker reacts only to **transient failures**.
 ## Key Architectural Decisions
 
 - No hidden retries
-- No implicit DLQ
+- No implicit DLQ: nothing is dead-lettered unless you configure a `DLQPublisher`
+- No silent failures: every terminal outcome reaches the Observer once
 - No shared mutable state
 - No transport-specific behavior leakage
 
@@ -186,7 +237,7 @@ Circuit Breaker reacts only to **transient failures**.
 
 ## Future Extensions
 
-- Replay tooling
+- Adapters for more brokers, following the adapter contract
 - Admin introspection APIs
 - Schema registry
 - Backpressure signals
@@ -194,4 +245,3 @@ Circuit Breaker reacts only to **transient failures**.
 ---
 
 This architecture prioritizes correctness, observability, and long-term maintainability over convenience.
-
