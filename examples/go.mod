@@ -9,7 +9,7 @@ require (
 	github.com/isaquesb/go-event-bus/json v0.4.0
 	github.com/isaquesb/go-event-bus/redis v0.4.0
 	github.com/isaquesb/go-event-bus/telemetry v0.4.0
-	github.com/nats-io/nats.go v1.54.0
+	github.com/nats-io/nats.go v1.55.0
 	github.com/redis/go-redis/v9 v9.23.0
 	go.opentelemetry.io/otel v1.47.0
 )
